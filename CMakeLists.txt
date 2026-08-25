@@ -125,6 +125,8 @@ add_library(
     aistore_metadata
     src/metadata/object_layout.cpp
     src/metadata/object_descriptor.cpp
+    src/metadata/uuid_v7.cpp
+    src/metadata/artifact_model.cpp
 )
 
 target_include_directories(
@@ -149,6 +151,7 @@ target_link_libraries(
     aistore_metadata
     PRIVATE
     aistore_hashing
+    OpenSSL::Crypto
 )
 
 if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
@@ -289,6 +292,28 @@ if(BUILD_TESTING)
 
     target_link_libraries(
         aistore_object_descriptor_tests
+        PRIVATE
+        aistore_metadata
+    )
+
+    aistore_add_unit_test(
+        aistore_uuid_v7_tests
+        tests/unit/metadata/uuid_v7_test.cpp
+    )
+
+    target_link_libraries(
+        aistore_uuid_v7_tests
+        PRIVATE
+        aistore_metadata
+    )
+
+    aistore_add_unit_test(
+        aistore_artifact_model_tests
+        tests/unit/metadata/artifact_model_test.cpp
+    )
+
+    target_link_libraries(
+        aistore_artifact_model_tests
         PRIVATE
         aistore_metadata
     )
