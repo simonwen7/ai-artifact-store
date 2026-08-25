@@ -128,6 +128,7 @@ add_library(
     src/metadata/object_descriptor.cpp
     src/metadata/uuid_v7.cpp
     src/metadata/artifact_model.cpp
+    src/metadata/postgres_metadata_repository.cpp
 )
 
 target_include_directories(
@@ -153,6 +154,7 @@ target_link_libraries(
     PRIVATE
     aistore_hashing
     OpenSSL::Crypto
+    libpqxx::pqxx
 )
 
 if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
@@ -339,6 +341,18 @@ if(BUILD_TESTING)
     target_link_libraries(
         aistore_postgres_connection_tests
         PRIVATE
+        libpqxx::pqxx
+    )
+
+    aistore_add_test(
+        aistore_postgres_metadata_repository_tests
+        tests/integration/postgres_metadata_repository_test.cpp
+    )
+
+    target_link_libraries(
+        aistore_postgres_metadata_repository_tests
+        PRIVATE
+        aistore_metadata
         libpqxx::pqxx
     )
 endif()
