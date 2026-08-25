@@ -1,0 +1,60 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    name: Build and Test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            clang \
+            ninja-build \
+            pkg-config
+
+      - name: Install vcpkg
+        run: |
+          git clone --depth 1 https://github.com/microsoft/vcpkg.git "$HOME/vcpkg"
+          "$HOME/vcpkg/bootstrap-vcpkg.sh" -disableMetrics
+
+      - name: Show tool versions
+        run: |
+          cmake --version
+          clang++ --version
+          ninja --version
+          "$HOME/vcpkg/vcpkg" version
+
+      - name: Configure
+        run: |
+          cmake \
+            -S . \
+            -B build-ci \
+            -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE="$HOME/vcpkg/scripts/buildsystems/vcpkg.cmake" \
+            -DCMAKE_CXX_COMPILER=clang++
+
+      - name: Build
+        run: cmake --build build-ci
+
+      - name: Run tests
+        run: ctest --test-dir build-ci --output-on-failure
+
+      - name: Run CLI smoke test
+        run: ./build-ci/aistore
+        
