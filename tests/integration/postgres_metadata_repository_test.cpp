@@ -9,8 +9,15 @@
 namespace {
 
 using aistore::metadata::Artifact;
+using aistore::metadata::ChunkRef;
+using aistore::metadata::ObjectDescriptor;
+using aistore::metadata::ObjectLayout;
 using aistore::metadata::PostgresMetadataRepository;
 using aistore::metadata::UuidV7;
+
+const std::string kChunkA(64, 'a');
+
+const std::string kChunkB(64, 'b');
 
 std::string test_database_connection_string() {
     const char* configured = std::getenv("AISTORE_TEST_DB_URL");
@@ -22,7 +29,7 @@ std::string test_database_connection_string() {
     return "dbname=ai_artifact_store_test";
 }
 
-void reset_artifact_data() {
+void reset_metadata_data() {
     pqxx::connection connection{
         test_database_connection_string(),
     };
@@ -31,15 +38,41 @@ void reset_artifact_data() {
 
     transaction
         .exec(
-            "TRUNCATE TABLE artifacts "
-            "RESTART IDENTITY CASCADE")
+            "TRUNCATE TABLE "
+            "    tags, "
+            "    storage_locations, "
+            "    artifact_versions, "
+            "    object_chunks, "
+            "    artifacts, "
+            "    objects, "
+            "    chunks "
+            "RESTART IDENTITY")
         .no_rows();
 
     transaction.commit();
 }
 
+ObjectDescriptor make_object_descriptor() {
+    return ObjectDescriptor{
+        ObjectLayout{
+            {
+                ChunkRef{
+                    .chunk_id = kChunkA,
+                    .offset = 0,
+                    .size = 4,
+                },
+                ChunkRef{
+                    .chunk_id = kChunkB,
+                    .offset = 4,
+                    .size = 2,
+                },
+            },
+        },
+    };
+}
+
 TEST(PostgresMetadataRepositoryTest, CreatesAndReadsArtifact) {
-    reset_artifact_data();
+    reset_metadata_data();
 
     PostgresMetadataRepository repository{
         test_database_connection_string(),
@@ -67,7 +100,7 @@ TEST(PostgresMetadataRepositoryTest, CreatesAndReadsArtifact) {
 }
 
 TEST(PostgresMetadataRepositoryTest, MissingArtifactReturnsNullopt) {
-    reset_artifact_data();
+    reset_metadata_data();
 
     PostgresMetadataRepository repository{
         test_database_connection_string(),
@@ -79,7 +112,7 @@ TEST(PostgresMetadataRepositoryTest, MissingArtifactReturnsNullopt) {
 }
 
 TEST(PostgresMetadataRepositoryTest, DatabaseEnforcesUniqueProjectAndName) {
-    reset_artifact_data();
+    reset_metadata_data();
 
     PostgresMetadataRepository repository{
         test_database_connection_string(),
@@ -100,6 +133,160 @@ TEST(PostgresMetadataRepositoryTest, DatabaseEnforcesUniqueProjectAndName) {
     repository.create_artifact(first);
 
     EXPECT_THROW(repository.create_artifact(second), pqxx::sql_error);
+}
+
+TEST(PostgresMetadataRepositoryTest, RegistersAndReadsObjectTransactionally) {
+    reset_metadata_data();
+
+    PostgresMetadataRepository repository{
+        test_database_connection_string(),
+    };
+
+    const ObjectDescriptor descriptor = make_object_descriptor();
+
+    repository.register_object(descriptor);
+
+    const auto restored = repository.get_object(descriptor.object_id());
+
+    ASSERT_TRUE(restored.has_value());
+
+    EXPECT_EQ(restored->object_id(), descriptor.object_id());
+
+    EXPECT_EQ(restored->canonical_bytes(), descriptor.canonical_bytes());
+
+    EXPECT_EQ(restored->layout().total_size(), 6U);
+
+    ASSERT_EQ(restored->layout().chunks().size(), 2U);
+
+    EXPECT_EQ(restored->layout().chunks()[0].chunk_id, kChunkA);
+
+    EXPECT_EQ(restored->layout().chunks()[0].offset, 0U);
+
+    EXPECT_EQ(restored->layout().chunks()[0].size, 4U);
+
+    EXPECT_EQ(restored->layout().chunks()[1].chunk_id, kChunkB);
+
+    EXPECT_EQ(restored->layout().chunks()[1].offset, 4U);
+
+    EXPECT_EQ(restored->layout().chunks()[1].size, 2U);
+}
+
+TEST(PostgresMetadataRepositoryTest, RegisterObjectIsIdempotent) {
+    reset_metadata_data();
+
+    PostgresMetadataRepository repository{
+        test_database_connection_string(),
+    };
+
+    const ObjectDescriptor descriptor = make_object_descriptor();
+
+    repository.register_object(descriptor);
+
+    repository.register_object(descriptor);
+
+    pqxx::connection connection{
+        test_database_connection_string(),
+    };
+
+    pqxx::work transaction{connection};
+
+    EXPECT_EQ(transaction.query_value<long long>("SELECT COUNT(*) FROM objects"), 1);
+
+    EXPECT_EQ(transaction.query_value<long long>("SELECT COUNT(*) FROM chunks"), 2);
+
+    EXPECT_EQ(transaction.query_value<long long>("SELECT COUNT(*) FROM object_chunks"), 2);
+
+    transaction.commit();
+}
+
+TEST(PostgresMetadataRepositoryTest, RegisterObjectRollsBackOnChunkSizeConflict) {
+    reset_metadata_data();
+
+    {
+        pqxx::connection connection{
+            test_database_connection_string(),
+        };
+
+        pqxx::work transaction{connection};
+
+        transaction
+            .exec(
+                "INSERT INTO chunks ("
+                "    chunk_id, "
+                "    size_bytes"
+                ") "
+                "VALUES ("
+                "    $1, "
+                "    $2"
+                ")",
+                pqxx::params{
+                    kChunkB,
+                    99,
+                })
+            .no_rows();
+
+        transaction.commit();
+    }
+
+    PostgresMetadataRepository repository{
+        test_database_connection_string(),
+    };
+
+    const ObjectDescriptor descriptor = make_object_descriptor();
+
+    EXPECT_THROW(repository.register_object(descriptor), std::runtime_error);
+
+    pqxx::connection connection{
+        test_database_connection_string(),
+    };
+
+    pqxx::work transaction{connection};
+
+    const bool chunk_a_exists = transaction.query_value<bool>(
+        "SELECT EXISTS ("
+        "    SELECT 1 "
+        "    FROM chunks "
+        "    WHERE chunk_id = $1"
+        ")",
+        pqxx::params{
+            kChunkA,
+        });
+
+    const bool object_exists = transaction.query_value<bool>(
+        "SELECT EXISTS ("
+        "    SELECT 1 "
+        "    FROM objects "
+        "    WHERE object_id = $1"
+        ")",
+        pqxx::params{
+            descriptor.object_id(),
+        });
+
+    const long long existing_chunk_b_size = transaction.query_value<long long>(
+        "SELECT size_bytes "
+        "FROM chunks "
+        "WHERE chunk_id = $1",
+        pqxx::params{
+            kChunkB,
+        });
+
+    EXPECT_FALSE(chunk_a_exists);
+    EXPECT_FALSE(object_exists);
+    EXPECT_EQ(existing_chunk_b_size, 99);
+
+    transaction.commit();
+}
+
+TEST(PostgresMetadataRepositoryTest, MissingObjectReturnsNullopt) {
+    reset_metadata_data();
+
+    PostgresMetadataRepository repository{
+        test_database_connection_string(),
+    };
+
+    const auto restored = repository.get_object(std::string(64, 'c'));
+
+    EXPECT_FALSE(restored.has_value());
 }
 
 }  // namespace

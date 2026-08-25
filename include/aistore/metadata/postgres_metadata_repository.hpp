@@ -4,8 +4,10 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 
 #include "aistore/metadata/artifact_model.hpp"
+#include "aistore/metadata/object_descriptor.hpp"
 
 namespace aistore::metadata {
 
@@ -26,6 +28,10 @@ class PostgresMetadataRepository {
     void create_artifact(const Artifact& artifact);
 
     [[nodiscard]] std::optional<Artifact> get_artifact(const UuidV7& artifact_id);
+
+    void register_object(const ObjectDescriptor& descriptor);
+
+    [[nodiscard]] std::optional<ObjectDescriptor> get_object(std::string_view object_id);
 
    private:
     class Impl;
