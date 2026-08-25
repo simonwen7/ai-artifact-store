@@ -16,6 +16,27 @@ jobs:
     name: Build and Test
     runs-on: ubuntu-latest
 
+    env:
+      AISTORE_TEST_DB_URL: postgresql://postgres:postgres@localhost:5432/ai_artifact_store_test
+
+    services:
+      postgres:
+        image: postgres:17
+
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: ai_artifact_store_test
+
+        ports:
+          - 5432:5432
+
+        options: >-
+          --health-cmd "pg_isready -U postgres -d ai_artifact_store_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
@@ -26,7 +47,8 @@ jobs:
           sudo apt-get install -y \
             clang \
             ninja-build \
-            pkg-config
+            pkg-config \
+            postgresql-client
 
       - name: Install vcpkg
         run: |
@@ -38,7 +60,19 @@ jobs:
           cmake --version
           clang++ --version
           ninja --version
+          psql --version
           "$HOME/vcpkg/vcpkg" version
+
+      - name: Apply database migrations
+        env:
+          PGPASSWORD: postgres
+        run: |
+          psql \
+            -h localhost \
+            -U postgres \
+            -d ai_artifact_store_test \
+            -v ON_ERROR_STOP=1 \
+            -f migrations/001_initial_schema.sql
 
       - name: Configure
         run: |
