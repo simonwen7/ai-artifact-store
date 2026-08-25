@@ -1,7 +1,7 @@
+#include <gtest/gtest.h>
+
 #include <array>
 #include <span>
-
-#include <gtest/gtest.h>
 
 TEST(BuildConfigurationTest, SupportsCpp20) {
     const std::array<int, 3> values{1, 2, 3};

@@ -1,0 +1,13 @@
+Checks: >
+  -*,
+  bugprone-*,
+  performance-*,
+  portability-*,
+  modernize-*,
+  -modernize-use-trailing-return-type
+
+WarningsAsErrors: ''
+
+HeaderFilterRegex: '.*'
+
+FormatStyle: file

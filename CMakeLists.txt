@@ -6,6 +6,8 @@ project(
     LANGUAGES CXX
 )
 
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
 add_executable(
     aistore
     apps/aistore-cli/main.cpp
