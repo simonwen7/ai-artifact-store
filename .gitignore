@@ -1,0 +1,20 @@
+# Build directories
+build/
+cmake-build-*/
+
+# CMake generated files
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+compile_commands.json
+
+# Compiler-generated files
+*.o
+*.obj
+*.a
+*.so
+*.dylib
+
+# macOS
+.DS_Store
