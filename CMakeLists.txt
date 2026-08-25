@@ -10,6 +10,11 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 find_package(OpenSSL REQUIRED)
 find_package(libpqxx CONFIG REQUIRED)
+find_package(
+    Boost CONFIG REQUIRED
+    COMPONENTS json
+)
+find_package(Threads REQUIRED)
 
 add_library(
     aistore_hashing
@@ -170,6 +175,87 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
     )
 endif()
 
+add_library(
+    aistore_http
+    src/http/http_server.cpp
+)
+
+target_include_directories(
+    aistore_http
+    PUBLIC
+    ${PROJECT_SOURCE_DIR}/include
+)
+
+target_compile_features(
+    aistore_http
+    PUBLIC
+    cxx_std_20
+)
+
+set_target_properties(
+    aistore_http
+    PROPERTIES
+    CXX_EXTENSIONS OFF
+)
+
+target_link_libraries(
+    aistore_http
+    PUBLIC
+    Boost::headers
+    Threads::Threads
+)
+
+if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+    target_compile_options(
+        aistore_http
+        PRIVATE
+        -Wall
+        -Wextra
+        -Wpedantic
+    )
+endif()
+
+add_library(
+    aistore_services
+    src/service/storage_node_service.cpp
+    src/service/metadata_service.cpp
+)
+
+target_include_directories(
+    aistore_services
+    PUBLIC
+    ${PROJECT_SOURCE_DIR}/include
+)
+
+target_compile_features(
+    aistore_services
+    PUBLIC
+    cxx_std_20
+)
+
+set_target_properties(
+    aistore_services
+    PROPERTIES
+    CXX_EXTENSIONS OFF
+)
+
+target_link_libraries(
+    aistore_services
+    PUBLIC
+    aistore_http
+    Boost::json
+)
+
+if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+    target_compile_options(
+        aistore_services
+        PRIVATE
+        -Wall
+        -Wextra
+        -Wpedantic
+    )
+endif()
+
 add_executable(
     aistore
     apps/aistore-cli/main.cpp
@@ -190,6 +276,76 @@ set_target_properties(
 if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
     target_compile_options(
         aistore
+        PRIVATE
+        -Wall
+        -Wextra
+        -Wpedantic
+    )
+endif()
+
+add_executable(
+    aistore_storage_node
+    apps/storage-node/main.cpp
+)
+
+target_compile_features(
+    aistore_storage_node
+    PRIVATE
+    cxx_std_20
+)
+
+set_target_properties(
+    aistore_storage_node
+    PROPERTIES
+    OUTPUT_NAME storage-node
+    CXX_EXTENSIONS OFF
+)
+
+target_link_libraries(
+    aistore_storage_node
+    PRIVATE
+    aistore_http
+    aistore_services
+)
+
+if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+    target_compile_options(
+        aistore_storage_node
+        PRIVATE
+        -Wall
+        -Wextra
+        -Wpedantic
+    )
+endif()
+
+add_executable(
+    aistore_metadata_service
+    apps/metadata-service/main.cpp
+)
+
+target_compile_features(
+    aistore_metadata_service
+    PRIVATE
+    cxx_std_20
+)
+
+set_target_properties(
+    aistore_metadata_service
+    PROPERTIES
+    OUTPUT_NAME metadata-service
+    CXX_EXTENSIONS OFF
+)
+
+target_link_libraries(
+    aistore_metadata_service
+    PRIVATE
+    aistore_http
+    aistore_services
+)
+
+if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+    target_compile_options(
+        aistore_metadata_service
         PRIVATE
         -Wall
         -Wextra
@@ -391,5 +547,20 @@ if(BUILD_TESTING)
         PRIVATE
         aistore_metadata
         libpqxx::pqxx
+    )
+
+    aistore_add_test(
+        aistore_http_service_health_tests
+        tests/integration/http_service_health_test.cpp
+    )
+
+    target_link_libraries(
+        aistore_http_service_health_tests
+        PRIVATE
+        aistore_http
+        aistore_services
+        Boost::json
+        Boost::headers
+        Threads::Threads
     )
 endif()

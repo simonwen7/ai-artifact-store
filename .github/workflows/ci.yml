@@ -112,4 +112,9 @@ jobs:
 
       - name: Run CLI smoke test
         run: ./build-ci/aistore
+
+      - name: Verify service binaries
+        run: |
+          test -x ./build-ci/storage-node
+          test -x ./build-ci/metadata-service
         
