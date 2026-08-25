@@ -44,11 +44,13 @@ class PostgresMetadataRepository {
 
     void create_version(const ArtifactVersion& version);
 
-    [[nodiscard]] std::optional<ArtifactVersion> get_version(const UuidV7& version_id);
+    [[nodiscard]] std::optional<ArtifactVersion> get_version(std::string_view version_id);
 
-    void set_tag(const UuidV7& artifact_id, std::string_view tag_name, const UuidV7& version_id);
+    void set_version_state(std::string_view version_id, VersionState state);
 
-    [[nodiscard]] std::optional<UuidV7> get_tag(const UuidV7& artifact_id, std::string_view tag_name);
+    void set_tag(const UuidV7& artifact_id, std::string_view tag_name, std::string_view version_id);
+
+    [[nodiscard]] std::optional<std::string> get_tag(const UuidV7& artifact_id, std::string_view tag_name);
 
     void register_storage_location(const StorageLocation& location);
 

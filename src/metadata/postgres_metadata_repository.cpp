@@ -88,6 +88,22 @@ void validate_layout_id(std::string_view layout_id) {
     }
 }
 
+void validate_version_id(std::string_view version_id) {
+    if (version_id.size() != 64) {
+        throw std::invalid_argument("version ID must contain exactly 64 hexadecimal characters");
+    }
+
+    for (const char character : version_id) {
+        const bool is_digit = character >= '0' && character <= '9';
+
+        const bool is_lower_hex = character >= 'a' && character <= 'f';
+
+        if (!is_digit && !is_lower_hex) {
+            throw std::invalid_argument("version ID must use lowercase hexadecimal characters");
+        }
+    }
+}
+
 std::string_view version_state_to_string(VersionState state) {
     switch (state) {
         case VersionState::Staging:
@@ -503,38 +519,77 @@ class PostgresMetadataRepository::Impl {
                 "    version_id, "
                 "    artifact_id, "
                 "    root_object_id, "
+                "    parent_version_id, "
+                "    descriptor_version, "
+                "    canonical_descriptor, "
                 "    state"
                 ") "
                 "VALUES ("
-                "    $1::uuid, "
+                "    $1, "
                 "    $2::uuid, "
                 "    $3, "
-                "    $4"
+                "    $4, "
+                "    $5, "
+                "    $6::bytea, "
+                "    $7"
                 ")",
                 pqxx::params{
-                    version.version_id().str(),
+                    version.version_id(),
                     version.artifact_id().str(),
                     version.root_object_id(),
+                    version.parent_version_id(),
+                    static_cast<int>(ArtifactVersion::kFormatVersion),
+                    version.canonical_bytes(),
                     version_state_to_string(version.state()),
                 })
             .no_rows();
 
+        for (const auto& [key, value] : version.immutable_metadata()) {
+            transaction
+                .exec(
+                    "INSERT INTO artifact_version_metadata ("
+                    "    version_id, "
+                    "    metadata_key, "
+                    "    metadata_value"
+                    ") "
+                    "VALUES ("
+                    "    $1, "
+                    "    $2, "
+                    "    $3"
+                    ")",
+                    pqxx::params{
+                        version.version_id(),
+                        key,
+                        value,
+                    })
+                .no_rows();
+        }
+
         transaction.commit();
     }
 
-    [[nodiscard]] std::optional<ArtifactVersion> get_version(const UuidV7& version_id) {
+    [[nodiscard]] std::optional<ArtifactVersion> get_version(std::string_view version_id) {
+        validate_version_id(version_id);
+
         pqxx::work transaction{connection_};
 
-        auto stored = transaction.query01<std::string, std::string, std::string, std::string>(
+        auto stored = transaction.query01<std::string, std::string, std::string, std::optional<std::string>, int,
+                                          std::string, std::string>(
             "SELECT "
-            "    version_id::text, "
+            "    version_id, "
             "    artifact_id::text, "
             "    root_object_id, "
+            "    parent_version_id, "
+            "    descriptor_version, "
+            "    encode("
+            "        canonical_descriptor, "
+            "        'hex'"
+            "    ), "
             "    state "
             "FROM artifact_versions "
-            "WHERE version_id = $1::uuid",
+            "WHERE version_id = $1",
             pqxx::params{
-                version_id.str(),
+                version_id,
             });
 
         if (!stored.has_value()) {
@@ -542,28 +597,82 @@ class PostgresMetadataRepository::Impl {
             return std::nullopt;
         }
 
-        auto [stored_version_id, stored_artifact_id, root_object_id, state] = std::move(*stored);
+        auto [stored_version_id, stored_artifact_id, root_object_id, parent_version_id, descriptor_version,
+              stored_descriptor_hex, state] = std::move(*stored);
 
-        const VersionState version_state = version_state_from_string(state);
+        if (std::cmp_not_equal(descriptor_version, ArtifactVersion::kFormatVersion)) {
+            throw std::runtime_error("stored artifact version uses an unsupported descriptor version");
+        }
 
-        transaction.commit();
+        ArtifactVersion::ImmutableMetadata immutable_metadata;
 
-        return ArtifactVersion{
-            UuidV7{
-                std::move(stored_version_id),
-            },
+        for (auto [metadata_key, metadata_value] :
+             transaction.query<std::string, std::string>("SELECT "
+                                                         "    metadata_key, "
+                                                         "    metadata_value "
+                                                         "FROM artifact_version_metadata "
+                                                         "WHERE version_id = $1 "
+                                                         "ORDER BY metadata_key",
+                                                         pqxx::params{
+                                                             version_id,
+                                                         })) {
+            immutable_metadata.emplace(std::move(metadata_key), std::move(metadata_value));
+        }
+
+        ArtifactVersion reconstructed{
             UuidV7{
                 std::move(stored_artifact_id),
             },
             std::move(root_object_id),
-            version_state,
+            std::move(parent_version_id),
+            std::move(immutable_metadata),
+            version_state_from_string(state),
         };
+
+        if (reconstructed.version_id() != stored_version_id) {
+            throw std::runtime_error("stored artifact version does not match version ID");
+        }
+
+        const std::string reconstructed_descriptor_hex = bytes_to_hex(std::span<const std::byte>{
+            reconstructed.canonical_bytes(),
+        });
+
+        if (reconstructed_descriptor_hex != stored_descriptor_hex) {
+            throw std::runtime_error("stored canonical descriptor does not match artifact version");
+        }
+
+        transaction.commit();
+
+        return reconstructed;
     }
 
-    void set_tag(const UuidV7& artifact_id, std::string_view tag_name, const UuidV7& version_id) {
+    void set_version_state(std::string_view version_id, VersionState state) {
+        validate_version_id(version_id);
+
+        pqxx::work transaction{connection_};
+
+        const pqxx::result updated = transaction.exec(
+            "UPDATE artifact_versions "
+            "SET state = $2 "
+            "WHERE version_id = $1",
+            pqxx::params{
+                version_id,
+                version_state_to_string(state),
+            });
+
+        if (updated.affected_rows() != 1U) {
+            throw std::runtime_error("artifact version does not exist");
+        }
+
+        transaction.commit();
+    }
+
+    void set_tag(const UuidV7& artifact_id, std::string_view tag_name, std::string_view version_id) {
         if (tag_name.empty()) {
             throw std::invalid_argument("tag name must not be empty");
         }
+
+        validate_version_id(version_id);
 
         pqxx::work transaction{connection_};
 
@@ -577,7 +686,7 @@ class PostgresMetadataRepository::Impl {
                 "VALUES ("
                 "    $1::uuid, "
                 "    $2, "
-                "    $3::uuid"
+                "    $3"
                 ") "
                 "ON CONFLICT (artifact_id, tag_name) "
                 "DO UPDATE SET "
@@ -586,14 +695,14 @@ class PostgresMetadataRepository::Impl {
                 pqxx::params{
                     artifact_id.str(),
                     tag_name,
-                    version_id.str(),
+                    version_id,
                 })
             .no_rows();
 
         transaction.commit();
     }
 
-    [[nodiscard]] std::optional<UuidV7> get_tag(const UuidV7& artifact_id, std::string_view tag_name) {
+    [[nodiscard]] std::optional<std::string> get_tag(const UuidV7& artifact_id, std::string_view tag_name) {
         if (tag_name.empty()) {
             throw std::invalid_argument("tag name must not be empty");
         }
@@ -602,7 +711,7 @@ class PostgresMetadataRepository::Impl {
 
         auto stored = transaction.query01<std::string>(
             "SELECT "
-            "    version_id::text "
+            "    version_id "
             "FROM tags "
             "WHERE artifact_id = $1::uuid "
             "  AND tag_name = $2",
@@ -620,9 +729,7 @@ class PostgresMetadataRepository::Impl {
 
         transaction.commit();
 
-        return UuidV7{
-            std::move(stored_version_id),
-        };
+        return stored_version_id;
     }
 
     void register_storage_location(const StorageLocation& location) {
@@ -912,16 +1019,20 @@ std::vector<ObjectLayoutDescriptor> PostgresMetadataRepository::get_object_layou
 
 void PostgresMetadataRepository::create_version(const ArtifactVersion& version) { impl_->create_version(version); }
 
-std::optional<ArtifactVersion> PostgresMetadataRepository::get_version(const UuidV7& version_id) {
+std::optional<ArtifactVersion> PostgresMetadataRepository::get_version(std::string_view version_id) {
     return impl_->get_version(version_id);
 }
 
+void PostgresMetadataRepository::set_version_state(std::string_view version_id, VersionState state) {
+    impl_->set_version_state(version_id, state);
+}
+
 void PostgresMetadataRepository::set_tag(const UuidV7& artifact_id, std::string_view tag_name,
-                                         const UuidV7& version_id) {
+                                         std::string_view version_id) {
     impl_->set_tag(artifact_id, tag_name, version_id);
 }
 
-std::optional<UuidV7> PostgresMetadataRepository::get_tag(const UuidV7& artifact_id, std::string_view tag_name) {
+std::optional<std::string> PostgresMetadataRepository::get_tag(const UuidV7& artifact_id, std::string_view tag_name) {
     return impl_->get_tag(artifact_id, tag_name);
 }
 

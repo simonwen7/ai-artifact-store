@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <optional>
 #include <pqxx/pqxx>
 #include <string>
 #include <vector>
@@ -54,6 +55,7 @@ void reset_metadata_data() {
         .exec(
             "TRUNCATE TABLE "
             "    tags, "
+            "    artifact_version_metadata, "
             "    storage_locations, "
             "    artifact_versions, "
             "    object_layout_chunks, "
@@ -586,31 +588,32 @@ TEST(PostgresMetadataRepositoryTest, CreatesAndReadsArtifactVersion) {
 
     repository.register_object(object);
 
-    const UuidV7 version_id = UuidV7::generate();
-
     const ArtifactVersion version{
-        version_id,
-        artifact_id,
-        object.object_id(),
-        VersionState::Committed,
+        artifact_id, object.object_id(), std::nullopt, ArtifactVersion::ImmutableMetadata{}, VersionState::Committed,
     };
 
     repository.create_version(version);
 
-    const auto restored = repository.get_version(version_id);
+    const auto restored = repository.get_version(version.version_id());
 
     ASSERT_TRUE(restored.has_value());
 
-    EXPECT_EQ(restored->version_id(), version_id);
+    EXPECT_EQ(restored->version_id(), version.version_id());
 
     EXPECT_EQ(restored->artifact_id(), artifact_id);
 
     EXPECT_EQ(restored->root_object_id(), object.object_id());
 
+    EXPECT_FALSE(restored->parent_version_id().has_value());
+
+    EXPECT_TRUE(restored->immutable_metadata().empty());
+
     EXPECT_EQ(restored->state(), VersionState::Committed);
+
+    EXPECT_EQ(restored->canonical_bytes(), version.canonical_bytes());
 }
 
-TEST(PostgresMetadataRepositoryTest, PreservesAllArtifactVersionStates) {
+TEST(PostgresMetadataRepositoryTest, PersistsParentAndImmutableMetadata) {
     reset_metadata_data();
 
     PostgresMetadataRepository repository{
@@ -629,46 +632,96 @@ TEST(PostgresMetadataRepositoryTest, PreservesAllArtifactVersionStates) {
 
     repository.register_object(object);
 
-    const ArtifactVersion staging{
-        UuidV7::generate(),
+    const ArtifactVersion parent{
         artifact_id,
         object.object_id(),
-        VersionState::Staging,
-    };
-
-    const ArtifactVersion committed{
-        UuidV7::generate(),
-        artifact_id,
-        object.object_id(),
+        std::nullopt,
+        ArtifactVersion::ImmutableMetadata{
+            {"stage", "base"},
+        },
         VersionState::Committed,
     };
 
-    const ArtifactVersion failed{
-        UuidV7::generate(),
+    repository.create_version(parent);
+
+    const ArtifactVersion child{
         artifact_id,
         object.object_id(),
-        VersionState::Failed,
+        parent.version_id(),
+        ArtifactVersion::ImmutableMetadata{
+            {"epoch", "2"},
+            {"framework", "pytorch"},
+        },
+        VersionState::Committed,
     };
 
-    repository.create_version(staging);
-    repository.create_version(committed);
-    repository.create_version(failed);
+    repository.create_version(child);
 
-    const auto restored_staging = repository.get_version(staging.version_id());
+    const auto restored = repository.get_version(child.version_id());
 
-    const auto restored_committed = repository.get_version(committed.version_id());
+    ASSERT_TRUE(restored.has_value());
 
-    const auto restored_failed = repository.get_version(failed.version_id());
+    ASSERT_TRUE(restored->parent_version_id().has_value());
 
-    ASSERT_TRUE(restored_staging.has_value());
-    ASSERT_TRUE(restored_committed.has_value());
-    ASSERT_TRUE(restored_failed.has_value());
+    EXPECT_EQ(*restored->parent_version_id(), parent.version_id());
 
-    EXPECT_EQ(restored_staging->state(), VersionState::Staging);
+    EXPECT_EQ(restored->immutable_metadata(), child.immutable_metadata());
 
-    EXPECT_EQ(restored_committed->state(), VersionState::Committed);
+    EXPECT_EQ(restored->version_id(), child.version_id());
+}
 
-    EXPECT_EQ(restored_failed->state(), VersionState::Failed);
+TEST(PostgresMetadataRepositoryTest, UpdatesOperationalVersionStateWithoutChangingIdentity) {
+    reset_metadata_data();
+
+    PostgresMetadataRepository repository{
+        test_database_connection_string(),
+    };
+
+    const UuidV7 artifact_id = UuidV7::generate();
+
+    repository.create_artifact(Artifact{
+        artifact_id,
+        "checkpoint",
+        "training-project",
+    });
+
+    const Object object = make_object();
+
+    repository.register_object(object);
+
+    const ArtifactVersion version{
+        artifact_id,
+        object.object_id(),
+        std::nullopt,
+        ArtifactVersion::ImmutableMetadata{
+            {"epoch", "1"},
+        },
+        VersionState::Staging,
+    };
+
+    repository.create_version(version);
+
+    const std::string version_id = version.version_id();
+
+    repository.set_version_state(version_id, VersionState::Committed);
+
+    const auto restored = repository.get_version(version_id);
+
+    ASSERT_TRUE(restored.has_value());
+
+    EXPECT_EQ(restored->version_id(), version_id);
+
+    EXPECT_EQ(restored->state(), VersionState::Committed);
+
+    EXPECT_EQ(restored->artifact_id(), version.artifact_id());
+
+    EXPECT_EQ(restored->root_object_id(), version.root_object_id());
+
+    EXPECT_EQ(restored->parent_version_id(), version.parent_version_id());
+
+    EXPECT_EQ(restored->immutable_metadata(), version.immutable_metadata());
+
+    EXPECT_EQ(restored->canonical_bytes(), version.canonical_bytes());
 }
 
 TEST(PostgresMetadataRepositoryTest, MissingArtifactVersionReturnsNullopt) {
@@ -678,7 +731,7 @@ TEST(PostgresMetadataRepositoryTest, MissingArtifactVersionReturnsNullopt) {
         test_database_connection_string(),
     };
 
-    const auto restored = repository.get_version(UuidV7::generate());
+    const auto restored = repository.get_version(std::string(64, 'f'));
 
     EXPECT_FALSE(restored.has_value());
 }
@@ -695,9 +748,7 @@ TEST(PostgresMetadataRepositoryTest, DatabaseRejectsVersionForMissingArtifact) {
     repository.register_object(object);
 
     const ArtifactVersion version{
-        UuidV7::generate(),
-        UuidV7::generate(),
-        object.object_id(),
+        UuidV7::generate(),      object.object_id(), std::nullopt, ArtifactVersion::ImmutableMetadata{},
         VersionState::Committed,
     };
 
@@ -720,13 +771,145 @@ TEST(PostgresMetadataRepositoryTest, DatabaseRejectsVersionForMissingRootObject)
     });
 
     const ArtifactVersion version{
-        UuidV7::generate(),
-        artifact_id,
-        std::string(64, 'c'),
-        VersionState::Committed,
+        artifact_id, std::string(64, 'e'), std::nullopt, ArtifactVersion::ImmutableMetadata{}, VersionState::Committed,
     };
 
     EXPECT_THROW(repository.create_version(version), pqxx::foreign_key_violation);
+}
+
+TEST(PostgresMetadataRepositoryTest, DatabaseRejectsParentVersionFromDifferentArtifact) {
+    reset_metadata_data();
+
+    PostgresMetadataRepository repository{
+        test_database_connection_string(),
+    };
+
+    const UuidV7 artifact_a_id = UuidV7::generate();
+
+    const UuidV7 artifact_b_id = UuidV7::generate();
+
+    repository.create_artifact(Artifact{
+        artifact_a_id,
+        "checkpoint-a",
+        "training-project",
+    });
+
+    repository.create_artifact(Artifact{
+        artifact_b_id,
+        "checkpoint-b",
+        "training-project",
+    });
+
+    const Object object = make_object();
+
+    repository.register_object(object);
+
+    const ArtifactVersion parent{
+        artifact_a_id, object.object_id(), std::nullopt, ArtifactVersion::ImmutableMetadata{}, VersionState::Committed,
+    };
+
+    repository.create_version(parent);
+
+    const ArtifactVersion child{
+        artifact_b_id,           object.object_id(), parent.version_id(), ArtifactVersion::ImmutableMetadata{},
+        VersionState::Committed,
+    };
+
+    EXPECT_THROW(repository.create_version(child), pqxx::foreign_key_violation);
+}
+
+TEST(PostgresMetadataRepositoryTest, DuplicateSemanticVersionIsRejected) {
+    reset_metadata_data();
+
+    PostgresMetadataRepository repository{
+        test_database_connection_string(),
+    };
+
+    const UuidV7 artifact_id = UuidV7::generate();
+
+    repository.create_artifact(Artifact{
+        artifact_id,
+        "checkpoint",
+        "training-project",
+    });
+
+    const Object object = make_object();
+
+    repository.register_object(object);
+
+    const ArtifactVersion first{
+        artifact_id,
+        object.object_id(),
+        std::nullopt,
+        ArtifactVersion::ImmutableMetadata{
+            {"epoch", "1"},
+        },
+        VersionState::Staging,
+    };
+
+    const ArtifactVersion second{
+        artifact_id,
+        object.object_id(),
+        std::nullopt,
+        ArtifactVersion::ImmutableMetadata{
+            {"epoch", "1"},
+        },
+        VersionState::Committed,
+    };
+
+    EXPECT_EQ(first.version_id(), second.version_id());
+
+    repository.create_version(first);
+
+    EXPECT_THROW(repository.create_version(second), pqxx::unique_violation);
+}
+
+TEST(PostgresMetadataRepositoryTest, DetectsCorruptedStoredVersionDescriptor) {
+    reset_metadata_data();
+
+    PostgresMetadataRepository repository{
+        test_database_connection_string(),
+    };
+
+    const UuidV7 artifact_id = UuidV7::generate();
+
+    repository.create_artifact(Artifact{
+        artifact_id,
+        "checkpoint",
+        "training-project",
+    });
+
+    const Object object = make_object();
+
+    repository.register_object(object);
+
+    const ArtifactVersion version{
+        artifact_id, object.object_id(), std::nullopt, ArtifactVersion::ImmutableMetadata{}, VersionState::Committed,
+    };
+
+    repository.create_version(version);
+
+    {
+        pqxx::connection connection{
+            test_database_connection_string(),
+        };
+
+        pqxx::work transaction{connection};
+
+        transaction
+            .exec(
+                "UPDATE artifact_versions "
+                "SET canonical_descriptor = decode('00', 'hex') "
+                "WHERE version_id = $1",
+                pqxx::params{
+                    version.version_id(),
+                })
+            .no_rows();
+
+        transaction.commit();
+    }
+
+    EXPECT_THROW(static_cast<void>(repository.get_version(version.version_id())), std::runtime_error);
 }
 
 TEST(PostgresMetadataRepositoryTest, CreatesAndReadsTag) {
@@ -749,10 +932,7 @@ TEST(PostgresMetadataRepositoryTest, CreatesAndReadsTag) {
     repository.register_object(object);
 
     const ArtifactVersion version{
-        UuidV7::generate(),
-        artifact_id,
-        object.object_id(),
-        VersionState::Committed,
+        artifact_id, object.object_id(), std::nullopt, ArtifactVersion::ImmutableMetadata{}, VersionState::Committed,
     };
 
     repository.create_version(version);
@@ -786,18 +966,26 @@ TEST(PostgresMetadataRepositoryTest, UpdatingTagMovesExistingReference) {
     repository.register_object(object);
 
     const ArtifactVersion first_version{
-        UuidV7::generate(),
         artifact_id,
         object.object_id(),
+        std::nullopt,
+        ArtifactVersion::ImmutableMetadata{
+            {"epoch", "1"},
+        },
         VersionState::Committed,
     };
 
     const ArtifactVersion second_version{
-        UuidV7::generate(),
         artifact_id,
         object.object_id(),
+        std::nullopt,
+        ArtifactVersion::ImmutableMetadata{
+            {"epoch", "2"},
+        },
         VersionState::Committed,
     };
+
+    EXPECT_NE(first_version.version_id(), second_version.version_id());
 
     repository.create_version(first_version);
 
@@ -872,10 +1060,7 @@ TEST(PostgresMetadataRepositoryTest, DatabaseRejectsTagPointingToDifferentArtifa
     repository.register_object(object);
 
     const ArtifactVersion version_a{
-        UuidV7::generate(),
-        artifact_a_id,
-        object.object_id(),
-        VersionState::Committed,
+        artifact_a_id, object.object_id(), std::nullopt, ArtifactVersion::ImmutableMetadata{}, VersionState::Committed,
     };
 
     repository.create_version(version_a);
