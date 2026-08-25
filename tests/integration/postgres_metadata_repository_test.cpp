@@ -9,11 +9,13 @@
 namespace {
 
 using aistore::metadata::Artifact;
+using aistore::metadata::ArtifactVersion;
 using aistore::metadata::ChunkRef;
 using aistore::metadata::ObjectDescriptor;
 using aistore::metadata::ObjectLayout;
 using aistore::metadata::PostgresMetadataRepository;
 using aistore::metadata::UuidV7;
+using aistore::metadata::VersionState;
 
 const std::string kChunkA(64, 'a');
 
@@ -262,7 +264,7 @@ TEST(PostgresMetadataRepositoryTest, RegisterObjectRollsBackOnChunkSizeConflict)
             descriptor.object_id(),
         });
 
-    const long long existing_chunk_b_size = transaction.query_value<long long>(
+    const auto existing_chunk_b_size = transaction.query_value<long long>(
         "SELECT size_bytes "
         "FROM chunks "
         "WHERE chunk_id = $1",
@@ -287,6 +289,170 @@ TEST(PostgresMetadataRepositoryTest, MissingObjectReturnsNullopt) {
     const auto restored = repository.get_object(std::string(64, 'c'));
 
     EXPECT_FALSE(restored.has_value());
+}
+
+TEST(PostgresMetadataRepositoryTest, CreatesAndReadsArtifactVersion) {
+    reset_metadata_data();
+
+    PostgresMetadataRepository repository{
+        test_database_connection_string(),
+    };
+
+    const UuidV7 artifact_id = UuidV7::generate();
+
+    const Artifact artifact{
+        artifact_id,
+        "training-checkpoint",
+        "recommendation-model",
+    };
+
+    repository.create_artifact(artifact);
+
+    const ObjectDescriptor descriptor = make_object_descriptor();
+
+    repository.register_object(descriptor);
+
+    const UuidV7 version_id = UuidV7::generate();
+
+    const ArtifactVersion version{
+        version_id,
+        artifact_id,
+        descriptor.object_id(),
+        VersionState::Committed,
+    };
+
+    repository.create_version(version);
+
+    const auto restored = repository.get_version(version_id);
+
+    ASSERT_TRUE(restored.has_value());
+
+    EXPECT_EQ(restored->version_id(), version_id);
+
+    EXPECT_EQ(restored->artifact_id(), artifact_id);
+
+    EXPECT_EQ(restored->root_object_id(), descriptor.object_id());
+
+    EXPECT_EQ(restored->state(), VersionState::Committed);
+}
+
+TEST(PostgresMetadataRepositoryTest, PreservesAllArtifactVersionStates) {
+    reset_metadata_data();
+
+    PostgresMetadataRepository repository{
+        test_database_connection_string(),
+    };
+
+    const UuidV7 artifact_id = UuidV7::generate();
+
+    repository.create_artifact(Artifact{
+        artifact_id,
+        "checkpoint",
+        "training-project",
+    });
+
+    const ObjectDescriptor descriptor = make_object_descriptor();
+
+    repository.register_object(descriptor);
+
+    const ArtifactVersion staging{
+        UuidV7::generate(),
+        artifact_id,
+        descriptor.object_id(),
+        VersionState::Staging,
+    };
+
+    const ArtifactVersion committed{
+        UuidV7::generate(),
+        artifact_id,
+        descriptor.object_id(),
+        VersionState::Committed,
+    };
+
+    const ArtifactVersion failed{
+        UuidV7::generate(),
+        artifact_id,
+        descriptor.object_id(),
+        VersionState::Failed,
+    };
+
+    repository.create_version(staging);
+    repository.create_version(committed);
+    repository.create_version(failed);
+
+    const auto restored_staging = repository.get_version(staging.version_id());
+
+    const auto restored_committed = repository.get_version(committed.version_id());
+
+    const auto restored_failed = repository.get_version(failed.version_id());
+
+    ASSERT_TRUE(restored_staging.has_value());
+    ASSERT_TRUE(restored_committed.has_value());
+    ASSERT_TRUE(restored_failed.has_value());
+
+    EXPECT_EQ(restored_staging->state(), VersionState::Staging);
+
+    EXPECT_EQ(restored_committed->state(), VersionState::Committed);
+
+    EXPECT_EQ(restored_failed->state(), VersionState::Failed);
+}
+
+TEST(PostgresMetadataRepositoryTest, MissingArtifactVersionReturnsNullopt) {
+    reset_metadata_data();
+
+    PostgresMetadataRepository repository{
+        test_database_connection_string(),
+    };
+
+    const auto restored = repository.get_version(UuidV7::generate());
+
+    EXPECT_FALSE(restored.has_value());
+}
+
+TEST(PostgresMetadataRepositoryTest, DatabaseRejectsVersionForMissingArtifact) {
+    reset_metadata_data();
+
+    PostgresMetadataRepository repository{
+        test_database_connection_string(),
+    };
+
+    const ObjectDescriptor descriptor = make_object_descriptor();
+
+    repository.register_object(descriptor);
+
+    const ArtifactVersion version{
+        UuidV7::generate(),
+        UuidV7::generate(),
+        descriptor.object_id(),
+        VersionState::Committed,
+    };
+
+    EXPECT_THROW(repository.create_version(version), pqxx::foreign_key_violation);
+}
+
+TEST(PostgresMetadataRepositoryTest, DatabaseRejectsVersionForMissingRootObject) {
+    reset_metadata_data();
+
+    PostgresMetadataRepository repository{
+        test_database_connection_string(),
+    };
+
+    const UuidV7 artifact_id = UuidV7::generate();
+
+    repository.create_artifact(Artifact{
+        artifact_id,
+        "checkpoint",
+        "training-project",
+    });
+
+    const ArtifactVersion version{
+        UuidV7::generate(),
+        artifact_id,
+        std::string(64, 'c'),
+        VersionState::Committed,
+    };
+
+    EXPECT_THROW(repository.create_version(version), pqxx::foreign_key_violation);
 }
 
 }  // namespace

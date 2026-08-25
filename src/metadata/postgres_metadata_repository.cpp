@@ -72,6 +72,37 @@ void validate_object_id(std::string_view object_id) {
     }
 }
 
+std::string_view version_state_to_string(VersionState state) {
+    switch (state) {
+        case VersionState::Staging:
+            return "staging";
+
+        case VersionState::Committed:
+            return "committed";
+
+        case VersionState::Failed:
+            return "failed";
+    }
+
+    throw std::logic_error("unsupported artifact version state");
+}
+
+VersionState version_state_from_string(std::string_view state) {
+    if (state == "staging") {
+        return VersionState::Staging;
+    }
+
+    if (state == "committed") {
+        return VersionState::Committed;
+    }
+
+    if (state == "failed") {
+        return VersionState::Failed;
+    }
+
+    throw std::runtime_error("database contains an unsupported artifact version state");
+}
+
 }  // namespace
 
 class PostgresMetadataRepository::Impl {
@@ -337,6 +368,72 @@ class PostgresMetadataRepository::Impl {
         return descriptor;
     }
 
+    void create_version(const ArtifactVersion& version) {
+        pqxx::work transaction{connection_};
+
+        transaction
+            .exec(
+                "INSERT INTO artifact_versions ("
+                "    version_id, "
+                "    artifact_id, "
+                "    root_object_id, "
+                "    state"
+                ") "
+                "VALUES ("
+                "    $1::uuid, "
+                "    $2::uuid, "
+                "    $3, "
+                "    $4"
+                ")",
+                pqxx::params{
+                    version.version_id().str(),
+                    version.artifact_id().str(),
+                    version.root_object_id(),
+                    version_state_to_string(version.state()),
+                })
+            .no_rows();
+
+        transaction.commit();
+    }
+
+    [[nodiscard]] std::optional<ArtifactVersion> get_version(const UuidV7& version_id) {
+        pqxx::work transaction{connection_};
+
+        auto stored = transaction.query01<std::string, std::string, std::string, std::string>(
+            "SELECT "
+            "    version_id::text, "
+            "    artifact_id::text, "
+            "    root_object_id, "
+            "    state "
+            "FROM artifact_versions "
+            "WHERE version_id = $1::uuid",
+            pqxx::params{
+                version_id.str(),
+            });
+
+        if (!stored.has_value()) {
+            transaction.commit();
+            return std::nullopt;
+        }
+
+        auto [stored_version_id, stored_artifact_id, root_object_id, state] = std::move(*stored);
+
+        const VersionState version_state = version_state_from_string(state);
+
+        transaction.commit();
+
+        return ArtifactVersion{
+            UuidV7{
+                std::move(stored_version_id),
+            },
+            UuidV7{
+                std::move(stored_artifact_id),
+            },
+            std::move(root_object_id),
+            version_state,
+        };
+    }
+
    private:
     void verify_registered_object(pqxx::work& transaction, const ObjectDescriptor& descriptor) {
         const ObjectLayout& layout = descriptor.layout();
@@ -428,6 +525,12 @@ void PostgresMetadataRepository::register_object(const ObjectDescriptor& descrip
 
 std::optional<ObjectDescriptor> PostgresMetadataRepository::get_object(std::string_view object_id) {
     return impl_->get_object(object_id);
+}
+
+void PostgresMetadataRepository::create_version(const ArtifactVersion& version) { impl_->create_version(version); }
+
+std::optional<ArtifactVersion> PostgresMetadataRepository::get_version(const UuidV7& version_id) {
+    return impl_->get_version(version_id);
 }
 
 }  // namespace aistore::metadata

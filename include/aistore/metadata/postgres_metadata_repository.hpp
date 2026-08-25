@@ -33,6 +33,10 @@ class PostgresMetadataRepository {
 
     [[nodiscard]] std::optional<ObjectDescriptor> get_object(std::string_view object_id);
 
+    void create_version(const ArtifactVersion& version);
+
+    [[nodiscard]] std::optional<ArtifactVersion> get_version(const UuidV7& version_id);
+
    private:
     class Impl;
 
