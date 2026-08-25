@@ -37,6 +37,10 @@ class PostgresMetadataRepository {
 
     [[nodiscard]] std::optional<ArtifactVersion> get_version(const UuidV7& version_id);
 
+    void set_tag(const UuidV7& artifact_id, std::string_view tag_name, const UuidV7& version_id);
+
+    [[nodiscard]] std::optional<UuidV7> get_tag(const UuidV7& artifact_id, std::string_view tag_name);
+
    private:
     class Impl;
 

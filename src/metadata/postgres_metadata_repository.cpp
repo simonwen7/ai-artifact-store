@@ -434,6 +434,71 @@ class PostgresMetadataRepository::Impl {
         };
     }
 
+    void set_tag(const UuidV7& artifact_id, std::string_view tag_name, const UuidV7& version_id) {
+        if (tag_name.empty()) {
+            throw std::invalid_argument("tag name must not be empty");
+        }
+
+        pqxx::work transaction{connection_};
+
+        transaction
+            .exec(
+                "INSERT INTO tags ("
+                "    artifact_id, "
+                "    tag_name, "
+                "    version_id"
+                ") "
+                "VALUES ("
+                "    $1::uuid, "
+                "    $2, "
+                "    $3::uuid"
+                ") "
+                "ON CONFLICT (artifact_id, tag_name) "
+                "DO UPDATE SET "
+                "    version_id = EXCLUDED.version_id, "
+                "    updated_at = CURRENT_TIMESTAMP",
+                pqxx::params{
+                    artifact_id.str(),
+                    tag_name,
+                    version_id.str(),
+                })
+            .no_rows();
+
+        transaction.commit();
+    }
+
+    [[nodiscard]] std::optional<UuidV7> get_tag(const UuidV7& artifact_id, std::string_view tag_name) {
+        if (tag_name.empty()) {
+            throw std::invalid_argument("tag name must not be empty");
+        }
+
+        pqxx::work transaction{connection_};
+
+        auto stored = transaction.query01<std::string>(
+            "SELECT "
+            "    version_id::text "
+            "FROM tags "
+            "WHERE artifact_id = $1::uuid "
+            "  AND tag_name = $2",
+            pqxx::params{
+                artifact_id.str(),
+                tag_name,
+            });
+
+        if (!stored.has_value()) {
+            transaction.commit();
+            return std::nullopt;
+        }
+
+        auto [stored_version_id] = std::move(*stored);
+
+        transaction.commit();
+
+        return UuidV7{
+            std::move(stored_version_id),
+        };
+    }
+
    private:
     void verify_registered_object(pqxx::work& transaction, const ObjectDescriptor& descriptor) {
         const ObjectLayout& layout = descriptor.layout();
@@ -531,6 +596,15 @@ void PostgresMetadataRepository::create_version(const ArtifactVersion& version) 
 
 std::optional<ArtifactVersion> PostgresMetadataRepository::get_version(const UuidV7& version_id) {
     return impl_->get_version(version_id);
+}
+
+void PostgresMetadataRepository::set_tag(const UuidV7& artifact_id, std::string_view tag_name,
+                                         const UuidV7& version_id) {
+    impl_->set_tag(artifact_id, tag_name, version_id);
+}
+
+std::optional<UuidV7> PostgresMetadataRepository::get_tag(const UuidV7& artifact_id, std::string_view tag_name) {
+    return impl_->get_tag(artifact_id, tag_name);
 }
 
 }  // namespace aistore::metadata

@@ -455,4 +455,162 @@ TEST(PostgresMetadataRepositoryTest, DatabaseRejectsVersionForMissingRootObject)
     EXPECT_THROW(repository.create_version(version), pqxx::foreign_key_violation);
 }
 
+TEST(PostgresMetadataRepositoryTest, CreatesAndReadsTag) {
+    reset_metadata_data();
+
+    PostgresMetadataRepository repository{
+        test_database_connection_string(),
+    };
+
+    const UuidV7 artifact_id = UuidV7::generate();
+
+    repository.create_artifact(Artifact{
+        artifact_id,
+        "checkpoint",
+        "training-project",
+    });
+
+    const ObjectDescriptor descriptor = make_object_descriptor();
+
+    repository.register_object(descriptor);
+
+    const ArtifactVersion version{
+        UuidV7::generate(),
+        artifact_id,
+        descriptor.object_id(),
+        VersionState::Committed,
+    };
+
+    repository.create_version(version);
+
+    repository.set_tag(artifact_id, "latest", version.version_id());
+
+    const auto restored = repository.get_tag(artifact_id, "latest");
+
+    ASSERT_TRUE(restored.has_value());
+
+    EXPECT_EQ(*restored, version.version_id());
+}
+
+TEST(PostgresMetadataRepositoryTest, UpdatingTagMovesExistingReference) {
+    reset_metadata_data();
+
+    PostgresMetadataRepository repository{
+        test_database_connection_string(),
+    };
+
+    const UuidV7 artifact_id = UuidV7::generate();
+
+    repository.create_artifact(Artifact{
+        artifact_id,
+        "checkpoint",
+        "training-project",
+    });
+
+    const ObjectDescriptor descriptor = make_object_descriptor();
+
+    repository.register_object(descriptor);
+
+    const ArtifactVersion first_version{
+        UuidV7::generate(),
+        artifact_id,
+        descriptor.object_id(),
+        VersionState::Committed,
+    };
+
+    const ArtifactVersion second_version{
+        UuidV7::generate(),
+        artifact_id,
+        descriptor.object_id(),
+        VersionState::Committed,
+    };
+
+    repository.create_version(first_version);
+
+    repository.create_version(second_version);
+
+    repository.set_tag(artifact_id, "latest", first_version.version_id());
+
+    repository.set_tag(artifact_id, "latest", second_version.version_id());
+
+    const auto restored = repository.get_tag(artifact_id, "latest");
+
+    ASSERT_TRUE(restored.has_value());
+
+    EXPECT_EQ(*restored, second_version.version_id());
+
+    pqxx::connection connection{
+        test_database_connection_string(),
+    };
+
+    pqxx::work transaction{connection};
+
+    EXPECT_EQ(transaction.query_value<long long>("SELECT COUNT(*) "
+                                                 "FROM tags "
+                                                 "WHERE artifact_id = $1::uuid "
+                                                 "  AND tag_name = $2",
+                                                 pqxx::params{
+                                                     artifact_id.str(),
+                                                     "latest",
+                                                 }),
+              1);
+
+    transaction.commit();
+}
+
+TEST(PostgresMetadataRepositoryTest, MissingTagReturnsNullopt) {
+    reset_metadata_data();
+
+    PostgresMetadataRepository repository{
+        test_database_connection_string(),
+    };
+
+    const auto restored = repository.get_tag(UuidV7::generate(), "latest");
+
+    EXPECT_FALSE(restored.has_value());
+}
+
+TEST(PostgresMetadataRepositoryTest, DatabaseRejectsTagPointingToDifferentArtifactVersion) {
+    reset_metadata_data();
+
+    PostgresMetadataRepository repository{
+        test_database_connection_string(),
+    };
+
+    const UuidV7 artifact_a_id = UuidV7::generate();
+
+    const UuidV7 artifact_b_id = UuidV7::generate();
+
+    repository.create_artifact(Artifact{
+        artifact_a_id,
+        "checkpoint-a",
+        "training-project",
+    });
+
+    repository.create_artifact(Artifact{
+        artifact_b_id,
+        "checkpoint-b",
+        "training-project",
+    });
+
+    const ObjectDescriptor descriptor = make_object_descriptor();
+
+    repository.register_object(descriptor);
+
+    const ArtifactVersion version_a{
+        UuidV7::generate(),
+        artifact_a_id,
+        descriptor.object_id(),
+        VersionState::Committed,
+    };
+
+    repository.create_version(version_a);
+
+    EXPECT_THROW(repository.set_tag(artifact_b_id, "latest", version_a.version_id()), pqxx::foreign_key_violation);
+
+    const auto restored = repository.get_tag(artifact_b_id, "latest");
+
+    EXPECT_FALSE(restored.has_value());
+}
+
 }  // namespace
