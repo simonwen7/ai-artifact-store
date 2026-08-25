@@ -82,6 +82,45 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
     )
 endif()
 
+add_library(
+    aistore_storage
+    src/storage/local_chunk_store.cpp
+)
+
+target_include_directories(
+    aistore_storage
+    PUBLIC
+    ${PROJECT_SOURCE_DIR}/include
+)
+
+target_compile_features(
+    aistore_storage
+    PUBLIC
+    cxx_std_20
+)
+
+set_target_properties(
+    aistore_storage
+    PROPERTIES
+    CXX_EXTENSIONS OFF
+)
+
+target_link_libraries(
+    aistore_storage
+    PRIVATE
+    aistore_hashing
+)
+
+if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+    target_compile_options(
+        aistore_storage
+        PRIVATE
+        -Wall
+        -Wextra
+        -Wpedantic
+    )
+endif()
+
 add_executable(
     aistore
     apps/aistore-cli/main.cpp
@@ -113,47 +152,82 @@ include(CTest)
 
 if(BUILD_TESTING)
     find_package(GTest CONFIG REQUIRED)
+    include(GoogleTest)
 
-    add_executable(
-        aistore_unit_tests
+    function(aistore_add_unit_test target_name source_file)
+        add_executable(
+            ${target_name}
+            ${source_file}
+        )
+
+        target_compile_features(
+            ${target_name}
+            PRIVATE
+            cxx_std_20
+        )
+
+        set_target_properties(
+            ${target_name}
+            PROPERTIES
+            CXX_EXTENSIONS OFF
+        )
+
+        target_link_libraries(
+            ${target_name}
+            PRIVATE
+            GTest::gtest_main
+        )
+
+        if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+            target_compile_options(
+                ${target_name}
+                PRIVATE
+                -Wall
+                -Wextra
+                -Wpedantic
+            )
+        endif()
+
+        gtest_discover_tests(
+            ${target_name}
+        )
+    endfunction()
+
+    aistore_add_unit_test(
+        aistore_smoke_tests
         tests/unit/smoke_test.cpp
+    )
+
+    aistore_add_unit_test(
+        aistore_hashing_tests
         tests/unit/hashing/sha256_test.cpp
-        tests/unit/chunking/fixed_size_chunker_test.cpp
-    )
-
-    target_compile_features(
-        aistore_unit_tests
-        PRIVATE
-        cxx_std_20
-    )
-
-    set_target_properties(
-        aistore_unit_tests
-        PROPERTIES
-        CXX_EXTENSIONS OFF
     )
 
     target_link_libraries(
-        aistore_unit_tests
+        aistore_hashing_tests
         PRIVATE
         aistore_hashing
-        aistore_chunking
-        GTest::gtest_main
     )
 
-    if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
-        target_compile_options(
-            aistore_unit_tests
-            PRIVATE
-            -Wall
-            -Wextra
-            -Wpedantic
-        )
-    endif()
+    aistore_add_unit_test(
+        aistore_chunking_tests
+        tests/unit/chunking/fixed_size_chunker_test.cpp
+    )
 
-    include(GoogleTest)
+    target_link_libraries(
+        aistore_chunking_tests
+        PRIVATE
+        aistore_chunking
+    )
 
-    gtest_discover_tests(
-        aistore_unit_tests
+    aistore_add_unit_test(
+        aistore_storage_tests
+        tests/unit/storage/local_chunk_store_test.cpp
+    )
+
+    target_link_libraries(
+        aistore_storage_tests
+        PRIVATE
+        aistore_storage
     )
 endif()
