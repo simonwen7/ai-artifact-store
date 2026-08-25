@@ -129,6 +129,8 @@ add_library(
     src/metadata/object_layout_descriptor.cpp
     src/metadata/uuid_v7.cpp
     src/metadata/artifact_model.cpp
+    src/metadata/manifest_model.cpp
+    src/metadata/run_model.cpp
     src/metadata/postgres_metadata_repository.cpp
 )
 
@@ -329,6 +331,28 @@ if(BUILD_TESTING)
 
     target_link_libraries(
         aistore_artifact_model_tests
+        PRIVATE
+        aistore_metadata
+    )
+
+    aistore_add_test(
+        aistore_manifest_model_tests
+        tests/unit/metadata/manifest_model_test.cpp
+    )
+
+    target_link_libraries(
+        aistore_manifest_model_tests
+        PRIVATE
+        aistore_metadata
+    )
+
+    aistore_add_test(
+        aistore_run_model_tests
+        tests/unit/metadata/run_model_test.cpp
+    )
+
+    target_link_libraries(
+        aistore_run_model_tests
         PRIVATE
         aistore_metadata
     )

@@ -66,6 +66,17 @@ TEST(PostgresConnectionTest, ConnectsToMigratedTestDatabase) {
         ")");
 
     EXPECT_TRUE(artifact_version_identity_migration_exists);
+
+    const bool manifest_run_migration_exists = transaction.query_value<bool>(
+        "SELECT EXISTS ("
+        "    SELECT 1 "
+        "    FROM schema_migrations "
+        "    WHERE version = 4 "
+        "      AND name = "
+        "          'manifest_and_run_models'"
+        ")");
+
+    EXPECT_TRUE(manifest_run_migration_exists);
 }
 
 }  // namespace

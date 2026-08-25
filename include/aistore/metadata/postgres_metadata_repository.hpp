@@ -8,8 +8,10 @@
 #include <vector>
 
 #include "aistore/metadata/artifact_model.hpp"
+#include "aistore/metadata/manifest_model.hpp"
 #include "aistore/metadata/object.hpp"
 #include "aistore/metadata/object_layout_descriptor.hpp"
+#include "aistore/metadata/run_model.hpp"
 #include "aistore/metadata/storage_location.hpp"
 
 namespace aistore::metadata {
@@ -51,6 +53,14 @@ class PostgresMetadataRepository {
     void set_tag(const UuidV7& artifact_id, std::string_view tag_name, std::string_view version_id);
 
     [[nodiscard]] std::optional<std::string> get_tag(const UuidV7& artifact_id, std::string_view tag_name);
+
+    void register_manifest(const Manifest& manifest);
+
+    [[nodiscard]] std::optional<Manifest> get_manifest(std::string_view manifest_id);
+
+    void create_run(const Run& run);
+
+    [[nodiscard]] std::optional<Run> get_run(const UuidV7& run_id);
 
     void register_storage_location(const StorageLocation& location);
 

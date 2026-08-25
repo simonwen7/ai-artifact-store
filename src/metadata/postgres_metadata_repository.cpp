@@ -1,6 +1,7 @@
 #include "aistore/metadata/postgres_metadata_repository.hpp"
 
 #include <array>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -102,6 +103,34 @@ void validate_version_id(std::string_view version_id) {
             throw std::invalid_argument("version ID must use lowercase hexadecimal characters");
         }
     }
+}
+
+void validate_manifest_id(std::string_view manifest_id) {
+    if (manifest_id.size() != 64) {
+        throw std::invalid_argument("manifest ID must contain exactly 64 hexadecimal characters");
+    }
+
+    for (const char character : manifest_id) {
+        const bool is_digit = character >= '0' && character <= '9';
+
+        const bool is_lower_hex = character >= 'a' && character <= 'f';
+
+        if (!is_digit && !is_lower_hex) {
+            throw std::invalid_argument("manifest ID must use lowercase hexadecimal characters");
+        }
+    }
+}
+
+long long timestamp_to_unix_milliseconds(Run::Timestamp timestamp) {
+    return static_cast<long long>(timestamp.time_since_epoch().count());
+}
+
+Run::Timestamp timestamp_from_unix_milliseconds(long long milliseconds) {
+    return Run::Timestamp{
+        std::chrono::milliseconds{
+            milliseconds,
+        },
+    };
 }
 
 std::string_view version_state_to_string(VersionState state) {
@@ -732,6 +761,281 @@ class PostgresMetadataRepository::Impl {
         return stored_version_id;
     }
 
+    void register_manifest(const Manifest& manifest) {
+        pqxx::work transaction{connection_};
+
+        const long long entry_count = size_to_postgres_bigint(manifest.entries().size(), "manifest entry count");
+
+        const pqxx::result manifest_insert = transaction.exec(
+            "INSERT INTO manifests ("
+            "    manifest_id, "
+            "    descriptor_version, "
+            "    canonical_descriptor, "
+            "    entry_count"
+            ") "
+            "VALUES ("
+            "    $1, "
+            "    $2, "
+            "    $3::bytea, "
+            "    $4"
+            ") "
+            "ON CONFLICT (manifest_id) "
+            "DO NOTHING",
+            pqxx::params{
+                manifest.manifest_id(),
+                static_cast<int>(Manifest::kFormatVersion),
+                manifest.canonical_bytes(),
+                entry_count,
+            });
+
+        const bool manifest_was_inserted = manifest_insert.affected_rows() == 1U;
+
+        if (manifest_was_inserted) {
+            for (const auto& [role, version_id] : manifest.entries()) {
+                transaction
+                    .exec(
+                        "INSERT INTO manifest_entries ("
+                        "    manifest_id, "
+                        "    role, "
+                        "    version_id"
+                        ") "
+                        "VALUES ("
+                        "    $1, "
+                        "    $2, "
+                        "    $3"
+                        ")",
+                        pqxx::params{
+                            manifest.manifest_id(),
+                            role,
+                            version_id,
+                        })
+                    .no_rows();
+            }
+        }
+
+        verify_registered_manifest(transaction, manifest);
+
+        transaction.commit();
+    }
+
+    [[nodiscard]] std::optional<Manifest> get_manifest(std::string_view manifest_id) {
+        validate_manifest_id(manifest_id);
+
+        pqxx::work transaction{connection_};
+
+        auto stored = transaction.query01<std::string, int, std::string, long long>(
+            "SELECT "
+            "    manifest_id, "
+            "    descriptor_version, "
+            "    encode("
+            "        canonical_descriptor, "
+            "        'hex'"
+            "    ), "
+            "    entry_count "
+            "FROM manifests "
+            "WHERE manifest_id = $1",
+            pqxx::params{
+                manifest_id,
+            });
+
+        if (!stored.has_value()) {
+            transaction.commit();
+            return std::nullopt;
+        }
+
+        auto [stored_manifest_id, descriptor_version, stored_descriptor_hex, stored_entry_count] = std::move(*stored);
+
+        if (std::cmp_not_equal(descriptor_version, Manifest::kFormatVersion)) {
+            throw std::runtime_error("stored manifest uses an unsupported descriptor version");
+        }
+
+        if (stored_entry_count < 0) {
+            throw std::runtime_error("stored manifest contains an invalid negative entry count");
+        }
+
+        Manifest::Entries entries;
+
+        for (auto [role, version_id] : transaction.query<std::string, std::string>("SELECT "
+                                                                                   "    role, "
+                                                                                   "    version_id "
+                                                                                   "FROM manifest_entries "
+                                                                                   "WHERE manifest_id = $1 "
+                                                                                   "ORDER BY role",
+                                                                                   pqxx::params{
+                                                                                       manifest_id,
+                                                                                   })) {
+            entries.emplace(std::move(role), std::move(version_id));
+        }
+
+        if (std::cmp_not_equal(entries.size(), stored_entry_count)) {
+            throw std::runtime_error("stored manifest entry count does not match entry rows");
+        }
+
+        Manifest reconstructed{
+            std::move(entries),
+        };
+
+        if (reconstructed.manifest_id() != stored_manifest_id) {
+            throw std::runtime_error("stored manifest does not match manifest ID");
+        }
+
+        const std::string reconstructed_descriptor_hex = bytes_to_hex(std::span<const std::byte>{
+            reconstructed.canonical_bytes(),
+        });
+
+        if (reconstructed_descriptor_hex != stored_descriptor_hex) {
+            throw std::runtime_error("stored canonical descriptor does not match manifest");
+        }
+
+        transaction.commit();
+
+        return reconstructed;
+    }
+
+    void create_run(const Run& run) {
+        pqxx::work transaction{connection_};
+
+        const long long started_at_ms = timestamp_to_unix_milliseconds(run.started_at());
+
+        std::optional<long long> completed_at_ms;
+
+        if (run.completed_at().has_value()) {
+            completed_at_ms = timestamp_to_unix_milliseconds(*run.completed_at());
+        }
+
+        transaction
+            .exec(
+                "INSERT INTO runs ("
+                "    run_id, "
+                "    manifest_id, "
+                "    name, "
+                "    source_commit, "
+                "    started_at, "
+                "    completed_at"
+                ") "
+                "VALUES ("
+                "    $1::uuid, "
+                "    $2, "
+                "    $3, "
+                "    $4, "
+                "    to_timestamp("
+                "        $5::double precision / 1000.0"
+                "    ), "
+                "    CASE "
+                "        WHEN $6::bigint IS NULL "
+                "            THEN NULL "
+                "        ELSE to_timestamp("
+                "            $6::double precision / 1000.0"
+                "        ) "
+                "    END"
+                ")",
+                pqxx::params{
+                    run.run_id().str(),
+                    run.manifest_id(),
+                    run.name(),
+                    run.source_commit(),
+                    started_at_ms,
+                    completed_at_ms,
+                })
+            .no_rows();
+
+        for (const auto& [tag_key, tag_value] : run.tags()) {
+            transaction
+                .exec(
+                    "INSERT INTO run_tags ("
+                    "    run_id, "
+                    "    tag_key, "
+                    "    tag_value"
+                    ") "
+                    "VALUES ("
+                    "    $1::uuid, "
+                    "    $2, "
+                    "    $3"
+                    ")",
+                    pqxx::params{
+                        run.run_id().str(),
+                        tag_key,
+                        tag_value,
+                    })
+                .no_rows();
+        }
+
+        transaction.commit();
+    }
+
+    [[nodiscard]] std::optional<Run> get_run(const UuidV7& run_id) {
+        pqxx::work transaction{connection_};
+
+        auto stored = transaction.query01<std::string, std::string, std::string, std::optional<std::string>, long long,
+                                          std::optional<long long>>(
+            "SELECT "
+            "    run_id::text, "
+            "    manifest_id, "
+            "    name, "
+            "    source_commit, "
+            "    ROUND("
+            "        EXTRACT(EPOCH FROM started_at) "
+            "        * 1000"
+            "    )::bigint, "
+            "    CASE "
+            "        WHEN completed_at IS NULL "
+            "            THEN NULL "
+            "        ELSE ROUND("
+            "            EXTRACT(EPOCH FROM completed_at) "
+            "            * 1000"
+            "        )::bigint "
+            "    END "
+            "FROM runs "
+            "WHERE run_id = $1::uuid",
+            pqxx::params{
+                run_id.str(),
+            });
+
+        if (!stored.has_value()) {
+            transaction.commit();
+            return std::nullopt;
+        }
+
+        auto [stored_run_id, stored_manifest_id, name, source_commit, started_at_ms, completed_at_ms] =
+            std::move(*stored);
+
+        Run::Tags tags;
+
+        for (auto [tag_key, tag_value] : transaction.query<std::string, std::string>("SELECT "
+                                                                                     "    tag_key, "
+                                                                                     "    tag_value "
+                                                                                     "FROM run_tags "
+                                                                                     "WHERE run_id = $1::uuid "
+                                                                                     "ORDER BY tag_key",
+                                                                                     pqxx::params{
+                                                                                         run_id.str(),
+                                                                                     })) {
+            tags.emplace(std::move(tag_key), std::move(tag_value));
+        }
+
+        std::optional<Run::Timestamp> completed_at;
+
+        if (completed_at_ms.has_value()) {
+            completed_at = timestamp_from_unix_milliseconds(*completed_at_ms);
+        }
+
+        Run reconstructed{
+            UuidV7{
+                std::move(stored_run_id),
+            },
+            std::move(stored_manifest_id),
+            std::move(name),
+            std::move(source_commit),
+            std::move(tags),
+            timestamp_from_unix_milliseconds(started_at_ms),
+            completed_at,
+        };
+
+        transaction.commit();
+
+        return reconstructed;
+    }
+
     void register_storage_location(const StorageLocation& location) {
         validate_chunk_id(location.chunk_id);
 
@@ -981,6 +1285,63 @@ class PostgresMetadataRepository::Impl {
         }
     }
 
+    void verify_registered_manifest(pqxx::work& transaction, const Manifest& manifest) {
+        auto stored = transaction.query01<int, std::string, long long>(
+            "SELECT "
+            "    descriptor_version, "
+            "    encode("
+            "        canonical_descriptor, "
+            "        'hex'"
+            "    ), "
+            "    entry_count "
+            "FROM manifests "
+            "WHERE manifest_id = $1",
+            pqxx::params{
+                manifest.manifest_id(),
+            });
+
+        if (!stored.has_value()) {
+            throw std::runtime_error("registered manifest is missing from database");
+        }
+
+        const auto& [descriptor_version, stored_descriptor_hex, stored_entry_count] = *stored;
+
+        if (std::cmp_not_equal(descriptor_version, Manifest::kFormatVersion) ||
+            stored_descriptor_hex != bytes_to_hex(std::span<const std::byte>{
+                                         manifest.canonical_bytes(),
+                                     }) ||
+            stored_entry_count != size_to_postgres_bigint(manifest.entries().size(), "manifest entry count")) {
+            throw std::runtime_error("existing manifest metadata does not match descriptor");
+        }
+
+        auto expected = manifest.entries().cbegin();
+
+        for (const auto& [stored_role, stored_version_id] :
+             transaction.query<std::string, std::string>("SELECT "
+                                                         "    role, "
+                                                         "    version_id "
+                                                         "FROM manifest_entries "
+                                                         "WHERE manifest_id = $1 "
+                                                         "ORDER BY role",
+                                                         pqxx::params{
+                                                             manifest.manifest_id(),
+                                                         })) {
+            if (expected == manifest.entries().cend()) {
+                throw std::runtime_error("stored manifest contains unexpected entry rows");
+            }
+
+            if (stored_role != expected->first || stored_version_id != expected->second) {
+                throw std::runtime_error("stored manifest does not match descriptor");
+            }
+
+            ++expected;
+        }
+
+        if (expected != manifest.entries().cend()) {
+            throw std::runtime_error("stored manifest is missing entry rows");
+        }
+    }
+
     pqxx::connection connection_;
 };
 
@@ -1035,6 +1396,16 @@ void PostgresMetadataRepository::set_tag(const UuidV7& artifact_id, std::string_
 std::optional<std::string> PostgresMetadataRepository::get_tag(const UuidV7& artifact_id, std::string_view tag_name) {
     return impl_->get_tag(artifact_id, tag_name);
 }
+
+void PostgresMetadataRepository::register_manifest(const Manifest& manifest) { impl_->register_manifest(manifest); }
+
+std::optional<Manifest> PostgresMetadataRepository::get_manifest(std::string_view manifest_id) {
+    return impl_->get_manifest(manifest_id);
+}
+
+void PostgresMetadataRepository::create_run(const Run& run) { impl_->create_run(run); }
+
+std::optional<Run> PostgresMetadataRepository::get_run(const UuidV7& run_id) { return impl_->get_run(run_id); }
 
 void PostgresMetadataRepository::register_storage_location(const StorageLocation& location) {
     impl_->register_storage_location(location);

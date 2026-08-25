@@ -3,9 +3,11 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include <optional>
 #include <pqxx/pqxx>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -15,6 +17,7 @@ using aistore::metadata::Artifact;
 using aistore::metadata::ArtifactVersion;
 using aistore::metadata::ChunkingStrategy;
 using aistore::metadata::ChunkRef;
+using aistore::metadata::Manifest;
 using aistore::metadata::Object;
 using aistore::metadata::ObjectLayout;
 using aistore::metadata::ObjectLayoutDescriptor;
@@ -23,6 +26,9 @@ using aistore::metadata::StorageLocation;
 using aistore::metadata::StorageLocationState;
 using aistore::metadata::UuidV7;
 using aistore::metadata::VersionState;
+
+// GoogleTest's testing::Test::Run() shadows a bare using-declaration for Run.
+using RunModel = aistore::metadata::Run;
 
 const std::string kObjectId(64, '1');
 
@@ -54,6 +60,10 @@ void reset_metadata_data() {
     transaction
         .exec(
             "TRUNCATE TABLE "
+            "    run_tags, "
+            "    runs, "
+            "    manifest_entries, "
+            "    manifests, "
             "    tags, "
             "    artifact_version_metadata, "
             "    storage_locations, "
@@ -124,6 +134,23 @@ void register_test_object_and_layout(PostgresMetadataRepository& repository) {
     repository.register_object(make_object());
 
     repository.register_object_layout(make_object_layout_descriptor());
+}
+
+ArtifactVersion create_manifest_test_version(PostgresMetadataRepository& repository, const UuidV7& artifact_id,
+                                             std::string marker) {
+    ArtifactVersion version{
+        artifact_id,
+        kObjectId,
+        std::nullopt,
+        ArtifactVersion::ImmutableMetadata{
+            {"marker", std::move(marker)},
+        },
+        VersionState::Committed,
+    };
+
+    repository.create_version(version);
+
+    return version;
 }
 
 TEST(PostgresMetadataRepositoryTest, CreatesAndReadsArtifact) {
@@ -1231,6 +1258,406 @@ TEST(PostgresMetadataRepositoryTest, DatabaseRejectsSameNodePathForDifferentChun
                      .state = StorageLocationState::Available,
                  }),
                  pqxx::unique_violation);
+}
+
+TEST(PostgresMetadataRepositoryTest, RegistersAndReadsManifest) {
+    reset_metadata_data();
+
+    PostgresMetadataRepository repository{
+        test_database_connection_string(),
+    };
+
+    const UuidV7 artifact_id = UuidV7::generate();
+
+    repository.create_artifact(Artifact{
+        artifact_id,
+        "checkpoint",
+        "training-project",
+    });
+
+    register_test_object(repository);
+
+    const ArtifactVersion dataset_version = create_manifest_test_version(repository, artifact_id, "dataset");
+
+    const ArtifactVersion model_version = create_manifest_test_version(repository, artifact_id, "model");
+
+    const Manifest manifest{
+        Manifest::Entries{
+            {"dataset", dataset_version.version_id()},
+            {"model", model_version.version_id()},
+        },
+    };
+
+    repository.register_manifest(manifest);
+
+    const auto restored = repository.get_manifest(manifest.manifest_id());
+
+    ASSERT_TRUE(restored.has_value());
+
+    EXPECT_EQ(restored->manifest_id(), manifest.manifest_id());
+
+    EXPECT_EQ(restored->entries(), manifest.entries());
+
+    EXPECT_EQ(restored->canonical_bytes(), manifest.canonical_bytes());
+}
+
+TEST(PostgresMetadataRepositoryTest, RegisterManifestIsIdempotent) {
+    reset_metadata_data();
+
+    PostgresMetadataRepository repository{
+        test_database_connection_string(),
+    };
+
+    const UuidV7 artifact_id = UuidV7::generate();
+
+    repository.create_artifact(Artifact{
+        artifact_id,
+        "checkpoint",
+        "training-project",
+    });
+
+    register_test_object(repository);
+
+    const ArtifactVersion dataset_version = create_manifest_test_version(repository, artifact_id, "dataset");
+
+    const ArtifactVersion model_version = create_manifest_test_version(repository, artifact_id, "model");
+
+    const Manifest manifest{
+        Manifest::Entries{
+            {"dataset", dataset_version.version_id()},
+            {"model", model_version.version_id()},
+        },
+    };
+
+    repository.register_manifest(manifest);
+
+    repository.register_manifest(manifest);
+
+    pqxx::connection connection{
+        test_database_connection_string(),
+    };
+
+    pqxx::work transaction{connection};
+
+    EXPECT_EQ(transaction.query_value<long long>("SELECT COUNT(*) "
+                                                 "FROM manifests"),
+              1);
+
+    EXPECT_EQ(transaction.query_value<long long>("SELECT COUNT(*) "
+                                                 "FROM manifest_entries"),
+              static_cast<long long>(manifest.entries().size()));
+
+    transaction.commit();
+}
+
+TEST(PostgresMetadataRepositoryTest, DatabaseRejectsManifestEntryForMissingVersion) {
+    reset_metadata_data();
+
+    PostgresMetadataRepository repository{
+        test_database_connection_string(),
+    };
+
+    const Manifest manifest{
+        Manifest::Entries{
+            {"model", std::string(64, 'f')},
+        },
+    };
+
+    EXPECT_THROW(repository.register_manifest(manifest), pqxx::foreign_key_violation);
+
+    pqxx::connection connection{
+        test_database_connection_string(),
+    };
+
+    pqxx::work transaction{connection};
+
+    EXPECT_EQ(transaction.query_value<long long>("SELECT COUNT(*) "
+                                                 "FROM manifests"),
+              0);
+
+    transaction.commit();
+}
+
+TEST(PostgresMetadataRepositoryTest, DetectsCorruptedStoredManifestDescriptor) {
+    reset_metadata_data();
+
+    PostgresMetadataRepository repository{
+        test_database_connection_string(),
+    };
+
+    const UuidV7 artifact_id = UuidV7::generate();
+
+    repository.create_artifact(Artifact{
+        artifact_id,
+        "checkpoint",
+        "training-project",
+    });
+
+    register_test_object(repository);
+
+    const ArtifactVersion model_version = create_manifest_test_version(repository, artifact_id, "model");
+
+    const Manifest manifest{
+        Manifest::Entries{
+            {"model", model_version.version_id()},
+        },
+    };
+
+    repository.register_manifest(manifest);
+
+    {
+        pqxx::connection connection{
+            test_database_connection_string(),
+        };
+
+        pqxx::work transaction{connection};
+
+        transaction
+            .exec(
+                "UPDATE manifests "
+                "SET canonical_descriptor = decode('00', 'hex') "
+                "WHERE manifest_id = $1",
+                pqxx::params{
+                    manifest.manifest_id(),
+                })
+            .no_rows();
+
+        transaction.commit();
+    }
+
+    EXPECT_THROW(static_cast<void>(repository.get_manifest(manifest.manifest_id())), std::runtime_error);
+}
+
+TEST(PostgresMetadataRepositoryTest, CreatesAndReadsRun) {
+    reset_metadata_data();
+
+    PostgresMetadataRepository repository{
+        test_database_connection_string(),
+    };
+
+    const UuidV7 artifact_id = UuidV7::generate();
+
+    repository.create_artifact(Artifact{
+        artifact_id,
+        "checkpoint",
+        "training-project",
+    });
+
+    register_test_object(repository);
+
+    const ArtifactVersion model_version = create_manifest_test_version(repository, artifact_id, "model");
+
+    const Manifest manifest{
+        Manifest::Entries{
+            {"model", model_version.version_id()},
+        },
+    };
+
+    repository.register_manifest(manifest);
+
+    const UuidV7 run_id = UuidV7::generate();
+
+    const RunModel run{
+        run_id,
+        manifest.manifest_id(),
+        "training-run",
+        std::string{"abc123"},
+        RunModel::Tags{
+            {"environment", "dev"},
+            {"owner", "ml-team"},
+        },
+        RunModel::Timestamp{
+            std::chrono::milliseconds{
+                1700000000000LL,
+            },
+        },
+        RunModel::Timestamp{
+            std::chrono::milliseconds{
+                1700000060000LL,
+            },
+        },
+    };
+
+    repository.create_run(run);
+
+    const auto restored = repository.get_run(run_id);
+
+    ASSERT_TRUE(restored.has_value());
+
+    EXPECT_EQ(restored->run_id(), run_id);
+
+    EXPECT_EQ(restored->manifest_id(), manifest.manifest_id());
+
+    EXPECT_EQ(restored->name(), "training-run");
+
+    ASSERT_TRUE(restored->source_commit().has_value());
+
+    EXPECT_EQ(*restored->source_commit(), "abc123");
+
+    EXPECT_EQ(restored->tags(), (RunModel::Tags{
+                                    {"environment", "dev"},
+                                    {"owner", "ml-team"},
+                                }));
+
+    EXPECT_EQ(restored->started_at(), RunModel::Timestamp{std::chrono::milliseconds{1700000000000LL}});
+
+    ASSERT_TRUE(restored->completed_at().has_value());
+
+    EXPECT_EQ(*restored->completed_at(), RunModel::Timestamp{std::chrono::milliseconds{1700000060000LL}});
+}
+
+TEST(PostgresMetadataRepositoryTest, DifferentRunsCanReferenceSameManifest) {
+    reset_metadata_data();
+
+    PostgresMetadataRepository repository{
+        test_database_connection_string(),
+    };
+
+    const UuidV7 artifact_id = UuidV7::generate();
+
+    repository.create_artifact(Artifact{
+        artifact_id,
+        "checkpoint",
+        "training-project",
+    });
+
+    register_test_object(repository);
+
+    const ArtifactVersion model_version = create_manifest_test_version(repository, artifact_id, "model");
+
+    const Manifest manifest{
+        Manifest::Entries{
+            {"model", model_version.version_id()},
+        },
+    };
+
+    repository.register_manifest(manifest);
+
+    const RunModel::Timestamp started_at{
+        std::chrono::milliseconds{
+            1700000000000LL,
+        },
+    };
+
+    const RunModel first{
+        UuidV7::generate(), manifest.manifest_id(), "training-run-a", std::nullopt, RunModel::Tags{},
+        started_at,         std::nullopt,
+    };
+
+    const RunModel second{
+        UuidV7::generate(), manifest.manifest_id(), "training-run-b", std::nullopt, RunModel::Tags{},
+        started_at,         std::nullopt,
+    };
+
+    repository.create_run(first);
+
+    repository.create_run(second);
+
+    EXPECT_NE(first.run_id(), second.run_id());
+
+    EXPECT_EQ(first.manifest_id(), second.manifest_id());
+
+    pqxx::connection connection{
+        test_database_connection_string(),
+    };
+
+    pqxx::work transaction{connection};
+
+    EXPECT_EQ(transaction.query_value<long long>("SELECT COUNT(*) "
+                                                 "FROM runs "
+                                                 "WHERE manifest_id = $1",
+                                                 pqxx::params{
+                                                     manifest.manifest_id(),
+                                                 }),
+              2);
+
+    transaction.commit();
+}
+
+TEST(PostgresMetadataRepositoryTest, DatabaseRejectsRunForMissingManifest) {
+    reset_metadata_data();
+
+    PostgresMetadataRepository repository{
+        test_database_connection_string(),
+    };
+
+    const RunModel run{
+        UuidV7::generate(),
+        std::string(64, 'e'),
+        "training-run",
+        std::nullopt,
+        RunModel::Tags{},
+        RunModel::Timestamp{
+            std::chrono::milliseconds{
+                1700000000000LL,
+            },
+        },
+        std::nullopt,
+    };
+
+    EXPECT_THROW(repository.create_run(run), pqxx::foreign_key_violation);
+}
+
+TEST(PostgresMetadataRepositoryTest, DuplicateRunIdIsRejected) {
+    reset_metadata_data();
+
+    PostgresMetadataRepository repository{
+        test_database_connection_string(),
+    };
+
+    const UuidV7 artifact_id = UuidV7::generate();
+
+    repository.create_artifact(Artifact{
+        artifact_id,
+        "checkpoint",
+        "training-project",
+    });
+
+    register_test_object(repository);
+
+    const ArtifactVersion model_version = create_manifest_test_version(repository, artifact_id, "model");
+
+    const Manifest manifest{
+        Manifest::Entries{
+            {"model", model_version.version_id()},
+        },
+    };
+
+    repository.register_manifest(manifest);
+
+    const UuidV7 run_id = UuidV7::generate();
+
+    const RunModel first{
+        run_id,
+        manifest.manifest_id(),
+        "training-run",
+        std::nullopt,
+        RunModel::Tags{},
+        RunModel::Timestamp{
+            std::chrono::milliseconds{
+                1700000000000LL,
+            },
+        },
+        std::nullopt,
+    };
+
+    const RunModel second{
+        run_id,
+        manifest.manifest_id(),
+        "training-run",
+        std::nullopt,
+        RunModel::Tags{},
+        RunModel::Timestamp{
+            std::chrono::milliseconds{
+                1700000000000LL,
+            },
+        },
+        std::nullopt,
+    };
+
+    repository.create_run(first);
+
+    EXPECT_THROW(repository.create_run(second), pqxx::unique_violation);
 }
 
 }  // namespace
