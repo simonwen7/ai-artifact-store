@@ -5,9 +5,11 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include "aistore/metadata/artifact_model.hpp"
 #include "aistore/metadata/object_descriptor.hpp"
+#include "aistore/metadata/storage_location.hpp"
 
 namespace aistore::metadata {
 
@@ -40,6 +42,10 @@ class PostgresMetadataRepository {
     void set_tag(const UuidV7& artifact_id, std::string_view tag_name, const UuidV7& version_id);
 
     [[nodiscard]] std::optional<UuidV7> get_tag(const UuidV7& artifact_id, std::string_view tag_name);
+
+    void register_storage_location(const StorageLocation& location);
+
+    [[nodiscard]] std::vector<StorageLocation> get_storage_locations(std::string_view chunk_id);
 
    private:
     class Impl;

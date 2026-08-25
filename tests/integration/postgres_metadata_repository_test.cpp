@@ -14,6 +14,8 @@ using aistore::metadata::ChunkRef;
 using aistore::metadata::ObjectDescriptor;
 using aistore::metadata::ObjectLayout;
 using aistore::metadata::PostgresMetadataRepository;
+using aistore::metadata::StorageLocation;
+using aistore::metadata::StorageLocationState;
 using aistore::metadata::UuidV7;
 using aistore::metadata::VersionState;
 
@@ -611,6 +613,175 @@ TEST(PostgresMetadataRepositoryTest, DatabaseRejectsTagPointingToDifferentArtifa
     const auto restored = repository.get_tag(artifact_b_id, "latest");
 
     EXPECT_FALSE(restored.has_value());
+}
+
+TEST(PostgresMetadataRepositoryTest, RegistersAndReadsStorageLocation) {
+    reset_metadata_data();
+
+    PostgresMetadataRepository repository{
+        test_database_connection_string(),
+    };
+
+    const ObjectDescriptor descriptor = make_object_descriptor();
+
+    repository.register_object(descriptor);
+
+    repository.register_storage_location(StorageLocation{
+        .chunk_id = kChunkA,
+        .node_id = "node-a",
+        .storage_path = "/data/chunks/aa/chunk-a",
+        .state = StorageLocationState::Available,
+    });
+
+    const auto locations = repository.get_storage_locations(kChunkA);
+
+    ASSERT_EQ(locations.size(), 1U);
+
+    EXPECT_EQ(locations[0].chunk_id, kChunkA);
+
+    EXPECT_EQ(locations[0].node_id, "node-a");
+
+    EXPECT_EQ(locations[0].storage_path, "/data/chunks/aa/chunk-a");
+
+    EXPECT_EQ(locations[0].state, StorageLocationState::Available);
+}
+
+TEST(PostgresMetadataRepositoryTest, UpdatingStorageLocationReusesChunkNodeIdentity) {
+    reset_metadata_data();
+
+    PostgresMetadataRepository repository{
+        test_database_connection_string(),
+    };
+
+    const ObjectDescriptor descriptor = make_object_descriptor();
+
+    repository.register_object(descriptor);
+
+    repository.register_storage_location(StorageLocation{
+        .chunk_id = kChunkA,
+        .node_id = "node-a",
+        .storage_path = "/data/chunks/aa/chunk-a",
+        .state = StorageLocationState::Available,
+    });
+
+    repository.register_storage_location(StorageLocation{
+        .chunk_id = kChunkA,
+        .node_id = "node-a",
+        .storage_path = "/replacement/chunks/aa/chunk-a",
+        .state = StorageLocationState::Missing,
+    });
+
+    const auto locations = repository.get_storage_locations(kChunkA);
+
+    ASSERT_EQ(locations.size(), 1U);
+
+    EXPECT_EQ(locations[0].storage_path, "/replacement/chunks/aa/chunk-a");
+
+    EXPECT_EQ(locations[0].state, StorageLocationState::Missing);
+
+    pqxx::connection connection{
+        test_database_connection_string(),
+    };
+
+    pqxx::work transaction{connection};
+
+    EXPECT_EQ(transaction.query_value<long long>("SELECT COUNT(*) "
+                                                 "FROM storage_locations "
+                                                 "WHERE chunk_id = $1 "
+                                                 "  AND node_id = $2",
+                                                 pqxx::params{
+                                                     kChunkA,
+                                                     "node-a",
+                                                 }),
+              1);
+
+    transaction.commit();
+}
+
+TEST(PostgresMetadataRepositoryTest, PreservesStorageLocationStates) {
+    reset_metadata_data();
+
+    PostgresMetadataRepository repository{
+        test_database_connection_string(),
+    };
+
+    const ObjectDescriptor descriptor = make_object_descriptor();
+
+    repository.register_object(descriptor);
+
+    repository.register_storage_location(StorageLocation{
+        .chunk_id = kChunkA,
+        .node_id = "node-available",
+        .storage_path = "/store/available",
+        .state = StorageLocationState::Available,
+    });
+
+    repository.register_storage_location(StorageLocation{
+        .chunk_id = kChunkA,
+        .node_id = "node-missing",
+        .storage_path = "/store/missing",
+        .state = StorageLocationState::Missing,
+    });
+
+    repository.register_storage_location(StorageLocation{
+        .chunk_id = kChunkA,
+        .node_id = "node-corrupt",
+        .storage_path = "/store/corrupt",
+        .state = StorageLocationState::Corrupt,
+    });
+
+    const auto locations = repository.get_storage_locations(kChunkA);
+
+    ASSERT_EQ(locations.size(), 3U);
+
+    EXPECT_EQ(locations[0].state, StorageLocationState::Available);
+
+    EXPECT_EQ(locations[1].state, StorageLocationState::Corrupt);
+
+    EXPECT_EQ(locations[2].state, StorageLocationState::Missing);
+}
+
+TEST(PostgresMetadataRepositoryTest, DatabaseRejectsStorageLocationForMissingChunk) {
+    reset_metadata_data();
+
+    PostgresMetadataRepository repository{
+        test_database_connection_string(),
+    };
+
+    EXPECT_THROW(repository.register_storage_location(StorageLocation{
+                     .chunk_id = std::string(64, 'c'),
+                     .node_id = "node-a",
+                     .storage_path = "/data/missing",
+                     .state = StorageLocationState::Available,
+                 }),
+                 pqxx::foreign_key_violation);
+}
+
+TEST(PostgresMetadataRepositoryTest, DatabaseRejectsSameNodePathForDifferentChunks) {
+    reset_metadata_data();
+
+    PostgresMetadataRepository repository{
+        test_database_connection_string(),
+    };
+
+    const ObjectDescriptor descriptor = make_object_descriptor();
+
+    repository.register_object(descriptor);
+
+    repository.register_storage_location(StorageLocation{
+        .chunk_id = kChunkA,
+        .node_id = "node-a",
+        .storage_path = "/data/shared-path",
+        .state = StorageLocationState::Available,
+    });
+
+    EXPECT_THROW(repository.register_storage_location(StorageLocation{
+                     .chunk_id = kChunkB,
+                     .node_id = "node-a",
+                     .storage_path = "/data/shared-path",
+                     .state = StorageLocationState::Available,
+                 }),
+                 pqxx::unique_violation);
 }
 
 }  // namespace

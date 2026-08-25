@@ -103,6 +103,53 @@ VersionState version_state_from_string(std::string_view state) {
     throw std::runtime_error("database contains an unsupported artifact version state");
 }
 
+std::string_view storage_location_state_to_string(StorageLocationState state) {
+    switch (state) {
+        case StorageLocationState::Available:
+            return "available";
+
+        case StorageLocationState::Missing:
+            return "missing";
+
+        case StorageLocationState::Corrupt:
+            return "corrupt";
+    }
+
+    throw std::logic_error("unsupported storage location state");
+}
+
+StorageLocationState storage_location_state_from_string(std::string_view state) {
+    if (state == "available") {
+        return StorageLocationState::Available;
+    }
+
+    if (state == "missing") {
+        return StorageLocationState::Missing;
+    }
+
+    if (state == "corrupt") {
+        return StorageLocationState::Corrupt;
+    }
+
+    throw std::runtime_error("database contains an unsupported storage location state");
+}
+
+void validate_chunk_id(std::string_view chunk_id) {
+    if (chunk_id.size() != 64) {
+        throw std::invalid_argument("chunk ID must contain exactly 64 hexadecimal characters");
+    }
+
+    for (const char character : chunk_id) {
+        const bool is_digit = character >= '0' && character <= '9';
+
+        const bool is_lower_hex = character >= 'a' && character <= 'f';
+
+        if (!is_digit && !is_lower_hex) {
+            throw std::invalid_argument("chunk ID must use lowercase hexadecimal characters");
+        }
+    }
+}
+
 }  // namespace
 
 class PostgresMetadataRepository::Impl {
@@ -499,6 +546,80 @@ class PostgresMetadataRepository::Impl {
         };
     }
 
+    void register_storage_location(const StorageLocation& location) {
+        validate_chunk_id(location.chunk_id);
+
+        if (location.node_id.empty()) {
+            throw std::invalid_argument("storage node ID must not be empty");
+        }
+
+        if (location.storage_path.empty()) {
+            throw std::invalid_argument("storage path must not be empty");
+        }
+
+        pqxx::work transaction{connection_};
+
+        transaction
+            .exec(
+                "INSERT INTO storage_locations ("
+                "    chunk_id, "
+                "    node_id, "
+                "    storage_path, "
+                "    state"
+                ") "
+                "VALUES ("
+                "    $1, "
+                "    $2, "
+                "    $3, "
+                "    $4"
+                ") "
+                "ON CONFLICT (chunk_id, node_id) "
+                "DO UPDATE SET "
+                "    storage_path = EXCLUDED.storage_path, "
+                "    state = EXCLUDED.state",
+                pqxx::params{
+                    location.chunk_id,
+                    location.node_id,
+                    location.storage_path,
+                    storage_location_state_to_string(location.state),
+                })
+            .no_rows();
+
+        transaction.commit();
+    }
+
+    [[nodiscard]] std::vector<StorageLocation> get_storage_locations(std::string_view chunk_id) {
+        validate_chunk_id(chunk_id);
+
+        pqxx::work transaction{connection_};
+
+        std::vector<StorageLocation> locations;
+
+        for (const auto& [stored_chunk_id, node_id, storage_path, state] :
+             transaction.query<std::string, std::string, std::string, std::string>("SELECT "
+                                                                                   "    chunk_id, "
+                                                                                   "    node_id, "
+                                                                                   "    storage_path, "
+                                                                                   "    state "
+                                                                                   "FROM storage_locations "
+                                                                                   "WHERE chunk_id = $1 "
+                                                                                   "ORDER BY node_id",
+                                                                                   pqxx::params{
+                                                                                       chunk_id,
+                                                                                   })) {
+            locations.push_back(StorageLocation{
+                .chunk_id = stored_chunk_id,
+                .node_id = node_id,
+                .storage_path = storage_path,
+                .state = storage_location_state_from_string(state),
+            });
+        }
+
+        transaction.commit();
+
+        return locations;
+    }
+
    private:
     void verify_registered_object(pqxx::work& transaction, const ObjectDescriptor& descriptor) {
         const ObjectLayout& layout = descriptor.layout();
@@ -605,6 +726,14 @@ void PostgresMetadataRepository::set_tag(const UuidV7& artifact_id, std::string_
 
 std::optional<UuidV7> PostgresMetadataRepository::get_tag(const UuidV7& artifact_id, std::string_view tag_name) {
     return impl_->get_tag(artifact_id, tag_name);
+}
+
+void PostgresMetadataRepository::register_storage_location(const StorageLocation& location) {
+    impl_->register_storage_location(location);
+}
+
+std::vector<StorageLocation> PostgresMetadataRepository::get_storage_locations(std::string_view chunk_id) {
+    return impl_->get_storage_locations(chunk_id);
 }
 
 }  // namespace aistore::metadata
