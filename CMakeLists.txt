@@ -230,4 +230,16 @@ if(BUILD_TESTING)
         PRIVATE
         aistore_storage
     )
+
+    aistore_add_unit_test(
+        aistore_local_pipeline_tests
+        tests/integration/local_chunk_pipeline_test.cpp
+    )
+
+    target_link_libraries(
+        aistore_local_pipeline_tests
+        PRIVATE
+        aistore_chunking
+        aistore_storage
+    )
 endif()
