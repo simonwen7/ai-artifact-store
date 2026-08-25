@@ -121,6 +121,39 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
     )
 endif()
 
+add_library(
+    aistore_metadata
+    src/metadata/object_layout.cpp
+)
+
+target_include_directories(
+    aistore_metadata
+    PUBLIC
+    ${PROJECT_SOURCE_DIR}/include
+)
+
+target_compile_features(
+    aistore_metadata
+    PUBLIC
+    cxx_std_20
+)
+
+set_target_properties(
+    aistore_metadata
+    PROPERTIES
+    CXX_EXTENSIONS OFF
+)
+
+if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+    target_compile_options(
+        aistore_metadata
+        PRIVATE
+        -Wall
+        -Wextra
+        -Wpedantic
+    )
+endif()
+
 add_executable(
     aistore
     apps/aistore-cli/main.cpp
@@ -229,6 +262,17 @@ if(BUILD_TESTING)
         aistore_storage_tests
         PRIVATE
         aistore_storage
+    )
+
+    aistore_add_unit_test(
+        aistore_metadata_tests
+        tests/unit/metadata/object_layout_test.cpp
+    )
+
+    target_link_libraries(
+        aistore_metadata_tests
+        PRIVATE
+        aistore_metadata
     )
 
     aistore_add_unit_test(
