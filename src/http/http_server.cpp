@@ -100,12 +100,31 @@ class HttpServer::Impl {
             auto self = shared_from_this();
 
             beast_http::async_read(stream_, buffer_, *parser_, [self](beast::error_code error, std::size_t) {
+                if (error == beast_http::error::body_limit) {
+                    self->send_payload_too_large();
+                    return;
+                }
+
                 if (error) {
                     return;
                 }
 
                 self->handle_request();
             });
+        }
+
+        void send_payload_too_large() {
+            response_ = HttpResponse{
+                beast_http::status::payload_too_large,
+                11,
+            };
+            response_.set(beast_http::field::content_type, "text/plain");
+            response_.body() = "payload too large";
+            response_.prepare_payload();
+            response_.keep_alive(false);
+            response_.set(beast_http::field::connection, "close");
+
+            do_write();
         }
 
         void handle_request() {

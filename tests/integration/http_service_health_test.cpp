@@ -1,11 +1,14 @@
 #include <gtest/gtest.h>
 
+#include <atomic>
 #include <boost/asio/connect.hpp>
 #include <boost/asio/ip/tcp.hpp>
 #include <boost/beast/core.hpp>
 #include <boost/beast/http.hpp>
 #include <boost/json.hpp>
+#include <chrono>
 #include <cstdint>
+#include <filesystem>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -15,6 +18,7 @@
 #include "aistore/http/http_server.hpp"
 #include "aistore/service/metadata_service.hpp"
 #include "aistore/service/storage_node_service.hpp"
+#include "aistore/storage/local_chunk_store.hpp"
 
 namespace {
 
@@ -30,8 +34,37 @@ using aistore::http::HttpServer;
 using aistore::http::HttpServerConfig;
 using aistore::service::MetadataService;
 using aistore::service::StorageNodeService;
+using aistore::storage::LocalChunkStore;
 
 constexpr std::uint64_t kMaxRequestBodyBytes = 8ULL * 1024ULL * 1024ULL;
+
+class TemporaryDirectory {
+   public:
+    TemporaryDirectory() {
+        static std::atomic<std::uint64_t> counter{0};
+
+        const auto timestamp = std::chrono::steady_clock::now().time_since_epoch().count();
+
+        path_ = std::filesystem::temp_directory_path() /
+                ("aistore-http-health-" + std::to_string(timestamp) + "-" + std::to_string(counter.fetch_add(1)));
+
+        std::filesystem::create_directories(path_);
+    }
+
+    ~TemporaryDirectory() {
+        std::error_code error;
+        std::filesystem::remove_all(path_, error);
+    }
+
+    TemporaryDirectory(const TemporaryDirectory&) = delete;
+
+    TemporaryDirectory& operator=(const TemporaryDirectory&) = delete;
+
+    [[nodiscard]] const std::filesystem::path& path() const noexcept { return path_; }
+
+   private:
+    std::filesystem::path path_;
+};
 
 HttpResponse http_exchange(std::uint16_t port, beast_http::verb method, std::string_view target) {
     asio::io_context ioc;
@@ -107,7 +140,9 @@ boost::json::object parse_json_object(const HttpResponse& response) {
 }
 
 TEST(HttpServiceHealthTest, StorageNodeHealthOverHttp) {
-    StorageNodeService service;
+    TemporaryDirectory temporary_directory;
+    LocalChunkStore chunk_store{temporary_directory.path()};
+    StorageNodeService service{chunk_store};
     RunningHttpServer server{service};
 
     const HttpResponse response = http_exchange(server.port(), beast_http::verb::get, "/health");
@@ -139,7 +174,9 @@ TEST(HttpServiceHealthTest, MetadataServiceHealthOverHttp) {
 }
 
 TEST(HttpServiceHealthTest, StorageNodeUnknownRouteReturns404) {
-    StorageNodeService service;
+    TemporaryDirectory temporary_directory;
+    LocalChunkStore chunk_store{temporary_directory.path()};
+    StorageNodeService service{chunk_store};
     RunningHttpServer server{service};
 
     const HttpResponse response = http_exchange(server.port(), beast_http::verb::get, "/does-not-exist");
@@ -167,7 +204,9 @@ TEST(HttpServiceHealthTest, MetadataServiceUnknownRouteReturns404) {
 }
 
 TEST(HttpServiceHealthTest, StorageNodeHealthRejectsNonGet) {
-    StorageNodeService service;
+    TemporaryDirectory temporary_directory;
+    LocalChunkStore chunk_store{temporary_directory.path()};
+    StorageNodeService service{chunk_store};
     RunningHttpServer server{service};
 
     const HttpResponse response = http_exchange(server.port(), beast_http::verb::post, "/health");

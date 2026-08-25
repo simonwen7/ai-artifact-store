@@ -117,4 +117,59 @@ jobs:
         run: |
           test -x ./build-ci/storage-node
           test -x ./build-ci/metadata-service
-        
+
+      - name: Run storage-node API smoke test
+        run: |
+          set -euo pipefail
+
+          storage_root="$(mktemp -d)"
+          storage_pid=""
+
+          cleanup() {
+            if [[ -n "${storage_pid}" ]] && kill -0 "${storage_pid}" 2>/dev/null; then
+              kill "${storage_pid}"
+              wait "${storage_pid}" || true
+            fi
+
+            rm -rf "${storage_root}"
+          }
+
+          trap cleanup EXIT
+
+          AISTORE_STORAGE_ROOT="${storage_root}" ./build-ci/storage-node &
+          storage_pid=$!
+
+          ready=0
+          for _ in $(seq 1 50); do
+            if curl -fsS "http://127.0.0.1:8081/health" >/dev/null; then
+              ready=1
+              break
+            fi
+            sleep 0.1
+          done
+
+          if [[ "${ready}" -ne 1 ]]; then
+            echo "storage-node did not become ready" >&2
+            exit 1
+          fi
+
+          chunk_id="ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+
+          curl -fsS \
+            -X PUT \
+            -H "Content-Type: application/octet-stream" \
+            --data-binary "abc" \
+            "http://127.0.0.1:8081/v1/chunks/${chunk_id}"
+
+          output_file="$(mktemp)"
+          curl -fsS \
+            -o "${output_file}" \
+            "http://127.0.0.1:8081/v1/chunks/${chunk_id}"
+
+          printf 'abc' | cmp -s - "${output_file}"
+
+          kill "${storage_pid}"
+          wait "${storage_pid}" || true
+          storage_pid=""
+
+          rm -f "${output_file}"

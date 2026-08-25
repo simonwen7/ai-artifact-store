@@ -243,6 +243,8 @@ target_link_libraries(
     aistore_services
     PUBLIC
     aistore_http
+    aistore_storage
+    aistore_hashing
     Boost::json
 )
 
@@ -559,6 +561,24 @@ if(BUILD_TESTING)
         PRIVATE
         aistore_http
         aistore_services
+        aistore_storage
+        Boost::json
+        Boost::headers
+        Threads::Threads
+    )
+
+    aistore_add_test(
+        aistore_storage_node_chunk_api_tests
+        tests/integration/storage_node_chunk_api_test.cpp
+    )
+
+    target_link_libraries(
+        aistore_storage_node_chunk_api_tests
+        PRIVATE
+        aistore_http
+        aistore_services
+        aistore_storage
+        aistore_hashing
         Boost::json
         Boost::headers
         Threads::Threads
