@@ -74,6 +74,13 @@ jobs:
             -v ON_ERROR_STOP=1 \
             -f migrations/001_initial_schema.sql
 
+          psql \
+            -h localhost \
+            -U postgres \
+            -d ai_artifact_store_test \
+            -v ON_ERROR_STOP=1 \
+            -f migrations/002_separate_object_layouts.sql
+
       - name: Configure
         run: |
           cmake \

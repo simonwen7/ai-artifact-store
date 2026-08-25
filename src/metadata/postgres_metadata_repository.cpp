@@ -72,6 +72,22 @@ void validate_object_id(std::string_view object_id) {
     }
 }
 
+void validate_layout_id(std::string_view layout_id) {
+    if (layout_id.size() != 64) {
+        throw std::invalid_argument("layout ID must contain exactly 64 hexadecimal characters");
+    }
+
+    for (const char character : layout_id) {
+        const bool is_digit = character >= '0' && character <= '9';
+
+        const bool is_lower_hex = character >= 'a' && character <= 'f';
+
+        if (!is_digit && !is_lower_hex) {
+            throw std::invalid_argument("layout ID must use lowercase hexadecimal characters");
+        }
+    }
+}
+
 std::string_view version_state_to_string(VersionState state) {
     switch (state) {
         case VersionState::Staging:
@@ -150,6 +166,23 @@ void validate_chunk_id(std::string_view chunk_id) {
     }
 }
 
+std::string_view chunking_strategy_to_string(ChunkingStrategy strategy) {
+    switch (strategy) {
+        case ChunkingStrategy::FixedSize:
+            return "fixed-size";
+    }
+
+    throw std::logic_error("unsupported chunking strategy");
+}
+
+ChunkingStrategy chunking_strategy_from_string(std::string_view strategy) {
+    if (strategy == "fixed-size") {
+        return ChunkingStrategy::FixedSize;
+    }
+
+    throw std::runtime_error("database contains an unsupported chunking strategy");
+}
+
 }  // namespace
 
 class PostgresMetadataRepository::Impl {
@@ -213,10 +246,106 @@ class PostgresMetadataRepository::Impl {
         };
     }
 
-    void register_object(const ObjectDescriptor& descriptor) {
+    void register_object(const Object& object) {
         pqxx::work transaction{connection_};
 
+        const long long total_size = to_postgres_bigint(object.total_size(), "object total size");
+
+        transaction
+            .exec(
+                "INSERT INTO objects ("
+                "    object_id, "
+                "    total_size_bytes"
+                ") "
+                "VALUES ("
+                "    $1, "
+                "    $2"
+                ") "
+                "ON CONFLICT (object_id) "
+                "DO NOTHING",
+                pqxx::params{
+                    object.object_id(),
+                    total_size,
+                })
+            .no_rows();
+
+        const auto stored_total_size = transaction.query_value<long long>(
+            "SELECT "
+            "    total_size_bytes "
+            "FROM objects "
+            "WHERE object_id = $1",
+            pqxx::params{
+                object.object_id(),
+            });
+
+        if (stored_total_size != total_size) {
+            throw std::runtime_error("existing object size does not match object identity");
+        }
+
+        transaction.commit();
+    }
+
+    [[nodiscard]] std::optional<Object> get_object(std::string_view object_id) {
+        validate_object_id(object_id);
+
+        pqxx::work transaction{connection_};
+
+        auto stored = transaction.query01<std::string, long long>(
+            "SELECT "
+            "    object_id, "
+            "    total_size_bytes "
+            "FROM objects "
+            "WHERE object_id = $1",
+            pqxx::params{
+                object_id,
+            });
+
+        if (!stored.has_value()) {
+            transaction.commit();
+            return std::nullopt;
+        }
+
+        auto [stored_object_id, stored_total_size] = std::move(*stored);
+
+        if (stored_total_size < 0) {
+            throw std::runtime_error("stored object contains an invalid negative size");
+        }
+
+        Object object{
+            std::move(stored_object_id),
+            static_cast<std::uint64_t>(stored_total_size),
+        };
+
+        transaction.commit();
+
+        return object;
+    }
+
+    void register_object_layout(const ObjectLayoutDescriptor& descriptor) {
+        pqxx::work transaction{connection_};
+
+        const Object& object = descriptor.object();
+
         const ObjectLayout& layout = descriptor.layout();
+
+        const auto stored_object_size = transaction.query01<long long>(
+            "SELECT "
+            "    total_size_bytes "
+            "FROM objects "
+            "WHERE object_id = $1",
+            pqxx::params{
+                object.object_id(),
+            });
+
+        if (!stored_object_size.has_value()) {
+            throw std::runtime_error("object must be registered before its layout");
+        }
+
+        const auto [stored_size] = *stored_object_size;
+
+        if (stored_size != to_postgres_bigint(object.total_size(), "object total size")) {
+            throw std::runtime_error("registered object size does not match object layout");
+        }
 
         for (const ChunkRef& chunk : layout.chunks()) {
             const long long chunk_size = to_postgres_bigint(chunk.size, "chunk size");
@@ -231,34 +360,38 @@ class PostgresMetadataRepository::Impl {
                     "    $1, "
                     "    $2"
                     ") "
-                    "ON CONFLICT (chunk_id) DO NOTHING",
+                    "ON CONFLICT (chunk_id) "
+                    "DO NOTHING",
                     pqxx::params{
                         chunk.chunk_id,
                         chunk_size,
                     })
                 .no_rows();
 
-            const auto stored_size = transaction.query_value<long long>(
-                "SELECT size_bytes "
+            const auto stored_chunk_size = transaction.query_value<long long>(
+                "SELECT "
+                "    size_bytes "
                 "FROM chunks "
                 "WHERE chunk_id = $1",
                 pqxx::params{
                     chunk.chunk_id,
                 });
 
-            if (stored_size != chunk_size) {
+            if (stored_chunk_size != chunk_size) {
                 throw std::runtime_error("existing chunk size does not match object layout");
             }
         }
 
-        const long long total_size = to_postgres_bigint(layout.total_size(), "object total size");
+        const long long total_size = to_postgres_bigint(layout.total_size(), "object layout total size");
 
-        const long long chunk_count = size_to_postgres_bigint(layout.chunks().size(), "object chunk count");
+        const long long chunk_count = size_to_postgres_bigint(layout.chunks().size(), "object layout chunk count");
 
-        const pqxx::result object_insert = transaction.exec(
-            "INSERT INTO objects ("
+        const pqxx::result layout_insert = transaction.exec(
+            "INSERT INTO object_layouts ("
+            "    layout_id, "
             "    object_id, "
             "    descriptor_version, "
+            "    chunking_strategy, "
             "    canonical_descriptor, "
             "    total_size_bytes, "
             "    chunk_count"
@@ -266,29 +399,34 @@ class PostgresMetadataRepository::Impl {
             "VALUES ("
             "    $1, "
             "    $2, "
-            "    $3::bytea, "
+            "    $3, "
             "    $4, "
-            "    $5"
+            "    $5::bytea, "
+            "    $6, "
+            "    $7"
             ") "
-            "ON CONFLICT (object_id) DO NOTHING",
+            "ON CONFLICT (layout_id) "
+            "DO NOTHING",
             pqxx::params{
+                descriptor.layout_id(),
                 descriptor.object_id(),
-                static_cast<int>(ObjectDescriptor::kFormatVersion),
+                static_cast<int>(ObjectLayoutDescriptor::kFormatVersion),
+                chunking_strategy_to_string(descriptor.chunking_strategy()),
                 descriptor.canonical_bytes(),
                 total_size,
                 chunk_count,
             });
 
-        const bool object_was_inserted = object_insert.affected_rows() == 1U;
+        const bool layout_was_inserted = layout_insert.affected_rows() == 1U;
 
-        if (object_was_inserted) {
+        if (layout_was_inserted) {
             for (std::size_t index = 0; index < layout.chunks().size(); ++index) {
                 const ChunkRef& chunk = layout.chunks()[index];
 
                 transaction
                     .exec(
-                        "INSERT INTO object_chunks ("
-                        "    object_id, "
+                        "INSERT INTO object_layout_chunks ("
+                        "    layout_id, "
                         "    chunk_index, "
                         "    chunk_id, "
                         "    byte_offset, "
@@ -302,7 +440,7 @@ class PostgresMetadataRepository::Impl {
                         "    $5"
                         ")",
                         pqxx::params{
-                            descriptor.object_id(),
+                            descriptor.layout_id(),
                             size_to_postgres_bigint(index, "chunk index"),
                             chunk.chunk_id,
                             to_postgres_bigint(chunk.offset, "chunk byte offset"),
@@ -312,107 +450,48 @@ class PostgresMetadataRepository::Impl {
             }
         }
 
-        verify_registered_object(transaction, descriptor);
+        verify_registered_object_layout(transaction, descriptor);
 
         transaction.commit();
     }
 
-    [[nodiscard]] std::optional<ObjectDescriptor> get_object(std::string_view object_id) {
-        validate_object_id(object_id);
-
+    [[nodiscard]] std::optional<ObjectLayoutDescriptor> get_object_layout(std::string_view layout_id) {
         pqxx::work transaction{connection_};
 
-        auto stored_object = transaction.query01<int, std::string, long long, long long>(
-            "SELECT "
-            "    descriptor_version, "
-            "    encode(canonical_descriptor, 'hex'), "
-            "    total_size_bytes, "
-            "    chunk_count "
-            "FROM objects "
-            "WHERE object_id = $1",
-            pqxx::params{
-                object_id,
-            });
-
-        if (!stored_object.has_value()) {
-            transaction.commit();
-            return std::nullopt;
-        }
-
-        auto [descriptor_version, stored_descriptor_hex, stored_total_size, stored_chunk_count] =
-            std::move(*stored_object);
-
-        if (std::cmp_not_equal(descriptor_version, ObjectDescriptor::kFormatVersion)) {
-            throw std::runtime_error("stored object uses an unsupported descriptor version");
-        }
-
-        if (stored_total_size < 0 || stored_chunk_count < 0) {
-            throw std::runtime_error("stored object contains invalid negative metadata");
-        }
-
-        std::vector<ChunkRef> chunks;
-        chunks.reserve(static_cast<std::size_t>(stored_chunk_count));
-
-        std::size_t expected_index = 0;
-
-        for (auto [stored_index, chunk_id, byte_offset, chunk_size] :
-             transaction.query<long long, std::string, long long, long long>("SELECT "
-                                                                             "    chunk_index, "
-                                                                             "    chunk_id, "
-                                                                             "    byte_offset, "
-                                                                             "    chunk_size_bytes "
-                                                                             "FROM object_chunks "
-                                                                             "WHERE object_id = $1 "
-                                                                             "ORDER BY chunk_index",
-                                                                             pqxx::params{
-                                                                                 object_id,
-                                                                             })) {
-            if (stored_index != size_to_postgres_bigint(expected_index, "chunk index")) {
-                throw std::runtime_error("stored object chunk indexes are not contiguous");
-            }
-
-            if (byte_offset < 0 || chunk_size <= 0) {
-                throw std::runtime_error("stored object chunk contains invalid size metadata");
-            }
-
-            chunks.push_back(ChunkRef{
-                .chunk_id = std::move(chunk_id),
-                .offset = static_cast<std::uint64_t>(byte_offset),
-                .size = static_cast<std::uint64_t>(chunk_size),
-            });
-
-            ++expected_index;
-        }
-
-        if (std::cmp_not_equal(expected_index, stored_chunk_count)) {
-            throw std::runtime_error("stored object chunk count does not match layout rows");
-        }
-
-        ObjectDescriptor descriptor{
-            ObjectLayout{
-                std::move(chunks),
-            },
-        };
-
-        if (descriptor.object_id() != object_id) {
-            throw std::runtime_error("stored object layout does not match object ID");
-        }
-
-        if (descriptor.layout().total_size() != static_cast<std::uint64_t>(stored_total_size)) {
-            throw std::runtime_error("stored object total size does not match layout");
-        }
-
-        const std::string reconstructed_descriptor_hex = bytes_to_hex(std::span<const std::byte>{
-            descriptor.canonical_bytes(),
-        });
-
-        if (reconstructed_descriptor_hex != stored_descriptor_hex) {
-            throw std::runtime_error("stored canonical descriptor does not match object layout");
-        }
+        auto descriptor = load_object_layout(transaction, layout_id);
 
         transaction.commit();
 
         return descriptor;
+    }
+
+    [[nodiscard]] std::vector<ObjectLayoutDescriptor> get_object_layouts(std::string_view object_id) {
+        validate_object_id(object_id);
+
+        pqxx::work transaction{connection_};
+
+        std::vector<ObjectLayoutDescriptor> layouts;
+
+        for (const auto& [layout_id] : transaction.query<std::string>("SELECT "
+                                                                      "    layout_id "
+                                                                      "FROM object_layouts "
+                                                                      "WHERE object_id = $1 "
+                                                                      "ORDER BY layout_id",
+                                                                      pqxx::params{
+                                                                          object_id,
+                                                                      })) {
+            auto descriptor = load_object_layout(transaction, layout_id);
+
+            if (!descriptor.has_value()) {
+                throw std::runtime_error("object layout disappeared during transaction");
+            }
+
+            layouts.push_back(std::move(*descriptor));
+        }
+
+        transaction.commit();
+
+        return layouts;
     }
 
     void create_version(const ArtifactVersion& version) {
@@ -621,35 +700,143 @@ class PostgresMetadataRepository::Impl {
     }
 
    private:
-    void verify_registered_object(pqxx::work& transaction, const ObjectDescriptor& descriptor) {
-        const ObjectLayout& layout = descriptor.layout();
+    [[nodiscard]] std::optional<ObjectLayoutDescriptor> load_object_layout(pqxx::work& transaction,
+                                                                           std::string_view layout_id) {
+        validate_layout_id(layout_id);
 
-        auto stored_object = transaction.query01<int, std::string, long long, long long>(
+        auto stored = transaction.query01<std::string, int, std::string, std::string, long long, long long>(
             "SELECT "
+            "    object_id, "
             "    descriptor_version, "
-            "    encode(canonical_descriptor, 'hex'), "
+            "    chunking_strategy, "
+            "    encode("
+            "        canonical_descriptor, "
+            "        'hex'"
+            "    ), "
             "    total_size_bytes, "
             "    chunk_count "
-            "FROM objects "
-            "WHERE object_id = $1",
+            "FROM object_layouts "
+            "WHERE layout_id = $1",
             pqxx::params{
-                descriptor.object_id(),
+                layout_id,
             });
 
-        if (!stored_object.has_value()) {
-            throw std::runtime_error("registered object is missing from database");
+        if (!stored.has_value()) {
+            return std::nullopt;
         }
 
-        auto [descriptor_version, stored_descriptor_hex, stored_total_size, stored_chunk_count] =
-            std::move(*stored_object);
+        auto [stored_object_id, descriptor_version, stored_strategy, stored_descriptor_hex, stored_total_size,
+              stored_chunk_count] = std::move(*stored);
 
-        if (std::cmp_not_equal(descriptor_version, ObjectDescriptor::kFormatVersion) ||
+        if (std::cmp_not_equal(descriptor_version, ObjectLayoutDescriptor::kFormatVersion)) {
+            throw std::runtime_error("stored object layout uses an unsupported descriptor version");
+        }
+
+        if (stored_total_size < 0 || stored_chunk_count < 0) {
+            throw std::runtime_error("stored object layout contains invalid negative metadata");
+        }
+
+        std::vector<ChunkRef> chunks;
+
+        chunks.reserve(static_cast<std::size_t>(stored_chunk_count));
+
+        std::size_t expected_index = 0;
+
+        for (auto [stored_index, chunk_id, byte_offset, chunk_size] :
+             transaction.query<long long, std::string, long long, long long>("SELECT "
+                                                                             "    chunk_index, "
+                                                                             "    chunk_id, "
+                                                                             "    byte_offset, "
+                                                                             "    chunk_size_bytes "
+                                                                             "FROM object_layout_chunks "
+                                                                             "WHERE layout_id = $1 "
+                                                                             "ORDER BY chunk_index",
+                                                                             pqxx::params{
+                                                                                 layout_id,
+                                                                             })) {
+            if (stored_index != size_to_postgres_bigint(expected_index, "chunk index")) {
+                throw std::runtime_error("stored object layout chunk indexes are not contiguous");
+            }
+
+            if (byte_offset < 0 || chunk_size <= 0) {
+                throw std::runtime_error("stored object layout chunk contains invalid size metadata");
+            }
+
+            chunks.push_back(ChunkRef{
+                .chunk_id = std::move(chunk_id),
+                .offset = static_cast<std::uint64_t>(byte_offset),
+                .size = static_cast<std::uint64_t>(chunk_size),
+            });
+
+            ++expected_index;
+        }
+
+        if (std::cmp_not_equal(expected_index, stored_chunk_count)) {
+            throw std::runtime_error("stored object layout chunk count does not match layout rows");
+        }
+
+        ObjectLayoutDescriptor descriptor{
+            Object{
+                std::move(stored_object_id),
+                static_cast<std::uint64_t>(stored_total_size),
+            },
+            chunking_strategy_from_string(stored_strategy),
+            ObjectLayout{
+                std::move(chunks),
+            },
+        };
+
+        if (descriptor.layout_id() != layout_id) {
+            throw std::runtime_error("stored object layout does not match layout ID");
+        }
+
+        const std::string reconstructed_descriptor_hex = bytes_to_hex(std::span<const std::byte>{
+            descriptor.canonical_bytes(),
+        });
+
+        if (reconstructed_descriptor_hex != stored_descriptor_hex) {
+            throw std::runtime_error("stored canonical descriptor does not match object layout");
+        }
+
+        return descriptor;
+    }
+
+    void verify_registered_object_layout(pqxx::work& transaction, const ObjectLayoutDescriptor& descriptor) {
+        const ObjectLayout& layout = descriptor.layout();
+
+        auto stored = transaction.query01<std::string, int, std::string, std::string, long long, long long>(
+            "SELECT "
+            "    object_id, "
+            "    descriptor_version, "
+            "    chunking_strategy, "
+            "    encode("
+            "        canonical_descriptor, "
+            "        'hex'"
+            "    ), "
+            "    total_size_bytes, "
+            "    chunk_count "
+            "FROM object_layouts "
+            "WHERE layout_id = $1",
+            pqxx::params{
+                descriptor.layout_id(),
+            });
+
+        if (!stored.has_value()) {
+            throw std::runtime_error("registered object layout is missing from database");
+        }
+
+        const auto& [stored_object_id, descriptor_version, stored_strategy, stored_descriptor_hex, stored_total_size,
+                     stored_chunk_count] = *stored;
+
+        if (stored_object_id != descriptor.object_id() ||
+            std::cmp_not_equal(descriptor_version, ObjectLayoutDescriptor::kFormatVersion) ||
+            stored_strategy != chunking_strategy_to_string(descriptor.chunking_strategy()) ||
             stored_descriptor_hex != bytes_to_hex(std::span<const std::byte>{
                                          descriptor.canonical_bytes(),
                                      }) ||
-            stored_total_size != to_postgres_bigint(layout.total_size(), "object total size") ||
-            stored_chunk_count != size_to_postgres_bigint(layout.chunks().size(), "object chunk count")) {
-            throw std::runtime_error("existing object metadata does not match descriptor");
+            stored_total_size != to_postgres_bigint(layout.total_size(), "object layout total size") ||
+            stored_chunk_count != size_to_postgres_bigint(layout.chunks().size(), "object layout chunk count")) {
+            throw std::runtime_error("existing object layout metadata does not match descriptor");
         }
 
         std::size_t expected_index = 0;
@@ -660,14 +847,14 @@ class PostgresMetadataRepository::Impl {
                                                                              "    chunk_id, "
                                                                              "    byte_offset, "
                                                                              "    chunk_size_bytes "
-                                                                             "FROM object_chunks "
-                                                                             "WHERE object_id = $1 "
+                                                                             "FROM object_layout_chunks "
+                                                                             "WHERE layout_id = $1 "
                                                                              "ORDER BY chunk_index",
                                                                              pqxx::params{
-                                                                                 descriptor.object_id(),
+                                                                                 descriptor.layout_id(),
                                                                              })) {
             if (expected_index >= layout.chunks().size()) {
-                throw std::runtime_error("stored object contains unexpected chunk rows");
+                throw std::runtime_error("stored object layout contains unexpected chunk rows");
             }
 
             const ChunkRef& expected = layout.chunks()[expected_index];
@@ -683,7 +870,7 @@ class PostgresMetadataRepository::Impl {
         }
 
         if (expected_index != layout.chunks().size()) {
-            throw std::runtime_error("stored object is missing chunk rows");
+            throw std::runtime_error("stored object layout is missing chunk rows");
         }
     }
 
@@ -705,12 +892,22 @@ std::optional<Artifact> PostgresMetadataRepository::get_artifact(const UuidV7& a
     return impl_->get_artifact(artifact_id);
 }
 
-void PostgresMetadataRepository::register_object(const ObjectDescriptor& descriptor) {
-    impl_->register_object(descriptor);
+void PostgresMetadataRepository::register_object(const Object& object) { impl_->register_object(object); }
+
+std::optional<Object> PostgresMetadataRepository::get_object(std::string_view object_id) {
+    return impl_->get_object(object_id);
 }
 
-std::optional<ObjectDescriptor> PostgresMetadataRepository::get_object(std::string_view object_id) {
-    return impl_->get_object(object_id);
+void PostgresMetadataRepository::register_object_layout(const ObjectLayoutDescriptor& descriptor) {
+    impl_->register_object_layout(descriptor);
+}
+
+std::optional<ObjectLayoutDescriptor> PostgresMetadataRepository::get_object_layout(std::string_view layout_id) {
+    return impl_->get_object_layout(layout_id);
+}
+
+std::vector<ObjectLayoutDescriptor> PostgresMetadataRepository::get_object_layouts(std::string_view object_id) {
+    return impl_->get_object_layouts(object_id);
 }
 
 void PostgresMetadataRepository::create_version(const ArtifactVersion& version) { impl_->create_version(version); }

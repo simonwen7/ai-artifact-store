@@ -2,26 +2,36 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <cstdlib>
 #include <pqxx/pqxx>
 #include <string>
+#include <vector>
 
 namespace {
 
 using aistore::metadata::Artifact;
 using aistore::metadata::ArtifactVersion;
+using aistore::metadata::ChunkingStrategy;
 using aistore::metadata::ChunkRef;
-using aistore::metadata::ObjectDescriptor;
+using aistore::metadata::Object;
 using aistore::metadata::ObjectLayout;
+using aistore::metadata::ObjectLayoutDescriptor;
 using aistore::metadata::PostgresMetadataRepository;
 using aistore::metadata::StorageLocation;
 using aistore::metadata::StorageLocationState;
 using aistore::metadata::UuidV7;
 using aistore::metadata::VersionState;
 
+const std::string kObjectId(64, '1');
+
 const std::string kChunkA(64, 'a');
 
 const std::string kChunkB(64, 'b');
+
+const std::string kChunkC(64, 'c');
+
+const std::string kChunkD(64, 'd');
 
 std::string test_database_connection_string() {
     const char* configured = std::getenv("AISTORE_TEST_DB_URL");
@@ -46,7 +56,8 @@ void reset_metadata_data() {
             "    tags, "
             "    storage_locations, "
             "    artifact_versions, "
-            "    object_chunks, "
+            "    object_layout_chunks, "
+            "    object_layouts, "
             "    artifacts, "
             "    objects, "
             "    chunks "
@@ -56,8 +67,17 @@ void reset_metadata_data() {
     transaction.commit();
 }
 
-ObjectDescriptor make_object_descriptor() {
-    return ObjectDescriptor{
+Object make_object() {
+    return Object{
+        kObjectId,
+        6,
+    };
+}
+
+ObjectLayoutDescriptor make_object_layout_descriptor() {
+    return ObjectLayoutDescriptor{
+        make_object(),
+        ChunkingStrategy::FixedSize,
         ObjectLayout{
             {
                 ChunkRef{
@@ -73,6 +93,35 @@ ObjectDescriptor make_object_descriptor() {
             },
         },
     };
+}
+
+ObjectLayoutDescriptor make_alternate_object_layout_descriptor() {
+    return ObjectLayoutDescriptor{
+        make_object(),
+        ChunkingStrategy::FixedSize,
+        ObjectLayout{
+            {
+                ChunkRef{
+                    .chunk_id = kChunkC,
+                    .offset = 0,
+                    .size = 3,
+                },
+                ChunkRef{
+                    .chunk_id = kChunkD,
+                    .offset = 3,
+                    .size = 3,
+                },
+            },
+        },
+    };
+}
+
+void register_test_object(PostgresMetadataRepository& repository) { repository.register_object(make_object()); }
+
+void register_test_object_and_layout(PostgresMetadataRepository& repository) {
+    repository.register_object(make_object());
+
+    repository.register_object_layout(make_object_layout_descriptor());
 }
 
 TEST(PostgresMetadataRepositoryTest, CreatesAndReadsArtifact) {
@@ -139,40 +188,24 @@ TEST(PostgresMetadataRepositoryTest, DatabaseEnforcesUniqueProjectAndName) {
     EXPECT_THROW(repository.create_artifact(second), pqxx::sql_error);
 }
 
-TEST(PostgresMetadataRepositoryTest, RegistersAndReadsObjectTransactionally) {
+TEST(PostgresMetadataRepositoryTest, RegistersAndReadsObject) {
     reset_metadata_data();
 
     PostgresMetadataRepository repository{
         test_database_connection_string(),
     };
 
-    const ObjectDescriptor descriptor = make_object_descriptor();
+    const Object object = make_object();
 
-    repository.register_object(descriptor);
+    repository.register_object(object);
 
-    const auto restored = repository.get_object(descriptor.object_id());
+    const auto restored = repository.get_object(object.object_id());
 
     ASSERT_TRUE(restored.has_value());
 
-    EXPECT_EQ(restored->object_id(), descriptor.object_id());
+    EXPECT_EQ(restored->object_id(), object.object_id());
 
-    EXPECT_EQ(restored->canonical_bytes(), descriptor.canonical_bytes());
-
-    EXPECT_EQ(restored->layout().total_size(), 6U);
-
-    ASSERT_EQ(restored->layout().chunks().size(), 2U);
-
-    EXPECT_EQ(restored->layout().chunks()[0].chunk_id, kChunkA);
-
-    EXPECT_EQ(restored->layout().chunks()[0].offset, 0U);
-
-    EXPECT_EQ(restored->layout().chunks()[0].size, 4U);
-
-    EXPECT_EQ(restored->layout().chunks()[1].chunk_id, kChunkB);
-
-    EXPECT_EQ(restored->layout().chunks()[1].offset, 4U);
-
-    EXPECT_EQ(restored->layout().chunks()[1].size, 2U);
+    EXPECT_EQ(restored->total_size(), object.total_size());
 }
 
 TEST(PostgresMetadataRepositoryTest, RegisterObjectIsIdempotent) {
@@ -182,11 +215,11 @@ TEST(PostgresMetadataRepositoryTest, RegisterObjectIsIdempotent) {
         test_database_connection_string(),
     };
 
-    const ObjectDescriptor descriptor = make_object_descriptor();
+    const Object object = make_object();
 
-    repository.register_object(descriptor);
+    repository.register_object(object);
 
-    repository.register_object(descriptor);
+    repository.register_object(object);
 
     pqxx::connection connection{
         test_database_connection_string(),
@@ -194,17 +227,113 @@ TEST(PostgresMetadataRepositoryTest, RegisterObjectIsIdempotent) {
 
     pqxx::work transaction{connection};
 
-    EXPECT_EQ(transaction.query_value<long long>("SELECT COUNT(*) FROM objects"), 1);
-
-    EXPECT_EQ(transaction.query_value<long long>("SELECT COUNT(*) FROM chunks"), 2);
-
-    EXPECT_EQ(transaction.query_value<long long>("SELECT COUNT(*) FROM object_chunks"), 2);
+    EXPECT_EQ(transaction.query_value<long long>("SELECT COUNT(*) "
+                                                 "FROM objects"),
+              1);
 
     transaction.commit();
 }
 
-TEST(PostgresMetadataRepositoryTest, RegisterObjectRollsBackOnChunkSizeConflict) {
+TEST(PostgresMetadataRepositoryTest, RegisterObjectRejectsConflictingSize) {
     reset_metadata_data();
+
+    PostgresMetadataRepository repository{
+        test_database_connection_string(),
+    };
+
+    repository.register_object(make_object());
+
+    EXPECT_THROW(repository.register_object(Object{
+                     kObjectId,
+                     7,
+                 }),
+                 std::runtime_error);
+}
+
+TEST(PostgresMetadataRepositoryTest, MissingObjectReturnsNullopt) {
+    reset_metadata_data();
+
+    PostgresMetadataRepository repository{
+        test_database_connection_string(),
+    };
+
+    const auto restored = repository.get_object(std::string(64, 'f'));
+
+    EXPECT_FALSE(restored.has_value());
+}
+
+TEST(PostgresMetadataRepositoryTest, RegistersAndReadsObjectLayoutTransactionally) {
+    reset_metadata_data();
+
+    PostgresMetadataRepository repository{
+        test_database_connection_string(),
+    };
+
+    register_test_object(repository);
+
+    const auto descriptor = make_object_layout_descriptor();
+
+    repository.register_object_layout(descriptor);
+
+    const auto restored = repository.get_object_layout(descriptor.layout_id());
+
+    ASSERT_TRUE(restored.has_value());
+
+    EXPECT_EQ(restored->layout_id(), descriptor.layout_id());
+
+    EXPECT_EQ(restored->object_id(), descriptor.object_id());
+
+    EXPECT_EQ(restored->canonical_bytes(), descriptor.canonical_bytes());
+
+    EXPECT_EQ(restored->chunking_strategy(), ChunkingStrategy::FixedSize);
+
+    ASSERT_EQ(restored->layout().chunks().size(), 2U);
+}
+
+TEST(PostgresMetadataRepositoryTest, RegisterObjectLayoutIsIdempotent) {
+    reset_metadata_data();
+
+    PostgresMetadataRepository repository{
+        test_database_connection_string(),
+    };
+
+    register_test_object(repository);
+
+    const auto descriptor = make_object_layout_descriptor();
+
+    repository.register_object_layout(descriptor);
+
+    repository.register_object_layout(descriptor);
+
+    pqxx::connection connection{
+        test_database_connection_string(),
+    };
+
+    pqxx::work transaction{connection};
+
+    EXPECT_EQ(transaction.query_value<long long>("SELECT COUNT(*) "
+                                                 "FROM object_layouts"),
+              1);
+
+    EXPECT_EQ(transaction.query_value<long long>("SELECT COUNT(*) "
+                                                 "FROM chunks"),
+              2);
+
+    EXPECT_EQ(transaction.query_value<long long>("SELECT COUNT(*) "
+                                                 "FROM object_layout_chunks"),
+              2);
+
+    transaction.commit();
+}
+
+TEST(PostgresMetadataRepositoryTest, RegisterObjectLayoutRollsBackOnChunkSizeConflict) {
+    reset_metadata_data();
+
+    PostgresMetadataRepository repository{
+        test_database_connection_string(),
+    };
+
+    register_test_object(repository);
 
     {
         pqxx::connection connection{
@@ -232,13 +361,9 @@ TEST(PostgresMetadataRepositoryTest, RegisterObjectRollsBackOnChunkSizeConflict)
         transaction.commit();
     }
 
-    PostgresMetadataRepository repository{
-        test_database_connection_string(),
-    };
+    const auto descriptor = make_object_layout_descriptor();
 
-    const ObjectDescriptor descriptor = make_object_descriptor();
-
-    EXPECT_THROW(repository.register_object(descriptor), std::runtime_error);
+    EXPECT_THROW(repository.register_object_layout(descriptor), std::runtime_error);
 
     pqxx::connection connection{
         test_database_connection_string(),
@@ -256,41 +381,188 @@ TEST(PostgresMetadataRepositoryTest, RegisterObjectRollsBackOnChunkSizeConflict)
             kChunkA,
         });
 
-    const bool object_exists = transaction.query_value<bool>(
+    const bool layout_exists = transaction.query_value<bool>(
         "SELECT EXISTS ("
         "    SELECT 1 "
-        "    FROM objects "
-        "    WHERE object_id = $1"
+        "    FROM object_layouts "
+        "    WHERE layout_id = $1"
         ")",
         pqxx::params{
-            descriptor.object_id(),
-        });
-
-    const auto existing_chunk_b_size = transaction.query_value<long long>(
-        "SELECT size_bytes "
-        "FROM chunks "
-        "WHERE chunk_id = $1",
-        pqxx::params{
-            kChunkB,
+            descriptor.layout_id(),
         });
 
     EXPECT_FALSE(chunk_a_exists);
-    EXPECT_FALSE(object_exists);
-    EXPECT_EQ(existing_chunk_b_size, 99);
+
+    EXPECT_FALSE(layout_exists);
+
+    EXPECT_EQ(transaction.query_value<long long>("SELECT COUNT(*) "
+                                                 "FROM objects"),
+              1);
 
     transaction.commit();
 }
 
-TEST(PostgresMetadataRepositoryTest, MissingObjectReturnsNullopt) {
+TEST(PostgresMetadataRepositoryTest, MissingObjectLayoutReturnsNullopt) {
     reset_metadata_data();
 
     PostgresMetadataRepository repository{
         test_database_connection_string(),
     };
 
-    const auto restored = repository.get_object(std::string(64, 'c'));
+    const auto restored = repository.get_object_layout(std::string(64, 'e'));
 
     EXPECT_FALSE(restored.has_value());
+}
+
+TEST(PostgresMetadataRepositoryTest, SupportsMultipleLayoutsForSameObject) {
+    reset_metadata_data();
+
+    PostgresMetadataRepository repository{
+        test_database_connection_string(),
+    };
+
+    register_test_object(repository);
+
+    const auto first = make_object_layout_descriptor();
+
+    const auto second = make_alternate_object_layout_descriptor();
+
+    repository.register_object_layout(first);
+
+    repository.register_object_layout(second);
+
+    EXPECT_EQ(first.object_id(), second.object_id());
+
+    EXPECT_NE(first.layout_id(), second.layout_id());
+
+    auto restored = repository.get_object_layouts(kObjectId);
+
+    ASSERT_EQ(restored.size(), 2U);
+
+    std::vector<std::string> restored_layout_ids;
+
+    for (const auto& descriptor : restored) {
+        EXPECT_EQ(descriptor.object_id(), kObjectId);
+
+        restored_layout_ids.push_back(descriptor.layout_id());
+    }
+
+    std::vector<std::string> expected_layout_ids{
+        first.layout_id(),
+        second.layout_id(),
+    };
+
+    std::sort(restored_layout_ids.begin(), restored_layout_ids.end());
+
+    std::sort(expected_layout_ids.begin(), expected_layout_ids.end());
+
+    EXPECT_EQ(restored_layout_ids, expected_layout_ids);
+}
+
+TEST(PostgresMetadataRepositoryTest, RegisterObjectLayoutRequiresRegisteredObject) {
+    reset_metadata_data();
+
+    PostgresMetadataRepository repository{
+        test_database_connection_string(),
+    };
+
+    const auto descriptor = make_object_layout_descriptor();
+
+    EXPECT_THROW(repository.register_object_layout(descriptor), std::runtime_error);
+
+    pqxx::connection connection{
+        test_database_connection_string(),
+    };
+
+    pqxx::work transaction{connection};
+
+    EXPECT_EQ(transaction.query_value<long long>("SELECT COUNT(*) "
+                                                 "FROM chunks"),
+              0);
+
+    EXPECT_EQ(transaction.query_value<long long>("SELECT COUNT(*) "
+                                                 "FROM object_layouts"),
+              0);
+
+    transaction.commit();
+}
+
+TEST(PostgresMetadataRepositoryTest, DatabaseRejectsLayoutForMissingObject) {
+    reset_metadata_data();
+
+    pqxx::connection connection{
+        test_database_connection_string(),
+    };
+
+    pqxx::work transaction{connection};
+
+    EXPECT_THROW(transaction
+                     .exec("INSERT INTO object_layouts ("
+                           "    layout_id, "
+                           "    object_id, "
+                           "    descriptor_version, "
+                           "    chunking_strategy, "
+                           "    canonical_descriptor, "
+                           "    total_size_bytes, "
+                           "    chunk_count"
+                           ") "
+                           "VALUES ("
+                           "    $1, "
+                           "    $2, "
+                           "    1, "
+                           "    'fixed-size', "
+                           "    decode('00', 'hex'), "
+                           "    0, "
+                           "    0"
+                           ")",
+                           pqxx::params{
+                               std::string(64, 'e'),
+                               std::string(64, 'f'),
+                           })
+                     .no_rows(),
+                 pqxx::foreign_key_violation);
+}
+
+TEST(PostgresMetadataRepositoryTest, DatabaseRejectsLayoutWithMismatchedObjectSize) {
+    reset_metadata_data();
+
+    PostgresMetadataRepository repository{
+        test_database_connection_string(),
+    };
+
+    repository.register_object(make_object());
+
+    pqxx::connection connection{
+        test_database_connection_string(),
+    };
+
+    pqxx::work transaction{connection};
+
+    EXPECT_THROW(transaction
+                     .exec("INSERT INTO object_layouts ("
+                           "    layout_id, "
+                           "    object_id, "
+                           "    descriptor_version, "
+                           "    chunking_strategy, "
+                           "    canonical_descriptor, "
+                           "    total_size_bytes, "
+                           "    chunk_count"
+                           ") "
+                           "VALUES ("
+                           "    $1, "
+                           "    $2, "
+                           "    1, "
+                           "    'fixed-size', "
+                           "    decode('00', 'hex'), "
+                           "    7, "
+                           "    1"
+                           ")",
+                           pqxx::params{
+                               std::string(64, 'e'),
+                               kObjectId,
+                           })
+                     .no_rows(),
+                 pqxx::foreign_key_violation);
 }
 
 TEST(PostgresMetadataRepositoryTest, CreatesAndReadsArtifactVersion) {
@@ -310,16 +582,16 @@ TEST(PostgresMetadataRepositoryTest, CreatesAndReadsArtifactVersion) {
 
     repository.create_artifact(artifact);
 
-    const ObjectDescriptor descriptor = make_object_descriptor();
+    const Object object = make_object();
 
-    repository.register_object(descriptor);
+    repository.register_object(object);
 
     const UuidV7 version_id = UuidV7::generate();
 
     const ArtifactVersion version{
         version_id,
         artifact_id,
-        descriptor.object_id(),
+        object.object_id(),
         VersionState::Committed,
     };
 
@@ -333,7 +605,7 @@ TEST(PostgresMetadataRepositoryTest, CreatesAndReadsArtifactVersion) {
 
     EXPECT_EQ(restored->artifact_id(), artifact_id);
 
-    EXPECT_EQ(restored->root_object_id(), descriptor.object_id());
+    EXPECT_EQ(restored->root_object_id(), object.object_id());
 
     EXPECT_EQ(restored->state(), VersionState::Committed);
 }
@@ -353,28 +625,28 @@ TEST(PostgresMetadataRepositoryTest, PreservesAllArtifactVersionStates) {
         "training-project",
     });
 
-    const ObjectDescriptor descriptor = make_object_descriptor();
+    const Object object = make_object();
 
-    repository.register_object(descriptor);
+    repository.register_object(object);
 
     const ArtifactVersion staging{
         UuidV7::generate(),
         artifact_id,
-        descriptor.object_id(),
+        object.object_id(),
         VersionState::Staging,
     };
 
     const ArtifactVersion committed{
         UuidV7::generate(),
         artifact_id,
-        descriptor.object_id(),
+        object.object_id(),
         VersionState::Committed,
     };
 
     const ArtifactVersion failed{
         UuidV7::generate(),
         artifact_id,
-        descriptor.object_id(),
+        object.object_id(),
         VersionState::Failed,
     };
 
@@ -418,14 +690,14 @@ TEST(PostgresMetadataRepositoryTest, DatabaseRejectsVersionForMissingArtifact) {
         test_database_connection_string(),
     };
 
-    const ObjectDescriptor descriptor = make_object_descriptor();
+    const Object object = make_object();
 
-    repository.register_object(descriptor);
+    repository.register_object(object);
 
     const ArtifactVersion version{
         UuidV7::generate(),
         UuidV7::generate(),
-        descriptor.object_id(),
+        object.object_id(),
         VersionState::Committed,
     };
 
@@ -472,14 +744,14 @@ TEST(PostgresMetadataRepositoryTest, CreatesAndReadsTag) {
         "training-project",
     });
 
-    const ObjectDescriptor descriptor = make_object_descriptor();
+    const Object object = make_object();
 
-    repository.register_object(descriptor);
+    repository.register_object(object);
 
     const ArtifactVersion version{
         UuidV7::generate(),
         artifact_id,
-        descriptor.object_id(),
+        object.object_id(),
         VersionState::Committed,
     };
 
@@ -509,21 +781,21 @@ TEST(PostgresMetadataRepositoryTest, UpdatingTagMovesExistingReference) {
         "training-project",
     });
 
-    const ObjectDescriptor descriptor = make_object_descriptor();
+    const Object object = make_object();
 
-    repository.register_object(descriptor);
+    repository.register_object(object);
 
     const ArtifactVersion first_version{
         UuidV7::generate(),
         artifact_id,
-        descriptor.object_id(),
+        object.object_id(),
         VersionState::Committed,
     };
 
     const ArtifactVersion second_version{
         UuidV7::generate(),
         artifact_id,
-        descriptor.object_id(),
+        object.object_id(),
         VersionState::Committed,
     };
 
@@ -595,14 +867,14 @@ TEST(PostgresMetadataRepositoryTest, DatabaseRejectsTagPointingToDifferentArtifa
         "training-project",
     });
 
-    const ObjectDescriptor descriptor = make_object_descriptor();
+    const Object object = make_object();
 
-    repository.register_object(descriptor);
+    repository.register_object(object);
 
     const ArtifactVersion version_a{
         UuidV7::generate(),
         artifact_a_id,
-        descriptor.object_id(),
+        object.object_id(),
         VersionState::Committed,
     };
 
@@ -622,9 +894,7 @@ TEST(PostgresMetadataRepositoryTest, RegistersAndReadsStorageLocation) {
         test_database_connection_string(),
     };
 
-    const ObjectDescriptor descriptor = make_object_descriptor();
-
-    repository.register_object(descriptor);
+    register_test_object_and_layout(repository);
 
     repository.register_storage_location(StorageLocation{
         .chunk_id = kChunkA,
@@ -653,9 +923,7 @@ TEST(PostgresMetadataRepositoryTest, UpdatingStorageLocationReusesChunkNodeIdent
         test_database_connection_string(),
     };
 
-    const ObjectDescriptor descriptor = make_object_descriptor();
-
-    repository.register_object(descriptor);
+    register_test_object_and_layout(repository);
 
     repository.register_storage_location(StorageLocation{
         .chunk_id = kChunkA,
@@ -705,9 +973,7 @@ TEST(PostgresMetadataRepositoryTest, PreservesStorageLocationStates) {
         test_database_connection_string(),
     };
 
-    const ObjectDescriptor descriptor = make_object_descriptor();
-
-    repository.register_object(descriptor);
+    register_test_object_and_layout(repository);
 
     repository.register_storage_location(StorageLocation{
         .chunk_id = kChunkA,
@@ -764,9 +1030,7 @@ TEST(PostgresMetadataRepositoryTest, DatabaseRejectsSameNodePathForDifferentChun
         test_database_connection_string(),
     };
 
-    const ObjectDescriptor descriptor = make_object_descriptor();
-
-    repository.register_object(descriptor);
+    register_test_object_and_layout(repository);
 
     repository.register_storage_location(StorageLocation{
         .chunk_id = kChunkA,

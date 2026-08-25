@@ -127,7 +127,6 @@ add_library(
     src/metadata/object_layout.cpp
     src/metadata/object.cpp
     src/metadata/object_layout_descriptor.cpp
-    src/metadata/object_descriptor.cpp
     src/metadata/uuid_v7.cpp
     src/metadata/artifact_model.cpp
     src/metadata/postgres_metadata_repository.cpp
@@ -308,17 +307,6 @@ if(BUILD_TESTING)
 
     target_link_libraries(
         aistore_object_layout_descriptor_tests
-        PRIVATE
-        aistore_metadata
-    )
-
-    aistore_add_test(
-        aistore_object_descriptor_tests
-        tests/unit/metadata/object_descriptor_test.cpp
-    )
-
-    target_link_libraries(
-        aistore_object_descriptor_tests
         PRIVATE
         aistore_metadata
     )

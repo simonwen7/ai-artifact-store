@@ -27,7 +27,13 @@ TEST(PostgresConnectionTest, ConnectsToMigratedTestDatabase) {
 
     const std::string database_name = transaction.query_value<std::string>("SELECT current_database()");
 
-    EXPECT_EQ(database_name, "ai_artifact_store_test");
+    const char* configured = std::getenv("AISTORE_TEST_DB_URL");
+
+    if (configured == nullptr || configured[0] == '\0') {
+        EXPECT_EQ(database_name, "ai_artifact_store_test");
+    } else {
+        EXPECT_FALSE(database_name.empty());
+    }
 
     const bool initial_migration_exists = transaction.query_value<bool>(
         "SELECT EXISTS ("
@@ -38,6 +44,17 @@ TEST(PostgresConnectionTest, ConnectsToMigratedTestDatabase) {
         ")");
 
     EXPECT_TRUE(initial_migration_exists);
+
+    const bool object_layout_migration_exists = transaction.query_value<bool>(
+        "SELECT EXISTS ("
+        "    SELECT 1 "
+        "    FROM schema_migrations "
+        "    WHERE version = 2 "
+        "      AND name = "
+        "          'separate_object_layouts'"
+        ")");
+
+    EXPECT_TRUE(object_layout_migration_exists);
 }
 
 }  // namespace

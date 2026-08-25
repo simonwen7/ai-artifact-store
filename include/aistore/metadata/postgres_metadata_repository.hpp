@@ -8,7 +8,8 @@
 #include <vector>
 
 #include "aistore/metadata/artifact_model.hpp"
-#include "aistore/metadata/object_descriptor.hpp"
+#include "aistore/metadata/object.hpp"
+#include "aistore/metadata/object_layout_descriptor.hpp"
 #include "aistore/metadata/storage_location.hpp"
 
 namespace aistore::metadata {
@@ -31,9 +32,15 @@ class PostgresMetadataRepository {
 
     [[nodiscard]] std::optional<Artifact> get_artifact(const UuidV7& artifact_id);
 
-    void register_object(const ObjectDescriptor& descriptor);
+    void register_object(const Object& object);
 
-    [[nodiscard]] std::optional<ObjectDescriptor> get_object(std::string_view object_id);
+    [[nodiscard]] std::optional<Object> get_object(std::string_view object_id);
+
+    void register_object_layout(const ObjectLayoutDescriptor& descriptor);
+
+    [[nodiscard]] std::optional<ObjectLayoutDescriptor> get_object_layout(std::string_view layout_id);
+
+    [[nodiscard]] std::vector<ObjectLayoutDescriptor> get_object_layouts(std::string_view object_id);
 
     void create_version(const ArtifactVersion& version);
 
