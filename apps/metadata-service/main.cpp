@@ -1,15 +1,24 @@
 #include <cstdint>
+#include <cstdlib>
 #include <iostream>
 #include <stdexcept>
 
 #include "aistore/http/http_server.hpp"
+#include "aistore/metadata/postgres_metadata_repository.hpp"
 #include "aistore/service/metadata_service.hpp"
 
 int main() {
     try {
         constexpr std::uint64_t kMaxRequestBodyBytes = 8ULL * 1024ULL * 1024ULL;
 
-        aistore::service::MetadataService service;
+        const char* database_url = std::getenv("AISTORE_DB_URL");
+
+        if (database_url == nullptr || database_url[0] == '\0') {
+            throw std::runtime_error("AISTORE_DB_URL must be set");
+        }
+
+        aistore::metadata::PostgresMetadataRepository repository{database_url};
+        aistore::service::MetadataService service{repository};
 
         aistore::http::HttpServer server{
             aistore::http::HttpServerConfig{

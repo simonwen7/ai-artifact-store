@@ -245,7 +245,10 @@ target_link_libraries(
     aistore_http
     aistore_storage
     aistore_hashing
+    aistore_metadata
     Boost::json
+    PRIVATE
+    libpqxx::pqxx
 )
 
 if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
@@ -562,9 +565,11 @@ if(BUILD_TESTING)
         aistore_http
         aistore_services
         aistore_storage
+        aistore_metadata
         Boost::json
         Boost::headers
         Threads::Threads
+        libpqxx::pqxx
     )
 
     aistore_add_test(
@@ -582,5 +587,23 @@ if(BUILD_TESTING)
         Boost::json
         Boost::headers
         Threads::Threads
+    )
+
+    aistore_add_test(
+        aistore_metadata_service_location_api_tests
+        tests/integration/metadata_service_location_api_test.cpp
+    )
+
+    target_link_libraries(
+        aistore_metadata_service_location_api_tests
+        PRIVATE
+        aistore_http
+        aistore_services
+        aistore_metadata
+        aistore_hashing
+        Boost::json
+        Boost::headers
+        Threads::Threads
+        libpqxx::pqxx
     )
 endif()

@@ -173,3 +173,65 @@ jobs:
           storage_pid=""
 
           rm -f "${output_file}"
+
+      - name: Run metadata-service API smoke test
+        run: |
+          set -euo pipefail
+
+          chunk_id="ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+          metadata_pid=""
+
+          cleanup() {
+            if [[ -n "${metadata_pid}" ]] && kill -0 "${metadata_pid}" 2>/dev/null; then
+              kill "${metadata_pid}"
+              wait "${metadata_pid}" || true
+            fi
+          }
+
+          trap cleanup EXIT
+
+          psql "${AISTORE_TEST_DB_URL}" -v ON_ERROR_STOP=1 -c \
+            "INSERT INTO chunks (chunk_id, size_bytes) VALUES ('${chunk_id}', 3) ON CONFLICT (chunk_id) DO NOTHING;"
+
+          AISTORE_DB_URL="${AISTORE_TEST_DB_URL}" ./build-ci/metadata-service &
+          metadata_pid=$!
+
+          ready=0
+          for _ in $(seq 1 50); do
+            if curl -fsS "http://127.0.0.1:8080/health" >/dev/null; then
+              ready=1
+              break
+            fi
+            sleep 0.1
+          done
+
+          if [[ "${ready}" -ne 1 ]]; then
+            echo "metadata-service did not become ready" >&2
+            exit 1
+          fi
+
+          curl -fsS \
+            -X PUT \
+            -H "Content-Type: application/json" \
+            --data-binary '{"storage_path":"/ci/storage/abc","state":"available"}' \
+            "http://127.0.0.1:8080/v1/chunks/${chunk_id}/locations/ci-node"
+
+          response="$(curl -fsS "http://127.0.0.1:8080/v1/chunks/${chunk_id}/locations")"
+
+          case "${response}" in
+            *"${chunk_id}"*ci-node*/ci/storage/abc*available*)
+              ;;
+            *)
+              echo "unexpected location response: ${response}" >&2
+              exit 1
+              ;;
+          esac
+
+          kill "${metadata_pid}"
+          wait "${metadata_pid}" || true
+          metadata_pid=""
+
+          psql "${AISTORE_TEST_DB_URL}" -v ON_ERROR_STOP=1 -c \
+            "DELETE FROM storage_locations WHERE chunk_id = '${chunk_id}' AND node_id = 'ci-node';"
+          psql "${AISTORE_TEST_DB_URL}" -v ON_ERROR_STOP=1 -c \
+            "DELETE FROM chunks WHERE chunk_id = '${chunk_id}';"

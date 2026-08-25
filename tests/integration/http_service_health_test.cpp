@@ -8,6 +8,7 @@
 #include <boost/json.hpp>
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <filesystem>
 #include <stdexcept>
 #include <string>
@@ -16,6 +17,7 @@
 #include <utility>
 
 #include "aistore/http/http_server.hpp"
+#include "aistore/metadata/postgres_metadata_repository.hpp"
 #include "aistore/service/metadata_service.hpp"
 #include "aistore/service/storage_node_service.hpp"
 #include "aistore/storage/local_chunk_store.hpp"
@@ -32,11 +34,22 @@ using aistore::http::HttpRequest;
 using aistore::http::HttpResponse;
 using aistore::http::HttpServer;
 using aistore::http::HttpServerConfig;
+using aistore::metadata::PostgresMetadataRepository;
 using aistore::service::MetadataService;
 using aistore::service::StorageNodeService;
 using aistore::storage::LocalChunkStore;
 
 constexpr std::uint64_t kMaxRequestBodyBytes = 8ULL * 1024ULL * 1024ULL;
+
+std::string test_database_connection_string() {
+    const char* configured = std::getenv("AISTORE_TEST_DB_URL");
+
+    if (configured != nullptr && configured[0] != '\0') {
+        return configured;
+    }
+
+    return "dbname=ai_artifact_store_test";
+}
 
 class TemporaryDirectory {
    public:
@@ -158,7 +171,8 @@ TEST(HttpServiceHealthTest, StorageNodeHealthOverHttp) {
 }
 
 TEST(HttpServiceHealthTest, MetadataServiceHealthOverHttp) {
-    MetadataService service;
+    PostgresMetadataRepository repository{test_database_connection_string()};
+    MetadataService service{repository};
     RunningHttpServer server{service};
 
     const HttpResponse response = http_exchange(server.port(), beast_http::verb::get, "/health");
@@ -190,7 +204,8 @@ TEST(HttpServiceHealthTest, StorageNodeUnknownRouteReturns404) {
 }
 
 TEST(HttpServiceHealthTest, MetadataServiceUnknownRouteReturns404) {
-    MetadataService service;
+    PostgresMetadataRepository repository{test_database_connection_string()};
+    MetadataService service{repository};
     RunningHttpServer server{service};
 
     const HttpResponse response = http_exchange(server.port(), beast_http::verb::get, "/does-not-exist");
@@ -222,7 +237,8 @@ TEST(HttpServiceHealthTest, StorageNodeHealthRejectsNonGet) {
 }
 
 TEST(HttpServiceHealthTest, MetadataServiceHealthRejectsNonGet) {
-    MetadataService service;
+    PostgresMetadataRepository repository{test_database_connection_string()};
+    MetadataService service{repository};
     RunningHttpServer server{service};
 
     const HttpResponse response = http_exchange(server.port(), beast_http::verb::post, "/health");
