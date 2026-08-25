@@ -124,6 +124,7 @@ endif()
 add_library(
     aistore_metadata
     src/metadata/object_layout.cpp
+    src/metadata/object_descriptor.cpp
 )
 
 target_include_directories(
@@ -142,6 +143,12 @@ set_target_properties(
     aistore_metadata
     PROPERTIES
     CXX_EXTENSIONS OFF
+)
+
+target_link_libraries(
+    aistore_metadata
+    PRIVATE
+    aistore_hashing
 )
 
 if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
@@ -265,12 +272,23 @@ if(BUILD_TESTING)
     )
 
     aistore_add_unit_test(
-        aistore_metadata_tests
+        aistore_object_layout_tests
         tests/unit/metadata/object_layout_test.cpp
     )
 
     target_link_libraries(
-        aistore_metadata_tests
+        aistore_object_layout_tests
+        PRIVATE
+        aistore_metadata
+    )
+
+    aistore_add_unit_test(
+        aistore_object_descriptor_tests
+        tests/unit/metadata/object_descriptor_test.cpp
+    )
+
+    target_link_libraries(
+        aistore_object_descriptor_tests
         PRIVATE
         aistore_metadata
     )
