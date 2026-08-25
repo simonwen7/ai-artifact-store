@@ -125,6 +125,8 @@ endif()
 add_library(
     aistore_metadata
     src/metadata/object_layout.cpp
+    src/metadata/object.cpp
+    src/metadata/object_layout_descriptor.cpp
     src/metadata/object_descriptor.cpp
     src/metadata/uuid_v7.cpp
     src/metadata/artifact_model.cpp
@@ -289,6 +291,28 @@ if(BUILD_TESTING)
     )
 
     aistore_add_test(
+        aistore_object_tests
+        tests/unit/metadata/object_test.cpp
+    )
+
+    target_link_libraries(
+        aistore_object_tests
+        PRIVATE
+        aistore_metadata
+    )
+
+    aistore_add_test(
+        aistore_object_layout_descriptor_tests
+        tests/unit/metadata/object_layout_descriptor_test.cpp
+    )
+
+    target_link_libraries(
+        aistore_object_layout_descriptor_tests
+        PRIVATE
+        aistore_metadata
+    )
+
+    aistore_add_test(
         aistore_object_descriptor_tests
         tests/unit/metadata/object_descriptor_test.cpp
     )
@@ -331,6 +355,7 @@ if(BUILD_TESTING)
         PRIVATE
         aistore_chunking
         aistore_storage
+        aistore_metadata
     )
 
     aistore_add_test(

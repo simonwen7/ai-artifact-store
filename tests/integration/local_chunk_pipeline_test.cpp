@@ -14,6 +14,9 @@
 
 #include "aistore/chunking/fixed_size_chunker.hpp"
 #include "aistore/hashing/sha256.hpp"
+#include "aistore/metadata/object.hpp"
+#include "aistore/metadata/object_layout.hpp"
+#include "aistore/metadata/object_layout_descriptor.hpp"
 #include "aistore/storage/local_chunk_store.hpp"
 
 namespace {
@@ -21,10 +24,18 @@ namespace {
 using aistore::chunking::ChunkBuffer;
 using aistore::chunking::FixedSizeChunker;
 using aistore::hashing::Sha256;
+using aistore::metadata::ChunkingStrategy;
+using aistore::metadata::ChunkRef;
+using aistore::metadata::Object;
+using aistore::metadata::ObjectLayout;
+using aistore::metadata::ObjectLayoutDescriptor;
 using aistore::storage::LocalChunkStore;
 
 std::span<const std::byte> as_bytes(std::string_view text) {
-    return std::as_bytes(std::span{text.data(), text.size()});
+    return std::as_bytes(std::span{
+        text.data(),
+        text.size(),
+    });
 }
 
 std::string digest_to_hex(const Sha256::Digest& digest) {
@@ -39,6 +50,7 @@ std::string digest_to_hex(const Sha256::Digest& digest) {
         const auto value = std::to_integer<unsigned int>(byte);
 
         result.push_back(kHexDigits[(value >> 4U) & 0x0FU]);
+
         result.push_back(kHexDigits[value & 0x0FU]);
     }
 
@@ -78,13 +90,18 @@ class TemporaryDirectory {
 
     ~TemporaryDirectory() {
         std::error_code error;
+
         std::filesystem::remove_all(path_, error);
     }
 
     TemporaryDirectory(const TemporaryDirectory&) = delete;
+
     TemporaryDirectory& operator=(const TemporaryDirectory&) = delete;
 
-    [[nodiscard]] const std::filesystem::path& path() const noexcept { return path_; }
+    [[nodiscard]]
+    const std::filesystem::path& path() const noexcept {
+        return path_;
+    }
 
    private:
     std::filesystem::path path_;
@@ -92,8 +109,14 @@ class TemporaryDirectory {
 
 TEST(LocalChunkPipelineTest, ChunksHashesStoresAndRestoresByteStream) {
     TemporaryDirectory temporary_directory;
-    LocalChunkStore store{temporary_directory.path()};
-    FixedSizeChunker chunker{4};
+
+    LocalChunkStore store{
+        temporary_directory.path(),
+    };
+
+    FixedSizeChunker chunker{
+        4,
+    };
 
     std::vector<std::string> chunk_ids;
     std::vector<std::uint64_t> offsets;
@@ -104,19 +127,26 @@ TEST(LocalChunkPipelineTest, ChunksHashesStoresAndRestoresByteStream) {
         store.put(chunk_id, chunk.bytes);
 
         offsets.push_back(chunk.offset);
+
         chunk_ids.push_back(chunk_id);
     };
 
     chunker.update(as_bytes("ab"), consume);
+
     chunker.update(as_bytes("cdefg"), consume);
+
     chunker.update(as_bytes("hij"), consume);
+
     chunker.finalize(consume);
 
     ASSERT_EQ(chunk_ids.size(), 3U);
+
     ASSERT_EQ(offsets.size(), 3U);
 
     EXPECT_EQ(offsets[0], 0U);
+
     EXPECT_EQ(offsets[1], 4U);
+
     EXPECT_EQ(offsets[2], 8U);
 
     std::string restored;
@@ -125,10 +155,73 @@ TEST(LocalChunkPipelineTest, ChunksHashesStoresAndRestoresByteStream) {
         EXPECT_TRUE(store.contains(chunk_id));
 
         const auto chunk = store.get(chunk_id);
+
         restored += bytes_to_string(chunk);
     }
 
     EXPECT_EQ(restored, "abcdefghij");
+}
+
+TEST(LocalChunkPipelineTest, RawObjectIdentityIsIndependentOfChunkLayout) {
+    constexpr std::string_view raw_object = "abcdefghij";
+
+    const std::string object_id = hash_bytes(as_bytes(raw_object));
+
+    const Object object{
+        object_id,
+        raw_object.size(),
+    };
+
+    const ObjectLayoutDescriptor four_byte_layout{
+        object,
+        ChunkingStrategy::FixedSize,
+        ObjectLayout{
+            {
+                ChunkRef{
+                    .chunk_id = hash_bytes(as_bytes("abcd")),
+                    .offset = 0,
+                    .size = 4,
+                },
+                ChunkRef{
+                    .chunk_id = hash_bytes(as_bytes("efgh")),
+                    .offset = 4,
+                    .size = 4,
+                },
+                ChunkRef{
+                    .chunk_id = hash_bytes(as_bytes("ij")),
+                    .offset = 8,
+                    .size = 2,
+                },
+            },
+        },
+    };
+
+    const ObjectLayoutDescriptor five_byte_layout{
+        object,
+        ChunkingStrategy::FixedSize,
+        ObjectLayout{
+            {
+                ChunkRef{
+                    .chunk_id = hash_bytes(as_bytes("abcde")),
+                    .offset = 0,
+                    .size = 5,
+                },
+                ChunkRef{
+                    .chunk_id = hash_bytes(as_bytes("fghij")),
+                    .offset = 5,
+                    .size = 5,
+                },
+            },
+        },
+    };
+
+    EXPECT_EQ(four_byte_layout.object_id(), object_id);
+
+    EXPECT_EQ(five_byte_layout.object_id(), object_id);
+
+    EXPECT_EQ(four_byte_layout.object_id(), five_byte_layout.object_id());
+
+    EXPECT_NE(four_byte_layout.layout_id(), five_byte_layout.layout_id());
 }
 
 }  // namespace
