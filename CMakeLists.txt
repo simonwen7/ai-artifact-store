@@ -49,6 +49,39 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
     )
 endif()
 
+add_library(
+    aistore_chunking
+    src/chunking/fixed_size_chunker.cpp
+)
+
+target_include_directories(
+    aistore_chunking
+    PUBLIC
+    ${PROJECT_SOURCE_DIR}/include
+)
+
+target_compile_features(
+    aistore_chunking
+    PUBLIC
+    cxx_std_20
+)
+
+set_target_properties(
+    aistore_chunking
+    PROPERTIES
+    CXX_EXTENSIONS OFF
+)
+
+if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+    target_compile_options(
+        aistore_chunking
+        PRIVATE
+        -Wall
+        -Wextra
+        -Wpedantic
+    )
+endif()
+
 add_executable(
     aistore
     apps/aistore-cli/main.cpp
@@ -85,6 +118,7 @@ if(BUILD_TESTING)
         aistore_unit_tests
         tests/unit/smoke_test.cpp
         tests/unit/hashing/sha256_test.cpp
+        tests/unit/chunking/fixed_size_chunker_test.cpp
     )
 
     target_compile_features(
@@ -103,6 +137,7 @@ if(BUILD_TESTING)
         aistore_unit_tests
         PRIVATE
         aistore_hashing
+        aistore_chunking
         GTest::gtest_main
     )
 
