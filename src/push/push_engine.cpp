@@ -486,4 +486,114 @@ PreparedPush PushEngine::push(const PushRequest& request) const {
     };
 }
 
+PreparedPush PushEngine::prepare_committed_retry(const PushRequest& request,
+                                                 const metadata::UploadSession& committed_session) const {
+    if (request.session_id != committed_session.session_id()) {
+        throw std::invalid_argument("committed retry session ID does not match request session ID");
+    }
+
+    if (committed_session.state() != aistore::metadata::UploadSessionState::Committed) {
+        throw std::invalid_argument("committed retry requires a committed upload session");
+    }
+
+    if (!committed_session.finalized_version_id().has_value()) {
+        throw std::invalid_argument("committed retry requires a finalized version ID");
+    }
+
+    if (committed_session.target_node_id() != storage_node_id_) {
+        throw std::invalid_argument("committed retry target node does not match storage client node");
+    }
+
+    if (committed_session.chunking_strategy() != aistore::metadata::ChunkingStrategy::FixedSize) {
+        throw std::invalid_argument("committed retry chunking strategy must be fixed-size");
+    }
+
+    if (committed_session.chunk_size_bytes() == 0U || committed_session.chunk_size_bytes() > kMaxM4ChunkSize ||
+        committed_session.chunk_size_bytes() > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max())) {
+        throw std::invalid_argument("committed retry chunk size exceeds M4 storage limits");
+    }
+
+    const auto chunk_size = static_cast<std::size_t>(committed_session.chunk_size_bytes());
+
+    std::ifstream input{request.source_path, std::ios::binary};
+
+    if (!input.is_open()) {
+        throw std::runtime_error("failed to open source file for committed retry");
+    }
+
+    std::vector<aistore::metadata::ChunkRef> layout_refs;
+    std::set<std::string> seen_chunk_ids;
+
+    aistore::hashing::Sha256 object_hasher;
+    aistore::chunking::FixedSizeChunker chunker{chunk_size};
+    std::uint64_t bytes_read = 0;
+
+    const auto record_chunk = [&](aistore::chunking::ChunkBuffer chunk) {
+        aistore::hashing::Sha256 chunk_hasher;
+        chunk_hasher.update(chunk.bytes);
+        const std::string chunk_id = digest_to_hex(chunk_hasher.finalize());
+
+        layout_refs.push_back(aistore::metadata::ChunkRef{
+            .chunk_id = chunk_id,
+            .offset = chunk.offset,
+            .size = chunk.bytes.size(),
+        });
+
+        (void)seen_chunk_ids.insert(chunk_id);
+    };
+
+    std::vector<std::byte> read_buffer(kReadBufferSize);
+
+    while (input) {
+        input.read(reinterpret_cast<char*>(read_buffer.data()), static_cast<std::streamsize>(read_buffer.size()));
+
+        if (input.bad()) {
+            throw std::runtime_error("failed while reading source file for committed retry");
+        }
+
+        const auto bytes_just_read = static_cast<std::size_t>(input.gcount());
+
+        if (bytes_just_read == 0U) {
+            break;
+        }
+
+        const std::span<const std::byte> span{read_buffer.data(), bytes_just_read};
+        object_hasher.update(span);
+        bytes_read += bytes_just_read;
+        chunker.update(span, record_chunk);
+    }
+
+    if (input.bad()) {
+        throw std::runtime_error("failed while reading source file for committed retry");
+    }
+
+    chunker.finalize(record_chunk);
+
+    const aistore::hashing::Sha256::Digest object_digest = object_hasher.finalize();
+    const std::string object_id = digest_to_hex(object_digest);
+
+    aistore::metadata::Object object{object_id, bytes_read};
+    aistore::metadata::ObjectLayout layout{std::move(layout_refs)};
+    aistore::metadata::ObjectLayoutDescriptor descriptor{
+        std::move(object), aistore::metadata::ChunkingStrategy::FixedSize, std::move(layout)};
+
+    const std::size_t total_chunks = descriptor.layout().chunks().size();
+    const std::size_t unique_chunks = seen_chunk_ids.size();
+
+    return PreparedPush{
+        .session_id = request.session_id,
+        .layout_descriptor = std::move(descriptor),
+        .stats =
+            PushStats{
+                .bytes_read = bytes_read,
+                .total_chunks = total_chunks,
+                .unique_chunks = unique_chunks,
+                .put_requests = 0U,
+                .verified_target_chunks = 0U,
+                .repaired_target_chunks = 0U,
+                .bytes_sent_to_storage = 0U,
+            },
+    };
+}
+
 }  // namespace aistore::push

@@ -47,6 +47,13 @@ Example:
   --storage-node-id node-1
 ```
 
+Rerunning with the same `--session-id` handles both:
+
+- an Open session after an interrupted data-plane upload
+- a Committed session whose finalize acknowledgement may not have been observed by the client
+
+For the latter, the CLI locally rescans the source, reconstructs the descriptor, and uses idempotent finalize.
+
 ## Technology
 
 - C++20

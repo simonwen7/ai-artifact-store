@@ -548,4 +548,55 @@ TEST_F(PushEngineFixture, RejectsChunkSizeAboveM4StorageLimit) {
                  std::invalid_argument);
 }
 
+TEST(PushEngineRecoveryTest, PrepareCommittedRetryReconstructsDescriptorWithoutRemoteIO) {
+    MetadataClient unused_metadata{HttpClientConfig{
+        .endpoint = HttpEndpoint{.address = "127.0.0.1", .port = 1},
+    }};
+    StorageNodeClient unused_storage{HttpClientConfig{
+        .endpoint = HttpEndpoint{.address = "127.0.0.1", .port = 2},
+    }};
+
+    constexpr std::string_view kRecoveryNode = "m4s6-recovery-node";
+    PushEngine engine{unused_metadata, unused_storage, std::string{kRecoveryNode}};
+
+    TemporaryDirectory source_dir;
+    const std::string contents = "ABCDABCDEFGH";
+    const auto source = write_temp_file(source_dir.path(), "recovery.bin", contents);
+
+    const UuidV7 session_id = UuidV7::generate();
+    const UuidV7 artifact_id = UuidV7::generate();
+    const std::string finalized_version_id = std::string(64, 'a');
+
+    const UploadSession committed_session{
+        session_id,   artifact_id, std::string{kRecoveryNode},    ChunkingStrategy::FixedSize, 4U,
+        std::nullopt, {},          UploadSessionState::Committed, finalized_version_id};
+
+    const PreparedPush prepared =
+        engine.prepare_committed_retry(PushRequest{.source_path = source, .session_id = session_id}, committed_session);
+
+    EXPECT_EQ(prepared.session_id, session_id);
+    EXPECT_EQ(prepared.stats.bytes_read, 12U);
+    EXPECT_EQ(prepared.stats.total_chunks, 3U);
+    EXPECT_EQ(prepared.stats.unique_chunks, 2U);
+    EXPECT_EQ(prepared.stats.put_requests, 0U);
+    EXPECT_EQ(prepared.stats.verified_target_chunks, 0U);
+    EXPECT_EQ(prepared.stats.repaired_target_chunks, 0U);
+    EXPECT_EQ(prepared.stats.bytes_sent_to_storage, 0U);
+
+    const auto& refs = prepared.layout_descriptor.layout().chunks();
+    ASSERT_EQ(refs.size(), 3U);
+    EXPECT_EQ(refs[0].offset, 0U);
+    EXPECT_EQ(refs[1].offset, 4U);
+    EXPECT_EQ(refs[2].offset, 8U);
+    EXPECT_EQ(refs[0].size, 4U);
+    EXPECT_EQ(refs[1].size, 4U);
+    EXPECT_EQ(refs[2].size, 4U);
+    EXPECT_EQ(refs[0].chunk_id, refs[1].chunk_id);
+    EXPECT_NE(refs[2].chunk_id, refs[0].chunk_id);
+    EXPECT_EQ(refs[0].chunk_id, sha256_hex("ABCD"));
+    EXPECT_EQ(refs[2].chunk_id, sha256_hex("EFGH"));
+    EXPECT_EQ(prepared.layout_descriptor.object_id(), sha256_hex(contents));
+    EXPECT_EQ(prepared.layout_descriptor.object().total_size(), 12U);
+}
+
 }  // namespace

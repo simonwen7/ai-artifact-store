@@ -9,6 +9,7 @@
 #include "aistore/client/metadata_client.hpp"
 #include "aistore/client/storage_node_client.hpp"
 #include "aistore/metadata/object_layout_descriptor.hpp"
+#include "aistore/metadata/upload_session.hpp"
 #include "aistore/metadata/uuid_v7.hpp"
 
 namespace aistore::push {
@@ -50,6 +51,9 @@ class PushEngine {
                std::string storage_node_id);
 
     [[nodiscard]] PreparedPush push(const PushRequest& request) const;
+
+    [[nodiscard]] PreparedPush prepare_committed_retry(const PushRequest& request,
+                                                       const metadata::UploadSession& committed_session) const;
 
    private:
     client::MetadataClient& metadata_client_;

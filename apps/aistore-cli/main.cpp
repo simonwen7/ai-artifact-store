@@ -368,6 +368,16 @@ struct PushOptions {
     };
 }
 
+[[nodiscard]] bool creation_identity_matches(const aistore::metadata::UploadSession& requested,
+                                             const aistore::metadata::UploadSession& existing) {
+    return existing.artifact_id() == requested.artifact_id() &&
+           existing.target_node_id() == requested.target_node_id() &&
+           existing.chunking_strategy() == requested.chunking_strategy() &&
+           existing.chunk_size_bytes() == requested.chunk_size_bytes() &&
+           existing.parent_version_id() == requested.parent_version_id() &&
+           existing.immutable_metadata() == requested.immutable_metadata();
+}
+
 void emit_success_json(const std::string& target_node_id, const aistore::metadata::UuidV7& artifact_id,
                        const aistore::push::PreparedPush& prepared,
                        const aistore::metadata::FinalizeUploadResult& finalize_result) {
@@ -438,18 +448,43 @@ void emit_success_json(const std::string& target_node_id, const aistore::metadat
             std::nullopt,
         };
 
-        (void)metadata_client.create_upload_session(session);
-        session_established = true;
+        std::optional<aistore::push::PreparedPush> prepared;
 
-        const aistore::push::PreparedPush prepared = push_engine.push(aistore::push::PushRequest{
-            .source_path = options.file_path,
-            .session_id = session_id,
-        });
+        try {
+            (void)metadata_client.create_upload_session(session);
+            session_established = true;
+
+            prepared = push_engine.push(aistore::push::PushRequest{
+                .source_path = options.file_path,
+                .session_id = session_id,
+            });
+        } catch (const aistore::client::RemoteApiError& create_error) {
+            if (create_error.status_code() != 409U || create_error.error_code() != "upload_session_conflict") {
+                throw;
+            }
+
+            const std::optional<aistore::metadata::UploadSession> existing =
+                metadata_client.get_upload_session(session_id);
+
+            if (!existing.has_value() || existing->state() != aistore::metadata::UploadSessionState::Committed ||
+                !creation_identity_matches(session, *existing)) {
+                throw;
+            }
+
+            session_established = true;
+
+            prepared = push_engine.prepare_committed_retry(
+                aistore::push::PushRequest{
+                    .source_path = options.file_path,
+                    .session_id = session_id,
+                },
+                *existing);
+        }
 
         const aistore::metadata::FinalizeUploadResult finalize_result =
-            metadata_client.finalize_upload(prepared.session_id, prepared.layout_descriptor);
+            metadata_client.finalize_upload(prepared->session_id, prepared->layout_descriptor);
 
-        emit_success_json(options.storage_node_id, artifact_id, prepared, finalize_result);
+        emit_success_json(options.storage_node_id, artifact_id, *prepared, finalize_result);
         return 0;
     } catch (const aistore::client::RemoteApiError& error) {
         std::cerr << "aistore push error:\n"

@@ -367,4 +367,206 @@ fi
 printf 'ABCD' | cmp -s - "${FILE_A}"
 printf 'EFGH' | cmp -s - "${FILE_B}"
 
+# Phase 3: simulate lost finalize acknowledgement with storage-node down.
+if [[ -n "${STORAGE_PID}" ]] && kill -0 "${STORAGE_PID}" 2>/dev/null; then
+  kill "${STORAGE_PID}"
+  wait "${STORAGE_PID}" || true
+fi
+STORAGE_PID=""
+
+PHASE2_VERSION_ID="${VERSION_ID}"
+PHASE2_LAYOUT_ID="${LAYOUT_ID}"
+PHASE2_OBJECT_ID="${OBJECT_ID}"
+
+set +e
+"${AISTORE_BIN}" push \
+  --file "${SOURCE_FILE}" \
+  --artifact-id "${ARTIFACT_ID}" \
+  --storage-node-id "${NODE_ID}" \
+  --session-id "${SESSION_ID}" \
+  --chunk-size 4 \
+  --metadata source=process-e2e \
+  >"${STDOUT_FILE}" 2>"${STDERR_FILE}"
+PHASE3_STATUS=$?
+set -e
+
+if [[ "${PHASE3_STATUS}" -ne 0 ]]; then
+  echo "phase 3 expected exit 0, got ${PHASE3_STATUS}" >&2
+  echo "stderr:" >&2
+  cat "${STDERR_FILE}" >&2 || true
+  exit 1
+fi
+
+if [[ -s "${STDERR_FILE}" ]]; then
+  echo "phase 3 stderr must be empty" >&2
+  cat "${STDERR_FILE}" >&2
+  exit 1
+fi
+
+cp "${STDOUT_FILE}" "${JSON_FILE}"
+
+PHASE3_PARSE_OUT="$(
+  python3 - "${JSON_FILE}" "${SESSION_ID}" "${ARTIFACT_ID}" "${NODE_ID}" \
+    "${PHASE2_VERSION_ID}" "${PHASE2_OBJECT_ID}" "${PHASE2_LAYOUT_ID}" <<'PY'
+import json
+import re
+import sys
+
+path, session_id, artifact_id, node_id, version_id, object_id, layout_id = sys.argv[1:8]
+with open(path, encoding="utf-8") as handle:
+    text = handle.read()
+
+lines = [line for line in text.splitlines() if line.strip()]
+if len(lines) != 1:
+    raise SystemExit(f"expected exactly one JSON line, got {len(lines)}")
+
+body = json.loads(lines[0])
+expected_keys = {
+    "status",
+    "session_id",
+    "artifact_id",
+    "target_node_id",
+    "version_id",
+    "object_id",
+    "layout_id",
+    "bytes_read",
+    "total_chunks",
+    "unique_chunks",
+    "put_requests",
+    "verified_target_chunks",
+    "repaired_target_chunks",
+    "bytes_sent_to_storage",
+}
+if set(body.keys()) != expected_keys:
+    raise SystemExit(f"unexpected JSON keys: {sorted(body.keys())}")
+
+hex64 = re.compile(r"^[0-9a-f]{64}$")
+
+assert body["status"] == "committed"
+assert body["session_id"] == session_id
+assert body["artifact_id"] == artifact_id
+assert body["target_node_id"] == node_id
+assert body["version_id"] == version_id
+assert body["object_id"] == object_id
+assert body["layout_id"] == layout_id
+assert body["bytes_read"] == 12
+assert body["total_chunks"] == 3
+assert body["unique_chunks"] == 2
+assert body["put_requests"] == 0
+assert body["verified_target_chunks"] == 0
+assert body["repaired_target_chunks"] == 0
+assert body["bytes_sent_to_storage"] == 0
+assert hex64.fullmatch(body["version_id"])
+assert hex64.fullmatch(body["object_id"])
+assert hex64.fullmatch(body["layout_id"])
+PY
+)"
+
+SESSION_STATE="$(
+  psql "${DB_URL}" -At -v ON_ERROR_STOP=1 -c \
+    "SELECT state FROM upload_sessions WHERE session_id = '${SESSION_ID}'::uuid;"
+)"
+
+if [[ "${SESSION_STATE}" != "committed" ]]; then
+  echo "phase 3 expected committed session, got '${SESSION_STATE}'" >&2
+  exit 1
+fi
+
+FINALIZED_VERSION="$(
+  psql "${DB_URL}" -At -v ON_ERROR_STOP=1 -c \
+    "SELECT finalized_version_id FROM upload_sessions WHERE session_id = '${SESSION_ID}'::uuid;"
+)"
+
+if [[ "${FINALIZED_VERSION}" != "${PHASE2_VERSION_ID}" ]]; then
+  echo "phase 3 finalized_version_id changed unexpectedly" >&2
+  exit 1
+fi
+
+FINALIZED_LAYOUT="$(
+  psql "${DB_URL}" -At -v ON_ERROR_STOP=1 -c \
+    "SELECT layout_id FROM upload_session_finalizations WHERE session_id = '${SESSION_ID}'::uuid;"
+)"
+
+if [[ "${FINALIZED_LAYOUT}" != "${PHASE2_LAYOUT_ID}" ]]; then
+  echo "phase 3 finalized layout changed unexpectedly" >&2
+  exit 1
+fi
+
+VERSION_COUNT="$(
+  psql "${DB_URL}" -At -v ON_ERROR_STOP=1 -c \
+    "SELECT COUNT(*) FROM artifact_versions WHERE version_id = '${PHASE2_VERSION_ID}';"
+)"
+
+if [[ "${VERSION_COUNT}" != "1" ]]; then
+  echo "phase 3 unexpected ArtifactVersion count: ${VERSION_COUNT}" >&2
+  exit 1
+fi
+
+LAYOUT_COUNT="$(
+  psql "${DB_URL}" -At -v ON_ERROR_STOP=1 -c \
+    "SELECT COUNT(*) FROM object_layouts WHERE layout_id = '${PHASE2_LAYOUT_ID}';"
+)"
+
+if [[ "${LAYOUT_COUNT}" != "1" ]]; then
+  echo "phase 3 unexpected ObjectLayout count: ${LAYOUT_COUNT}" >&2
+  exit 1
+fi
+
+FINALIZATION_COUNT="$(
+  psql "${DB_URL}" -At -v ON_ERROR_STOP=1 -c \
+    "SELECT COUNT(*) FROM upload_session_finalizations WHERE session_id = '${SESSION_ID}'::uuid;"
+)"
+
+if [[ "${FINALIZATION_COUNT}" != "1" ]]; then
+  echo "phase 3 unexpected finalization count: ${FINALIZATION_COUNT}" >&2
+  exit 1
+fi
+
+# Negative check: different local file against same committed session.
+OTHER_FILE="${WORK_DIR}/other.bin"
+printf 'ZZZZZZZZZZZZ' >"${OTHER_FILE}"
+
+set +e
+"${AISTORE_BIN}" push \
+  --file "${OTHER_FILE}" \
+  --artifact-id "${ARTIFACT_ID}" \
+  --storage-node-id "${NODE_ID}" \
+  --session-id "${SESSION_ID}" \
+  --chunk-size 4 \
+  --metadata source=process-e2e \
+  >"${STDOUT_FILE}" 2>"${STDERR_FILE}"
+OTHER_STATUS=$?
+set -e
+
+if [[ "${OTHER_STATUS}" -eq 0 ]]; then
+  echo "different-file push against committed session unexpectedly succeeded" >&2
+  exit 1
+fi
+
+if [[ -s "${STDOUT_FILE}" ]]; then
+  echo "different-file push stdout must be empty" >&2
+  cat "${STDOUT_FILE}" >&2
+  exit 1
+fi
+
+SESSION_STATE="$(
+  psql "${DB_URL}" -At -v ON_ERROR_STOP=1 -c \
+    "SELECT state FROM upload_sessions WHERE session_id = '${SESSION_ID}'::uuid;"
+)"
+
+if [[ "${SESSION_STATE}" != "committed" ]]; then
+  echo "different-file push mutated session state to '${SESSION_STATE}'" >&2
+  exit 1
+fi
+
+FINALIZED_VERSION="$(
+  psql "${DB_URL}" -At -v ON_ERROR_STOP=1 -c \
+    "SELECT finalized_version_id FROM upload_sessions WHERE session_id = '${SESSION_ID}'::uuid;"
+)"
+
+if [[ "${FINALIZED_VERSION}" != "${PHASE2_VERSION_ID}" ]]; then
+  echo "different-file push mutated finalized_version_id" >&2
+  exit 1
+fi
+
 echo "aistore_cli_push_process_e2e passed"
