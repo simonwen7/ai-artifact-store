@@ -1234,6 +1234,170 @@ class PostgresMetadataRepository::Impl {
         return static_cast<std::uint64_t>(size_bytes);
     }
 
+    [[nodiscard]] ChunkNegotiationBatch negotiate_chunks(const std::vector<ChunkMetadata>& chunks) {
+        std::vector<ChunkMetadata> distinct_chunks;
+        std::map<std::string, std::uint64_t> seen_sizes;
+
+        for (const ChunkMetadata& chunk : chunks) {
+            validate_chunk_id(chunk.chunk_id);
+
+            if (chunk.size_bytes == 0U) {
+                throw std::invalid_argument("chunk size must be greater than zero");
+            }
+
+            (void)to_postgres_bigint(chunk.size_bytes, "chunk size");
+
+            const auto [iterator, inserted] = seen_sizes.emplace(chunk.chunk_id, chunk.size_bytes);
+
+            if (!inserted) {
+                if (iterator->second != chunk.size_bytes) {
+                    throw std::invalid_argument(
+                        "chunk negotiation batch contains conflicting sizes for the same chunk ID");
+                }
+
+                continue;
+            }
+
+            distinct_chunks.push_back(chunk);
+        }
+
+        if (distinct_chunks.empty()) {
+            return ChunkNegotiationBatch{
+                .chunks = {},
+                .conflict = std::nullopt,
+            };
+        }
+
+        pqxx::work transaction{connection_};
+
+        std::vector<bool> was_known;
+        was_known.reserve(distinct_chunks.size());
+
+        for (const ChunkMetadata& chunk : distinct_chunks) {
+            const long long requested_size = to_postgres_bigint(chunk.size_bytes, "chunk size");
+
+            const auto stored = transaction.query01<long long>(
+                "SELECT "
+                "    size_bytes "
+                "FROM chunks "
+                "WHERE chunk_id = $1",
+                pqxx::params{
+                    chunk.chunk_id,
+                });
+
+            if (!stored.has_value()) {
+                was_known.push_back(false);
+                continue;
+            }
+
+            const auto [stored_size] = *stored;
+
+            if (stored_size <= 0) {
+                throw std::runtime_error("stored chunk contains an invalid non-positive size");
+            }
+
+            if (stored_size != requested_size) {
+                return ChunkNegotiationBatch{
+                    .chunks = {},
+                    .conflict =
+                        ChunkSizeConflict{
+                            .chunk_id = chunk.chunk_id,
+                            .requested_size_bytes = chunk.size_bytes,
+                            .stored_size_bytes = static_cast<std::uint64_t>(stored_size),
+                        },
+                };
+            }
+
+            was_known.push_back(true);
+        }
+
+        for (std::size_t index = 0; index < distinct_chunks.size(); ++index) {
+            if (was_known[index]) {
+                continue;
+            }
+
+            const ChunkMetadata& chunk = distinct_chunks[index];
+            const long long chunk_size = to_postgres_bigint(chunk.size_bytes, "chunk size");
+
+            transaction
+                .exec(
+                    "INSERT INTO chunks ("
+                    "    chunk_id, "
+                    "    size_bytes"
+                    ") "
+                    "VALUES ("
+                    "    $1, "
+                    "    $2"
+                    ") "
+                    "ON CONFLICT (chunk_id) "
+                    "DO NOTHING",
+                    pqxx::params{
+                        chunk.chunk_id,
+                        chunk_size,
+                    })
+                .no_rows();
+        }
+
+        for (const ChunkMetadata& chunk : distinct_chunks) {
+            const long long requested_size = to_postgres_bigint(chunk.size_bytes, "chunk size");
+
+            const auto stored_chunk_size = transaction.query_value<long long>(
+                "SELECT "
+                "    size_bytes "
+                "FROM chunks "
+                "WHERE chunk_id = $1",
+                pqxx::params{
+                    chunk.chunk_id,
+                });
+
+            if (stored_chunk_size != requested_size) {
+                return ChunkNegotiationBatch{
+                    .chunks = {},
+                    .conflict =
+                        ChunkSizeConflict{
+                            .chunk_id = chunk.chunk_id,
+                            .requested_size_bytes = chunk.size_bytes,
+                            .stored_size_bytes = static_cast<std::uint64_t>(stored_chunk_size),
+                        },
+                };
+            }
+        }
+
+        std::vector<ChunkNegotiationEntry> entries;
+        entries.reserve(distinct_chunks.size());
+
+        for (std::size_t index = 0; index < distinct_chunks.size(); ++index) {
+            const ChunkMetadata& chunk = distinct_chunks[index];
+
+            std::vector<std::string> available_node_ids;
+
+            for (const auto& [node_id] : transaction.query<std::string>("SELECT "
+                                                                        "    node_id "
+                                                                        "FROM storage_locations "
+                                                                        "WHERE chunk_id = $1 "
+                                                                        "  AND state = 'available' "
+                                                                        "ORDER BY node_id",
+                                                                        pqxx::params{
+                                                                            chunk.chunk_id,
+                                                                        })) {
+                available_node_ids.push_back(node_id);
+            }
+
+            entries.push_back(ChunkNegotiationEntry{
+                .chunk = chunk,
+                .metadata_was_known = was_known[index],
+                .available_node_ids = std::move(available_node_ids),
+            });
+        }
+
+        transaction.commit();
+
+        return ChunkNegotiationBatch{
+            .chunks = std::move(entries),
+            .conflict = std::nullopt,
+        };
+    }
+
     void create_upload_session(const UploadSession& session) {
         if (session.state() != UploadSessionState::Open) {
             throw std::invalid_argument("create_upload_session may only create open upload sessions");
@@ -1780,6 +1944,10 @@ void PostgresMetadataRepository::register_chunks(const std::vector<ChunkMetadata
 
 std::optional<std::uint64_t> PostgresMetadataRepository::get_chunk_size(std::string_view chunk_id) {
     return impl_->get_chunk_size(chunk_id);
+}
+
+ChunkNegotiationBatch PostgresMetadataRepository::negotiate_chunks(const std::vector<ChunkMetadata>& chunks) {
+    return impl_->negotiate_chunks(chunks);
 }
 
 void PostgresMetadataRepository::create_upload_session(const UploadSession& session) {

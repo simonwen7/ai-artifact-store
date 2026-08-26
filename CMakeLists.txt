@@ -618,4 +618,22 @@ if(BUILD_TESTING)
         Threads::Threads
         libpqxx::pqxx
     )
+
+    aistore_add_test(
+        aistore_metadata_service_upload_api_tests
+        tests/integration/metadata_service_upload_api_test.cpp
+    )
+
+    target_link_libraries(
+        aistore_metadata_service_upload_api_tests
+        PRIVATE
+        aistore_http
+        aistore_services
+        aistore_metadata
+        aistore_hashing
+        Boost::json
+        Boost::headers
+        Threads::Threads
+        libpqxx::pqxx
+    )
 endif()

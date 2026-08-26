@@ -234,10 +234,74 @@ jobs:
               ;;
           esac
 
+          artifact_id="018f1f7e-7b3c-7000-8000-000000000001"
+          session_id="018f1f7e-7b3c-7000-8000-000000000002"
+
+          psql "${AISTORE_TEST_DB_URL}" -v ON_ERROR_STOP=1 -c \
+            "INSERT INTO artifacts (artifact_id, name, project) VALUES ('${artifact_id}'::uuid, 'ci-m4s2-artifact', 'ci-m4s2-project') ON CONFLICT (artifact_id) DO NOTHING;"
+
+          session_response="$(curl -fsS \
+            -X POST \
+            -H "Content-Type: application/json" \
+            --data-binary "{\"session_id\":\"${session_id}\",\"artifact_id\":\"${artifact_id}\",\"target_node_id\":\"ci-node\",\"chunking_strategy\":\"fixed-size\",\"chunk_size_bytes\":4194304,\"parent_version_id\":null,\"immutable_metadata\":{\"source\":\"ci\"}}" \
+            "http://127.0.0.1:8080/v1/upload-sessions")"
+
+          case "${session_response}" in
+            *"${session_id}"*"${artifact_id}"*ci-node*open*)
+              ;;
+            *)
+              echo "unexpected upload session create response: ${session_response}" >&2
+              exit 1
+              ;;
+          esac
+
+          get_session_response="$(curl -fsS "http://127.0.0.1:8080/v1/upload-sessions/${session_id}")"
+
+          case "${get_session_response}" in
+            *"${session_id}"*"${artifact_id}"*ci-node*open*)
+              ;;
+            *)
+              echo "unexpected upload session get response: ${get_session_response}" >&2
+              exit 1
+              ;;
+          esac
+
+          negotiate_response="$(curl -fsS \
+            -X POST \
+            -H "Content-Type: application/json" \
+            --data-binary "{\"session_id\":\"${session_id}\",\"chunks\":[{\"chunk_id\":\"${chunk_id}\",\"size_bytes\":3}]}" \
+            "http://127.0.0.1:8080/v1/chunks/negotiate")"
+
+          case "${negotiate_response}" in
+            *metadata_was_known\":true*available_on_target*ci-node*)
+              ;;
+            *)
+              echo "unexpected negotiate response: ${negotiate_response}" >&2
+              exit 1
+              ;;
+          esac
+
+          abort_response="$(curl -fsS \
+            -X POST \
+            "http://127.0.0.1:8080/v1/upload-sessions/${session_id}/abort")"
+
+          case "${abort_response}" in
+            *aborted*)
+              ;;
+            *)
+              echo "unexpected abort response: ${abort_response}" >&2
+              exit 1
+              ;;
+          esac
+
           kill "${metadata_pid}"
           wait "${metadata_pid}" || true
           metadata_pid=""
 
+          psql "${AISTORE_TEST_DB_URL}" -v ON_ERROR_STOP=1 -c \
+            "DELETE FROM upload_sessions WHERE session_id = '${session_id}'::uuid;"
+          psql "${AISTORE_TEST_DB_URL}" -v ON_ERROR_STOP=1 -c \
+            "DELETE FROM artifacts WHERE artifact_id = '${artifact_id}'::uuid;"
           psql "${AISTORE_TEST_DB_URL}" -v ON_ERROR_STOP=1 -c \
             "DELETE FROM storage_locations WHERE chunk_id = '${chunk_id}' AND node_id = 'ci-node';"
           psql "${AISTORE_TEST_DB_URL}" -v ON_ERROR_STOP=1 -c \

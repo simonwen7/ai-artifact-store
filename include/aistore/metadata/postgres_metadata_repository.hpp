@@ -72,6 +72,8 @@ class PostgresMetadataRepository {
 
     [[nodiscard]] std::optional<std::uint64_t> get_chunk_size(std::string_view chunk_id);
 
+    [[nodiscard]] ChunkNegotiationBatch negotiate_chunks(const std::vector<ChunkMetadata>& chunks);
+
     void create_upload_session(const UploadSession& session);
 
     [[nodiscard]] std::optional<UploadSession> get_upload_session(const UuidV7& session_id);
