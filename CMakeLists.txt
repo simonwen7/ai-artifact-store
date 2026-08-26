@@ -58,6 +58,7 @@ endif()
 add_library(
     aistore_chunking
     src/chunking/fixed_size_chunker.cpp
+    src/chunking/fastcdc_chunker.cpp
 )
 
 target_include_directories(
@@ -132,6 +133,7 @@ add_library(
     src/metadata/object_layout.cpp
     src/metadata/object.cpp
     src/metadata/object_layout_descriptor.cpp
+    src/metadata/chunking.cpp
     src/metadata/uuid_v7.cpp
     src/metadata/artifact_model.cpp
     src/metadata/manifest_model.cpp
@@ -570,10 +572,17 @@ if(BUILD_TESTING)
         tests/unit/chunking/fixed_size_chunker_test.cpp
     )
 
+    target_sources(
+        aistore_chunking_tests
+        PRIVATE
+        tests/unit/chunking/fastcdc_chunker_test.cpp
+    )
+
     target_link_libraries(
         aistore_chunking_tests
         PRIVATE
         aistore_chunking
+        aistore_hashing
     )
 
     aistore_add_test(
@@ -904,6 +913,7 @@ if(BUILD_TESTING)
         aistore_services
         aistore_storage
         aistore_hashing
+        aistore_chunking
         aistore_metadata
         Boost::json
         Boost::headers
@@ -964,6 +974,22 @@ if(BUILD_TESTING)
             aistore_cli_pull_process_e2e
             PROPERTIES
             TIMEOUT 90
+        )
+
+        add_test(
+            NAME aistore_cli_fastcdc_process_e2e
+            COMMAND
+                bash
+                "${PROJECT_SOURCE_DIR}/tests/e2e/aistore_cli_fastcdc_e2e.sh"
+                $<TARGET_FILE:aistore>
+                $<TARGET_FILE:aistore_metadata_service>
+                $<TARGET_FILE:aistore_storage_node>
+        )
+
+        set_tests_properties(
+            aistore_cli_fastcdc_process_e2e
+            PROPERTIES
+            TIMEOUT 120
         )
     endif()
 endif()

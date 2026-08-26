@@ -231,6 +231,7 @@ TEST_F(MetadataServiceRestoreApiTest, GetRestorePlanReturnsCommittedVersionDescr
     EXPECT_EQ(body.at("layout_id").as_string(), value.layout_id());
     EXPECT_EQ(json_uint64(body.at("total_size_bytes")), 4U);
     EXPECT_EQ(body.at("chunking_strategy").as_string(), "fixed-size");
+    EXPECT_TRUE(body.at("chunking_parameters").as_object().empty());
     EXPECT_EQ(json_uint64(body.at("chunk_count")), 1U);
     ASSERT_EQ(body.at("chunks").as_array().size(), 1U);
     EXPECT_EQ(body.at("chunks").as_array().at(0).at("chunk_id").as_string(), value.layout().chunks().front().chunk_id);
@@ -312,6 +313,35 @@ TEST_F(MetadataServiceRestoreApiTest, GetRestorePlanValidatesIdsAndMethodContrac
     const HttpResponse fragment = service_->handle_request(fragment_request);
     EXPECT_EQ(fragment.result(), beast_http::status::bad_request);
     EXPECT_EQ(boost::json::parse(fragment.body()).at("error").as_string(), "invalid_request");
+}
+
+TEST_F(MetadataServiceRestoreApiTest, RestorePlanSerializesFastCdcParameters) {
+    const aistore::metadata::FastCdcParameters parameters{
+        .min_chunk_size_bytes = 64,
+        .avg_chunk_size_bytes = 256,
+        .max_chunk_size_bytes = 1024,
+    };
+
+    const std::string object_id = sha256_hex(marker_ + "-fastcdc-restore-object");
+    const std::string chunk_id = sha256_hex(marker_ + "-fastcdc-restore-chunk");
+    object_ids_.push_back(object_id);
+    chunk_ids_.push_back(chunk_id);
+
+    const ObjectLayoutDescriptor value{
+        Object{object_id, 128},
+        parameters,
+        ObjectLayout{{ChunkRef{.chunk_id = chunk_id, .offset = 0, .size = 128}}},
+    };
+
+    const ArtifactVersion version = create_committed_version(value);
+
+    const HttpResponse response = http_exchange(server_->port(), beast_http::verb::get, target(version.version_id()));
+    ASSERT_EQ(response.result(), beast_http::status::ok);
+
+    const auto body = boost::json::parse(response.body()).as_object();
+    EXPECT_EQ(body.at("chunking_strategy").as_string(), "fastcdc");
+    EXPECT_EQ(json_uint64(body.at("chunking_parameters").as_object().at("avg_chunk_size_bytes")), 256U);
+    EXPECT_EQ(json_uint64(body.at("chunking_parameters").as_object().at("max_chunk_size_bytes")), 1024U);
 }
 
 }  // namespace

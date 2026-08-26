@@ -21,6 +21,7 @@ using aistore::metadata::ArtifactVersion;
 using aistore::metadata::ChunkingStrategy;
 using aistore::metadata::ChunkMetadata;
 using aistore::metadata::ChunkRef;
+using aistore::metadata::FastCdcParameters;
 using aistore::metadata::FinalizeUploadError;
 using aistore::metadata::FinalizeUploadErrorKind;
 using aistore::metadata::Manifest;
@@ -2524,6 +2525,216 @@ TEST(PostgresMetadataRepositoryTest, ResolveRestorePlanSupportsEmptyObject) {
     EXPECT_EQ(plan.layout_descriptor.object().total_size(), 0U);
     EXPECT_TRUE(plan.layout_descriptor.layout().chunks().empty());
     EXPECT_EQ(plan.layout_descriptor.layout_id(), empty_descriptor.layout_id());
+}
+
+UploadSession make_fastcdc_finalize_session(const UuidV7& session_id, const UuidV7& artifact_id,
+                                            std::string target_node, std::string marker,
+                                            const FastCdcParameters& parameters) {
+    return UploadSession{
+        session_id,
+        artifact_id,
+        std::move(target_node),
+        parameters,
+        std::nullopt,
+        UploadSession::ImmutableMetadata{{"marker", std::move(marker)}},
+        UploadSessionState::Open,
+        std::nullopt,
+    };
+}
+
+ObjectLayoutDescriptor make_fastcdc_finalize_descriptor(char object_marker, const FastCdcParameters& parameters,
+                                                        char first_chunk_marker = 'a', char second_chunk_marker = 'b') {
+    return ObjectLayoutDescriptor{
+        Object{std::string(64, object_marker), 192},
+        parameters,
+        ObjectLayout{{
+            ChunkRef{.chunk_id = std::string(64, first_chunk_marker), .offset = 0, .size = 128},
+            ChunkRef{.chunk_id = std::string(64, second_chunk_marker), .offset = 128, .size = 64},
+        }},
+    };
+}
+
+constexpr FastCdcParameters kTestFastCdcParameters{
+    .min_chunk_size_bytes = 64,
+    .avg_chunk_size_bytes = 256,
+    .max_chunk_size_bytes = 1024,
+};
+
+constexpr FastCdcParameters kAlternateFastCdcParameters{
+    .min_chunk_size_bytes = 128,
+    .avg_chunk_size_bytes = 512,
+    .max_chunk_size_bytes = 2048,
+};
+
+TEST(PostgresMetadataRepositoryTest, RegistersAndLoadsFastCdcLayoutWithParameters) {
+    reset_metadata_data();
+
+    PostgresMetadataRepository repository{
+        test_database_connection_string(),
+    };
+
+    const Object object{
+        kObjectId,
+        192,
+    };
+
+    repository.register_object(object);
+
+    const ObjectLayoutDescriptor descriptor{
+        object,
+        kTestFastCdcParameters,
+        ObjectLayout{
+            {
+                ChunkRef{
+                    .chunk_id = kChunkA,
+                    .offset = 0,
+                    .size = 128,
+                },
+                ChunkRef{
+                    .chunk_id = kChunkB,
+                    .offset = 128,
+                    .size = 64,
+                },
+            },
+        },
+    };
+
+    repository.register_object_layout(descriptor);
+
+    const auto restored = repository.get_object_layout(descriptor.layout_id());
+
+    ASSERT_TRUE(restored.has_value());
+    EXPECT_EQ(restored->chunking_strategy(), ChunkingStrategy::FastCdc);
+    ASSERT_TRUE(restored->fastcdc_parameters().has_value());
+    EXPECT_EQ(*restored->fastcdc_parameters(), kTestFastCdcParameters);
+    EXPECT_EQ(restored->canonical_bytes(), descriptor.canonical_bytes());
+}
+
+TEST(PostgresMetadataRepositoryTest, CreatesAndLoadsFastCdcUploadSession) {
+    reset_metadata_data();
+
+    PostgresMetadataRepository repository{
+        test_database_connection_string(),
+    };
+
+    const UuidV7 artifact_id = UuidV7::generate();
+    const UuidV7 session_id = UuidV7::generate();
+
+    repository.create_artifact(Artifact{
+        artifact_id,
+        "fastcdc-checkpoint",
+        "training-project",
+    });
+
+    const UploadSession session{
+        session_id,
+        artifact_id,
+        "node-a",
+        kTestFastCdcParameters,
+        std::nullopt,
+        UploadSession::ImmutableMetadata{
+            {"framework", "pytorch"},
+        },
+        UploadSessionState::Open,
+        std::nullopt,
+    };
+
+    repository.create_upload_session(session);
+
+    const auto restored = repository.get_upload_session(session_id);
+
+    ASSERT_TRUE(restored.has_value());
+    EXPECT_EQ(restored->chunking_strategy(), ChunkingStrategy::FastCdc);
+    EXPECT_EQ(restored->fastcdc_parameters(), kTestFastCdcParameters);
+    EXPECT_FALSE(restored->fixed_chunk_size_bytes().has_value());
+    EXPECT_EQ(restored->immutable_metadata().at("framework"), "pytorch");
+}
+
+TEST(PostgresMetadataRepositoryTest, RejectsUploadSessionConflictWhenFastCdcParametersDiffer) {
+    reset_metadata_data();
+
+    PostgresMetadataRepository repository{
+        test_database_connection_string(),
+    };
+
+    const UuidV7 artifact_id = UuidV7::generate();
+    const UuidV7 session_id = UuidV7::generate();
+
+    repository.create_artifact(Artifact{
+        artifact_id,
+        "fastcdc-checkpoint",
+        "training-project",
+    });
+
+    const UploadSession original{
+        session_id,
+        artifact_id,
+        "node-a",
+        kTestFastCdcParameters,
+        std::nullopt,
+        UploadSession::ImmutableMetadata{
+            {"framework", "pytorch"},
+        },
+        UploadSessionState::Open,
+        std::nullopt,
+    };
+
+    repository.create_upload_session(original);
+
+    const UploadSession conflicting{
+        session_id,
+        artifact_id,
+        "node-a",
+        kAlternateFastCdcParameters,
+        std::nullopt,
+        UploadSession::ImmutableMetadata{
+            {"framework", "pytorch"},
+        },
+        UploadSessionState::Open,
+        std::nullopt,
+    };
+
+    EXPECT_THROW(repository.create_upload_session(conflicting), std::runtime_error);
+}
+
+TEST(PostgresMetadataRepositoryTest, FinalizesFastCdcUpload) {
+    reset_metadata_data();
+    PostgresMetadataRepository repository{test_database_connection_string()};
+    const UuidV7 marker = UuidV7::generate();
+    const UuidV7 artifact_id = UuidV7::generate();
+    const UuidV7 session_id = UuidV7::generate();
+    const auto descriptor = make_fastcdc_finalize_descriptor('f', kTestFastCdcParameters, 'c', 'd');
+
+    repository.create_artifact(Artifact{artifact_id, "fastcdc-finalize-" + marker.str(), "m6-fastcdc"});
+    repository.create_upload_session(make_fastcdc_finalize_session(session_id, artifact_id, "m6-fastcdc-target",
+                                                                   marker.str(), kTestFastCdcParameters));
+    register_finalize_chunks(repository, descriptor, "m6-fastcdc-target", StorageLocationState::Available);
+
+    const auto result = repository.finalize_upload(session_id, descriptor);
+    const auto session = repository.get_upload_session(session_id);
+    const auto layout = repository.get_object_layout(descriptor.layout_id());
+
+    ASSERT_TRUE(session.has_value());
+    ASSERT_TRUE(layout.has_value());
+    EXPECT_EQ(result.layout_id, descriptor.layout_id());
+    EXPECT_EQ(session->state(), UploadSessionState::Committed);
+    EXPECT_EQ(layout->fastcdc_parameters(), kTestFastCdcParameters);
+}
+
+TEST(PostgresMetadataRepositoryTest, FinalizeRejectsFastCdcDescriptorThatDoesNotMatchSessionConfiguration) {
+    reset_metadata_data();
+    PostgresMetadataRepository repository{test_database_connection_string()};
+    const UuidV7 marker = UuidV7::generate();
+    const UuidV7 artifact_id = UuidV7::generate();
+    const UuidV7 session_id = UuidV7::generate();
+    const auto descriptor = make_fastcdc_finalize_descriptor('e', kAlternateFastCdcParameters, '1', '2');
+
+    repository.create_artifact(Artifact{artifact_id, "fastcdc-mismatch-" + marker.str(), "m6-fastcdc"});
+    repository.create_upload_session(make_fastcdc_finalize_session(session_id, artifact_id, "m6-fastcdc-target",
+                                                                   marker.str(), kTestFastCdcParameters));
+    register_finalize_chunks(repository, descriptor, "m6-fastcdc-target", StorageLocationState::Available);
+
+    EXPECT_THROW((void)repository.finalize_upload(session_id, descriptor), std::invalid_argument);
 }
 
 }  // namespace

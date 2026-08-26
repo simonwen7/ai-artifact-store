@@ -7,12 +7,9 @@
 #include <span>
 #include <vector>
 
-namespace aistore::chunking {
+#include "aistore/chunking/chunk_buffer.hpp"
 
-struct ChunkBuffer {
-    std::uint64_t offset;
-    std::vector<std::byte> bytes;
-};
+namespace aistore::chunking {
 
 class FixedSizeChunker {
    public:

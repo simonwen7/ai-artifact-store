@@ -21,8 +21,8 @@
 #include "aistore/hashing/sha256.hpp"
 #include "aistore/http/http_client.hpp"
 #include "aistore/http/http_server.hpp"
-#include "aistore/metadata/artifact_model.hpp"
 #include "aistore/metadata/chunk_metadata.hpp"
+#include "aistore/metadata/chunking.hpp"
 #include "aistore/metadata/finalize_upload.hpp"
 #include "aistore/metadata/object_layout_descriptor.hpp"
 #include "aistore/metadata/postgres_metadata_repository.hpp"
@@ -49,6 +49,7 @@ using aistore::metadata::ArtifactVersion;
 using aistore::metadata::ChunkingStrategy;
 using aistore::metadata::ChunkMetadata;
 using aistore::metadata::ChunkRef;
+using aistore::metadata::FastCdcParameters;
 using aistore::metadata::Object;
 using aistore::metadata::ObjectLayout;
 using aistore::metadata::ObjectLayoutDescriptor;
@@ -261,6 +262,40 @@ class MetadataClientFixture : public ::testing::Test {
         track_chunk(chunk_id);
         return ObjectLayoutDescriptor{Object{object_id, 4}, ChunkingStrategy::FixedSize,
                                       ObjectLayout{{ChunkRef{.chunk_id = chunk_id, .offset = 0, .size = 4}}}};
+    }
+
+    [[nodiscard]] UploadSession make_fastcdc_open_session(std::string_view target_node = "m4s3-target") const {
+        return UploadSession{
+            session_id_,
+            artifact_id_,
+            std::string{target_node},
+            FastCdcParameters{
+                .min_chunk_size_bytes = 64,
+                .avg_chunk_size_bytes = 256,
+                .max_chunk_size_bytes = 1024,
+            },
+            std::nullopt,
+            UploadSession::ImmutableMetadata{{"source", "m4s3-fastcdc"}},
+            UploadSessionState::Open,
+            std::nullopt,
+        };
+    }
+
+    [[nodiscard]] ObjectLayoutDescriptor make_fastcdc_descriptor() {
+        const std::string marker = UuidV7::generate().str();
+        const std::string object_id = sha256_hex("m6-client-fastcdc-object-" + marker);
+        const std::string chunk_id = sha256_hex("m6-client-fastcdc-chunk-" + marker);
+        owned_object_ids_.push_back(object_id);
+        track_chunk(chunk_id);
+        return ObjectLayoutDescriptor{
+            Object{object_id, 128},
+            FastCdcParameters{
+                .min_chunk_size_bytes = 64,
+                .avg_chunk_size_bytes = 256,
+                .max_chunk_size_bytes = 1024,
+            },
+            ObjectLayout{{ChunkRef{.chunk_id = chunk_id, .offset = 0, .size = 128}}},
+        };
     }
 
     UuidV7 artifact_id_{UuidV7::generate()};
@@ -653,6 +688,86 @@ TEST(MetadataClientStandaloneTest, GetRestorePlanRejectsMalformedSuccessfulRespo
     }};
 
     EXPECT_THROW((void)client.get_restore_plan(version_id, source_node), RemoteProtocolError);
+}
+
+TEST_F(MetadataClientFixture, CreatesAndParsesFastCdcUploadSession) {
+    const UploadSession created = client_->create_upload_session(make_fastcdc_open_session());
+
+    EXPECT_EQ(created.chunking_strategy(), ChunkingStrategy::FastCdc);
+    ASSERT_TRUE(created.fastcdc_parameters().has_value());
+    EXPECT_EQ(created.fastcdc_parameters()->avg_chunk_size_bytes, 256U);
+    EXPECT_EQ(created.immutable_metadata().at("source"), "m4s3-fastcdc");
+
+    const auto loaded = client_->get_upload_session(session_id_);
+    ASSERT_TRUE(loaded.has_value());
+    EXPECT_EQ(loaded->fastcdc_parameters(), created.fastcdc_parameters());
+}
+
+TEST_F(MetadataClientFixture, FinalizeSerializesFastCdcParameters) {
+    (void)client_->create_upload_session(make_fastcdc_open_session());
+    const ObjectLayoutDescriptor descriptor = make_fastcdc_descriptor();
+    const ChunkRef& chunk = descriptor.layout().chunks().front();
+    repository_->register_chunks({ChunkMetadata{.chunk_id = chunk.chunk_id, .size_bytes = chunk.size}});
+    repository_->register_storage_location(StorageLocation{
+        .chunk_id = chunk.chunk_id,
+        .node_id = "m4s3-target",
+        .storage_path = std::string{"/v1/chunks/"} + chunk.chunk_id,
+        .state = StorageLocationState::Available,
+    });
+
+    const auto result = client_->finalize_upload(session_id_, descriptor);
+
+    EXPECT_EQ(result.object_id, descriptor.object_id());
+    EXPECT_EQ(result.layout_id, descriptor.layout_id());
+    const auto layout = repository_->get_object_layout(descriptor.layout_id());
+    ASSERT_TRUE(layout.has_value());
+    EXPECT_EQ(layout->fastcdc_parameters(), descriptor.fastcdc_parameters());
+}
+
+TEST_F(MetadataClientFixture, RestorePlanParsesFastCdcParameters) {
+    const ObjectLayoutDescriptor descriptor = make_fastcdc_descriptor();
+    const ArtifactVersion version = create_committed_version(descriptor);
+    const RestorePlan plan = client_->get_restore_plan(version.version_id(), "m4s3-target");
+
+    EXPECT_EQ(plan.layout_descriptor.chunking_strategy(), ChunkingStrategy::FastCdc);
+    ASSERT_TRUE(plan.layout_descriptor.fastcdc_parameters().has_value());
+    EXPECT_EQ(plan.layout_descriptor.fastcdc_parameters()->avg_chunk_size_bytes, 256U);
+    EXPECT_EQ(plan.layout_descriptor.layout_id(), descriptor.layout_id());
+}
+
+TEST(MetadataClientStandaloneTest, RejectsMalformedFastCdcSuccessfulConfiguration) {
+    const UuidV7 session_id = UuidV7::generate();
+
+    RunningHttpServer server{[session_id](const HttpRequest& request) {
+        EXPECT_EQ(request.target(), std::string{"/v1/upload-sessions/"} + session_id.str());
+
+        HttpResponse response{beast_http::status::ok, request.version()};
+        response.set(beast_http::field::content_type, "application/json");
+        response.body() = boost::json::serialize(boost::json::object{
+            {"session_id", session_id.str()},
+            {"artifact_id", UuidV7::generate().str()},
+            {"target_node_id", "m4s3-target"},
+            {"chunking_strategy", "fastcdc"},
+            {"chunking_parameters",
+             boost::json::object{
+                 {"min_chunk_size_bytes", 64},
+                 {"avg_chunk_size_bytes", 300},
+                 {"max_chunk_size_bytes", 1024},
+             }},
+            {"parent_version_id", nullptr},
+            {"immutable_metadata", boost::json::object{}},
+            {"state", "open"},
+            {"finalized_version_id", nullptr},
+        });
+        response.prepare_payload();
+        return response;
+    }};
+
+    MetadataClient client{HttpClientConfig{
+        .endpoint = HttpEndpoint{.address = "127.0.0.1", .port = server.port()},
+    }};
+
+    EXPECT_THROW((void)client.get_upload_session(session_id), RemoteProtocolError);
 }
 
 TEST(MetadataClientStandaloneTest, GetRestorePlanValidatesArgumentsBeforeNetworkIo) {

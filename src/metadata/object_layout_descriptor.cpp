@@ -25,8 +25,11 @@ constexpr std::size_t kContentIdBytes = 32;
 
 constexpr std::size_t kChunkEntryBytes = kContentIdBytes + sizeof(std::uint64_t) + sizeof(std::uint64_t);
 
-constexpr std::size_t kDescriptorHeaderBytes = kMagic.size() + sizeof(std::uint32_t) + kContentIdBytes +
-                                               sizeof(std::uint8_t) + sizeof(std::uint64_t) + sizeof(std::uint64_t);
+constexpr std::size_t kFixedSizeDescriptorHeaderBytes = kMagic.size() + sizeof(std::uint32_t) + kContentIdBytes +
+                                                        sizeof(std::uint8_t) + sizeof(std::uint64_t) +
+                                                        sizeof(std::uint64_t);
+
+constexpr std::size_t kFastCdcDescriptorHeaderBytes = kFixedSizeDescriptorHeaderBytes + (3U * sizeof(std::uint64_t));
 
 void append_uint32_big_endian(std::vector<std::byte>& output, std::uint32_t value) {
     for (int shift = 24; shift >= 0; shift -= 8) {
@@ -68,15 +71,6 @@ void append_content_id(std::vector<std::byte>& output, std::string_view content_
     }
 }
 
-std::uint8_t chunking_strategy_code(ChunkingStrategy strategy) {
-    switch (strategy) {
-        case ChunkingStrategy::FixedSize:
-            return 1;
-    }
-
-    throw std::logic_error("unsupported chunking strategy");
-}
-
 std::string digest_to_hex(const Sha256::Digest& digest) {
     constexpr std::array<char, 16> kHexDigits{
         '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f',
@@ -99,12 +93,35 @@ std::string digest_to_hex(const Sha256::Digest& digest) {
 }  // namespace
 
 ObjectLayoutDescriptor::ObjectLayoutDescriptor(Object object, ChunkingStrategy chunking_strategy, ObjectLayout layout)
-    : object_(std::move(object)), chunking_strategy_(chunking_strategy), layout_(std::move(layout)) {
+    : object_(std::move(object)),
+      chunking_strategy_(chunking_strategy),
+      fastcdc_parameters_(std::nullopt),
+      layout_(std::move(layout)) {
+    if (chunking_strategy_ != ChunkingStrategy::FixedSize) {
+        throw std::invalid_argument("FixedSize ObjectLayoutDescriptor constructor requires FixedSize strategy");
+    }
+
     if (object_.total_size() != layout_.total_size()) {
         throw std::invalid_argument("object size must match object layout size");
     }
 
-    canonical_bytes_ = serialize(object_, chunking_strategy_, layout_);
+    canonical_bytes_ = serialize(object_, chunking_strategy_, fastcdc_parameters_, layout_);
+
+    layout_id_ = hash_canonical_bytes(canonical_bytes_);
+}
+
+ObjectLayoutDescriptor::ObjectLayoutDescriptor(Object object, FastCdcParameters fastcdc_parameters, ObjectLayout layout)
+    : object_(std::move(object)),
+      chunking_strategy_(ChunkingStrategy::FastCdc),
+      fastcdc_parameters_(fastcdc_parameters),
+      layout_(std::move(layout)) {
+    validate_fastcdc_parameters(*fastcdc_parameters_);
+
+    if (object_.total_size() != layout_.total_size()) {
+        throw std::invalid_argument("object size must match object layout size");
+    }
+
+    canonical_bytes_ = serialize(object_, chunking_strategy_, fastcdc_parameters_, layout_);
 
     layout_id_ = hash_canonical_bytes(canonical_bytes_);
 }
@@ -115,6 +132,10 @@ const std::string& ObjectLayoutDescriptor::object_id() const noexcept { return o
 
 ChunkingStrategy ObjectLayoutDescriptor::chunking_strategy() const noexcept { return chunking_strategy_; }
 
+std::optional<FastCdcParameters> ObjectLayoutDescriptor::fastcdc_parameters() const noexcept {
+    return fastcdc_parameters_;
+}
+
 const ObjectLayout& ObjectLayoutDescriptor::layout() const noexcept { return layout_; }
 
 const std::vector<std::byte>& ObjectLayoutDescriptor::canonical_bytes() const noexcept { return canonical_bytes_; }
@@ -122,16 +143,20 @@ const std::vector<std::byte>& ObjectLayoutDescriptor::canonical_bytes() const no
 const std::string& ObjectLayoutDescriptor::layout_id() const noexcept { return layout_id_; }
 
 std::vector<std::byte> ObjectLayoutDescriptor::serialize(const Object& object, ChunkingStrategy chunking_strategy,
+                                                         const std::optional<FastCdcParameters>& fastcdc_parameters,
                                                          const ObjectLayout& layout) {
     const std::size_t chunk_count = layout.chunks().size();
 
-    if (chunk_count > (std::numeric_limits<std::size_t>::max() - kDescriptorHeaderBytes) / kChunkEntryBytes) {
+    const std::size_t header_bytes = chunking_strategy == ChunkingStrategy::FastCdc ? kFastCdcDescriptorHeaderBytes
+                                                                                    : kFixedSizeDescriptorHeaderBytes;
+
+    if (chunk_count > (std::numeric_limits<std::size_t>::max() - header_bytes) / kChunkEntryBytes) {
         throw std::length_error("object layout descriptor is too large to serialize");
     }
 
     std::vector<std::byte> output;
 
-    output.reserve(kDescriptorHeaderBytes + (chunk_count * kChunkEntryBytes));
+    output.reserve(header_bytes + (chunk_count * kChunkEntryBytes));
 
     const auto magic_bytes = std::as_bytes(std::span{
         kMagic.data(),
@@ -145,6 +170,16 @@ std::vector<std::byte> ObjectLayoutDescriptor::serialize(const Object& object, C
     append_content_id(output, object.object_id());
 
     output.push_back(static_cast<std::byte>(chunking_strategy_code(chunking_strategy)));
+
+    if (chunking_strategy == ChunkingStrategy::FastCdc) {
+        if (!fastcdc_parameters.has_value()) {
+            throw std::logic_error("FastCDC layout serialization requires FastCDC parameters");
+        }
+
+        append_uint64_big_endian(output, fastcdc_parameters->min_chunk_size_bytes);
+        append_uint64_big_endian(output, fastcdc_parameters->avg_chunk_size_bytes);
+        append_uint64_big_endian(output, fastcdc_parameters->max_chunk_size_bytes);
+    }
 
     append_uint64_big_endian(output, object.total_size());
 

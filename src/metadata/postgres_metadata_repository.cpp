@@ -16,6 +16,7 @@
 #include <utility>
 #include <vector>
 
+#include "aistore/metadata/chunking.hpp"
 #include "aistore/metadata/restore_plan.hpp"
 
 namespace aistore::metadata {
@@ -232,21 +233,28 @@ void validate_chunk_id(std::string_view chunk_id) {
     }
 }
 
-std::string_view chunking_strategy_to_string(ChunkingStrategy strategy) {
-    switch (strategy) {
-        case ChunkingStrategy::FixedSize:
-            return "fixed-size";
-    }
-
-    throw std::logic_error("unsupported chunking strategy");
+[[nodiscard]] bool upload_session_configuration_matches(const UploadSession& left, const UploadSession& right) {
+    return left.fixed_chunk_size_bytes() == right.fixed_chunk_size_bytes() &&
+           left.fastcdc_parameters() == right.fastcdc_parameters();
 }
 
-ChunkingStrategy chunking_strategy_from_string(std::string_view strategy) {
-    if (strategy == "fixed-size") {
-        return ChunkingStrategy::FixedSize;
+[[nodiscard]] bool stored_fastcdc_columns_match(std::optional<long long> stored_min,
+                                                std::optional<long long> stored_avg,
+                                                std::optional<long long> stored_max,
+                                                const ObjectLayoutDescriptor& descriptor) {
+    const std::optional<FastCdcParameters> params = descriptor.fastcdc_parameters();
+
+    if (descriptor.chunking_strategy() == ChunkingStrategy::FixedSize) {
+        return !stored_min.has_value() && !stored_avg.has_value() && !stored_max.has_value();
     }
 
-    throw std::runtime_error("database contains an unsupported chunking strategy");
+    if (!params.has_value() || !stored_min.has_value() || !stored_avg.has_value() || !stored_max.has_value()) {
+        return false;
+    }
+
+    return std::cmp_equal(*stored_min, params->min_chunk_size_bytes) &&
+           std::cmp_equal(*stored_avg, params->avg_chunk_size_bytes) &&
+           std::cmp_equal(*stored_max, params->max_chunk_size_bytes);
 }
 
 std::string_view upload_session_state_to_string(UploadSessionState state) {
@@ -1347,6 +1355,25 @@ class PostgresMetadataRepository::Impl {
 
         pqxx::work transaction{connection_};
 
+        const std::optional<long long> chunk_size_param =
+            session.fixed_chunk_size_bytes().has_value()
+                ? std::optional<long long>{to_postgres_bigint(*session.fixed_chunk_size_bytes(),
+                                                              "upload session chunk size")}
+                : std::nullopt;
+        const std::optional<FastCdcParameters> fastcdc = session.fastcdc_parameters();
+        const std::optional<long long> fastcdc_min =
+            fastcdc.has_value()
+                ? std::optional<long long>{to_postgres_bigint(fastcdc->min_chunk_size_bytes, "FastCDC min chunk size")}
+                : std::nullopt;
+        const std::optional<long long> fastcdc_avg =
+            fastcdc.has_value()
+                ? std::optional<long long>{to_postgres_bigint(fastcdc->avg_chunk_size_bytes, "FastCDC avg chunk size")}
+                : std::nullopt;
+        const std::optional<long long> fastcdc_max =
+            fastcdc.has_value()
+                ? std::optional<long long>{to_postgres_bigint(fastcdc->max_chunk_size_bytes, "FastCDC max chunk size")}
+                : std::nullopt;
+
         const pqxx::result insert_result = transaction.exec(
             "INSERT INTO upload_sessions ("
             "    session_id, "
@@ -1354,6 +1381,9 @@ class PostgresMetadataRepository::Impl {
             "    target_node_id, "
             "    chunking_strategy, "
             "    chunk_size_bytes, "
+            "    fastcdc_min_chunk_size_bytes, "
+            "    fastcdc_avg_chunk_size_bytes, "
+            "    fastcdc_max_chunk_size_bytes, "
             "    parent_version_id, "
             "    state, "
             "    finalized_version_id"
@@ -1366,7 +1396,10 @@ class PostgresMetadataRepository::Impl {
             "    $5, "
             "    $6, "
             "    $7, "
-            "    $8"
+            "    $8, "
+            "    $9, "
+            "    $10, "
+            "    $11"
             ") "
             "ON CONFLICT (session_id) "
             "DO NOTHING",
@@ -1375,7 +1408,10 @@ class PostgresMetadataRepository::Impl {
                 session.artifact_id().str(),
                 session.target_node_id(),
                 chunking_strategy_to_string(session.chunking_strategy()),
-                to_postgres_bigint(session.chunk_size_bytes(), "upload session chunk size"),
+                chunk_size_param,
+                fastcdc_min,
+                fastcdc_avg,
+                fastcdc_max,
                 session.parent_version_id(),
                 upload_session_state_to_string(session.state()),
                 session.finalized_version_id(),
@@ -1388,7 +1424,7 @@ class PostgresMetadataRepository::Impl {
                 existing.session_id() != session.session_id() || existing.artifact_id() != session.artifact_id() ||
                 existing.target_node_id() != session.target_node_id() ||
                 existing.chunking_strategy() != session.chunking_strategy() ||
-                existing.chunk_size_bytes() != session.chunk_size_bytes() ||
+                !upload_session_configuration_matches(existing, session) ||
                 existing.parent_version_id() != session.parent_version_id() ||
                 existing.immutable_metadata() != session.immutable_metadata()) {
                 throw std::runtime_error("existing upload session does not match requested session");
@@ -1424,7 +1460,7 @@ class PostgresMetadataRepository::Impl {
         if (verified.session_id() != session.session_id() || verified.artifact_id() != session.artifact_id() ||
             verified.target_node_id() != session.target_node_id() ||
             verified.chunking_strategy() != session.chunking_strategy() ||
-            verified.chunk_size_bytes() != session.chunk_size_bytes() ||
+            !upload_session_configuration_matches(verified, session) ||
             verified.parent_version_id() != session.parent_version_id() ||
             verified.immutable_metadata() != session.immutable_metadata() ||
             verified.state() != UploadSessionState::Open || verified.finalized_version_id().has_value()) {
@@ -1437,7 +1473,8 @@ class PostgresMetadataRepository::Impl {
     [[nodiscard]] std::optional<UploadSession> get_upload_session(const UuidV7& session_id) {
         pqxx::work transaction{connection_};
 
-        auto stored = transaction.query01<std::string, std::string, std::string, std::string, long long,
+        auto stored = transaction.query01<std::string, std::string, std::string, std::string, std::optional<long long>,
+                                          std::optional<long long>, std::optional<long long>, std::optional<long long>,
                                           std::optional<std::string>, std::string, std::optional<std::string>>(
             "SELECT "
             "    session_id::text, "
@@ -1445,6 +1482,9 @@ class PostgresMetadataRepository::Impl {
             "    target_node_id, "
             "    chunking_strategy, "
             "    chunk_size_bytes, "
+            "    fastcdc_min_chunk_size_bytes, "
+            "    fastcdc_avg_chunk_size_bytes, "
+            "    fastcdc_max_chunk_size_bytes, "
             "    parent_version_id, "
             "    state, "
             "    finalized_version_id "
@@ -1511,7 +1551,8 @@ class PostgresMetadataRepository::Impl {
                                                        const ObjectLayoutDescriptor& descriptor) {
         pqxx::work transaction{connection_};
 
-        auto stored = transaction.query01<std::string, std::string, std::string, std::string, long long,
+        auto stored = transaction.query01<std::string, std::string, std::string, std::string, std::optional<long long>,
+                                          std::optional<long long>, std::optional<long long>, std::optional<long long>,
                                           std::optional<std::string>, std::string, std::optional<std::string>>(
             "SELECT "
             "    session_id::text, "
@@ -1519,6 +1560,9 @@ class PostgresMetadataRepository::Impl {
             "    target_node_id, "
             "    chunking_strategy, "
             "    chunk_size_bytes, "
+            "    fastcdc_min_chunk_size_bytes, "
+            "    fastcdc_avg_chunk_size_bytes, "
+            "    fastcdc_max_chunk_size_bytes, "
             "    parent_version_id, "
             "    state, "
             "    finalized_version_id "
@@ -1646,6 +1690,29 @@ class PostgresMetadataRepository::Impl {
 
             if (final_size == 0U || final_size > session.chunk_size_bytes()) {
                 throw std::invalid_argument("final chunk size is invalid for upload session chunk size");
+            }
+        }
+
+        if (!chunks.empty() && session.chunking_strategy() == ChunkingStrategy::FastCdc) {
+            if (!session.fastcdc_parameters().has_value() || !descriptor.fastcdc_parameters().has_value() ||
+                *session.fastcdc_parameters() != *descriptor.fastcdc_parameters()) {
+                throw std::invalid_argument("object layout FastCDC parameters do not match upload session");
+            }
+
+            const FastCdcParameters params = *session.fastcdc_parameters();
+
+            for (std::size_t index = 0; index + 1U < chunks.size(); ++index) {
+                const std::uint64_t chunk_size = chunks[index].size;
+
+                if (chunk_size < params.min_chunk_size_bytes || chunk_size > params.max_chunk_size_bytes) {
+                    throw std::invalid_argument("non-final chunk size is outside upload session FastCDC bounds");
+                }
+            }
+
+            const std::uint64_t final_size = chunks.back().size;
+
+            if (final_size == 0U || final_size > params.max_chunk_size_bytes) {
+                throw std::invalid_argument("final chunk size is invalid for upload session FastCDC bounds");
             }
         }
 
@@ -1839,8 +1906,10 @@ class PostgresMetadataRepository::Impl {
     }
 
    private:
-    using StoredUploadSessionRow = std::tuple<std::string, std::string, std::string, std::string, long long,
-                                              std::optional<std::string>, std::string, std::optional<std::string>>;
+    using StoredUploadSessionRow =
+        std::tuple<std::string, std::string, std::string, std::string, std::optional<long long>,
+                   std::optional<long long>, std::optional<long long>, std::optional<long long>,
+                   std::optional<std::string>, std::string, std::optional<std::string>>;
 
     void register_object_in_transaction(pqxx::work& transaction, const Object& object) {
         const long long total_size = to_postgres_bigint(object.total_size(), "object total size");
@@ -1938,12 +2007,29 @@ class PostgresMetadataRepository::Impl {
         const long long total_size = to_postgres_bigint(layout.total_size(), "object layout total size");
         const long long chunk_count = size_to_postgres_bigint(layout.chunks().size(), "object layout chunk count");
 
+        const std::optional<FastCdcParameters> fastcdc = descriptor.fastcdc_parameters();
+        const std::optional<long long> fastcdc_min =
+            fastcdc.has_value()
+                ? std::optional<long long>{to_postgres_bigint(fastcdc->min_chunk_size_bytes, "FastCDC min chunk size")}
+                : std::nullopt;
+        const std::optional<long long> fastcdc_avg =
+            fastcdc.has_value()
+                ? std::optional<long long>{to_postgres_bigint(fastcdc->avg_chunk_size_bytes, "FastCDC avg chunk size")}
+                : std::nullopt;
+        const std::optional<long long> fastcdc_max =
+            fastcdc.has_value()
+                ? std::optional<long long>{to_postgres_bigint(fastcdc->max_chunk_size_bytes, "FastCDC max chunk size")}
+                : std::nullopt;
+
         const pqxx::result layout_insert = transaction.exec(
             "INSERT INTO object_layouts ("
             "    layout_id, "
             "    object_id, "
             "    descriptor_version, "
             "    chunking_strategy, "
+            "    fastcdc_min_chunk_size_bytes, "
+            "    fastcdc_avg_chunk_size_bytes, "
+            "    fastcdc_max_chunk_size_bytes, "
             "    canonical_descriptor, "
             "    total_size_bytes, "
             "    chunk_count"
@@ -1953,9 +2039,12 @@ class PostgresMetadataRepository::Impl {
             "    $2, "
             "    $3, "
             "    $4, "
-            "    $5::bytea, "
+            "    $5, "
             "    $6, "
-            "    $7"
+            "    $7, "
+            "    $8::bytea, "
+            "    $9, "
+            "    $10"
             ") "
             "ON CONFLICT (layout_id) "
             "DO NOTHING",
@@ -1964,6 +2053,9 @@ class PostgresMetadataRepository::Impl {
                 descriptor.object_id(),
                 static_cast<int>(ObjectLayoutDescriptor::kFormatVersion),
                 chunking_strategy_to_string(descriptor.chunking_strategy()),
+                fastcdc_min,
+                fastcdc_avg,
+                fastcdc_max,
                 descriptor.canonical_bytes(),
                 total_size,
                 chunk_count,
@@ -2058,11 +2150,8 @@ class PostgresMetadataRepository::Impl {
 
     [[nodiscard]] UploadSession reconstruct_upload_session(pqxx::work& transaction, StoredUploadSessionRow stored) {
         auto [stored_session_id, stored_artifact_id, target_node_id, stored_strategy, stored_chunk_size,
-              parent_version_id, state, finalized_version_id] = std::move(stored);
-
-        if (stored_chunk_size <= 0) {
-            throw std::runtime_error("stored upload session contains an invalid non-positive chunk size");
-        }
+              stored_fastcdc_min, stored_fastcdc_avg, stored_fastcdc_max, parent_version_id, state,
+              finalized_version_id] = std::move(stored);
 
         UploadSession::ImmutableMetadata immutable_metadata;
 
@@ -2079,12 +2168,43 @@ class PostgresMetadataRepository::Impl {
             immutable_metadata.emplace(std::move(metadata_key), std::move(metadata_value));
         }
 
+        const ChunkingStrategy strategy = chunking_strategy_from_string(stored_strategy);
+
+        if (strategy == ChunkingStrategy::FixedSize) {
+            if (!stored_chunk_size.has_value() || *stored_chunk_size <= 0 || stored_fastcdc_min.has_value() ||
+                stored_fastcdc_avg.has_value() || stored_fastcdc_max.has_value()) {
+                throw std::runtime_error("stored upload session has invalid FixedSize configuration");
+            }
+
+            return UploadSession{
+                UuidV7{std::move(stored_session_id)},
+                UuidV7{std::move(stored_artifact_id)},
+                std::move(target_node_id),
+                strategy,
+                static_cast<std::uint64_t>(*stored_chunk_size),
+                std::move(parent_version_id),
+                std::move(immutable_metadata),
+                upload_session_state_from_string(state),
+                std::move(finalized_version_id),
+            };
+        }
+
+        if (stored_chunk_size.has_value() || !stored_fastcdc_min.has_value() || !stored_fastcdc_avg.has_value() ||
+            !stored_fastcdc_max.has_value()) {
+            throw std::runtime_error("stored upload session has invalid FastCDC configuration");
+        }
+
+        const FastCdcParameters fastcdc_parameters{
+            .min_chunk_size_bytes = static_cast<std::uint64_t>(*stored_fastcdc_min),
+            .avg_chunk_size_bytes = static_cast<std::uint64_t>(*stored_fastcdc_avg),
+            .max_chunk_size_bytes = static_cast<std::uint64_t>(*stored_fastcdc_max),
+        };
+
         return UploadSession{
             UuidV7{std::move(stored_session_id)},
             UuidV7{std::move(stored_artifact_id)},
             std::move(target_node_id),
-            chunking_strategy_from_string(stored_strategy),
-            static_cast<std::uint64_t>(stored_chunk_size),
+            fastcdc_parameters,
             std::move(parent_version_id),
             std::move(immutable_metadata),
             upload_session_state_from_string(state),
@@ -2093,7 +2213,8 @@ class PostgresMetadataRepository::Impl {
     }
 
     [[nodiscard]] UploadSession load_upload_session(pqxx::work& transaction, const UuidV7& session_id) {
-        auto stored = transaction.query01<std::string, std::string, std::string, std::string, long long,
+        auto stored = transaction.query01<std::string, std::string, std::string, std::string, std::optional<long long>,
+                                          std::optional<long long>, std::optional<long long>, std::optional<long long>,
                                           std::optional<std::string>, std::string, std::optional<std::string>>(
             "SELECT "
             "    session_id::text, "
@@ -2101,6 +2222,9 @@ class PostgresMetadataRepository::Impl {
             "    target_node_id, "
             "    chunking_strategy, "
             "    chunk_size_bytes, "
+            "    fastcdc_min_chunk_size_bytes, "
+            "    fastcdc_avg_chunk_size_bytes, "
+            "    fastcdc_max_chunk_size_bytes, "
             "    parent_version_id, "
             "    state, "
             "    finalized_version_id "
@@ -2121,29 +2245,34 @@ class PostgresMetadataRepository::Impl {
                                                                            std::string_view layout_id) {
         validate_layout_id(layout_id);
 
-        auto stored = transaction.query01<std::string, int, std::string, std::string, long long, long long>(
-            "SELECT "
-            "    object_id, "
-            "    descriptor_version, "
-            "    chunking_strategy, "
-            "    encode("
-            "        canonical_descriptor, "
-            "        'hex'"
-            "    ), "
-            "    total_size_bytes, "
-            "    chunk_count "
-            "FROM object_layouts "
-            "WHERE layout_id = $1",
-            pqxx::params{
-                layout_id,
-            });
+        auto stored =
+            transaction.query01<std::string, int, std::string, std::optional<long long>, std::optional<long long>,
+                                std::optional<long long>, std::string, long long, long long>(
+                "SELECT "
+                "    object_id, "
+                "    descriptor_version, "
+                "    chunking_strategy, "
+                "    fastcdc_min_chunk_size_bytes, "
+                "    fastcdc_avg_chunk_size_bytes, "
+                "    fastcdc_max_chunk_size_bytes, "
+                "    encode("
+                "        canonical_descriptor, "
+                "        'hex'"
+                "    ), "
+                "    total_size_bytes, "
+                "    chunk_count "
+                "FROM object_layouts "
+                "WHERE layout_id = $1",
+                pqxx::params{
+                    layout_id,
+                });
 
         if (!stored.has_value()) {
             return std::nullopt;
         }
 
-        auto [stored_object_id, descriptor_version, stored_strategy, stored_descriptor_hex, stored_total_size,
-              stored_chunk_count] = std::move(*stored);
+        auto [stored_object_id, descriptor_version, stored_strategy, stored_fastcdc_min, stored_fastcdc_avg,
+              stored_fastcdc_max, stored_descriptor_hex, stored_total_size, stored_chunk_count] = std::move(*stored);
 
         if (std::cmp_not_equal(descriptor_version, ObjectLayoutDescriptor::kFormatVersion)) {
             throw std::runtime_error("stored object layout uses an unsupported descriptor version");
@@ -2192,16 +2321,37 @@ class PostgresMetadataRepository::Impl {
             throw std::runtime_error("stored object layout chunk count does not match layout rows");
         }
 
-        ObjectLayoutDescriptor descriptor{
-            Object{
-                std::move(stored_object_id),
+        const ChunkingStrategy strategy = chunking_strategy_from_string(stored_strategy);
+        ObjectLayoutDescriptor descriptor = [&]() {
+            Object object{
+                stored_object_id,
                 static_cast<std::uint64_t>(stored_total_size),
-            },
-            chunking_strategy_from_string(stored_strategy),
-            ObjectLayout{
+            };
+            ObjectLayout layout{
                 std::move(chunks),
-            },
-        };
+            };
+
+            if (strategy == ChunkingStrategy::FixedSize) {
+                if (stored_fastcdc_min.has_value() || stored_fastcdc_avg.has_value() ||
+                    stored_fastcdc_max.has_value()) {
+                    throw std::runtime_error("stored object layout has invalid FixedSize FastCDC columns");
+                }
+
+                return ObjectLayoutDescriptor{std::move(object), strategy, std::move(layout)};
+            }
+
+            if (!stored_fastcdc_min.has_value() || !stored_fastcdc_avg.has_value() || !stored_fastcdc_max.has_value()) {
+                throw std::runtime_error("stored object layout has invalid FastCDC configuration");
+            }
+
+            const FastCdcParameters fastcdc_parameters{
+                .min_chunk_size_bytes = static_cast<std::uint64_t>(*stored_fastcdc_min),
+                .avg_chunk_size_bytes = static_cast<std::uint64_t>(*stored_fastcdc_avg),
+                .max_chunk_size_bytes = static_cast<std::uint64_t>(*stored_fastcdc_max),
+            };
+
+            return ObjectLayoutDescriptor{std::move(object), fastcdc_parameters, std::move(layout)};
+        }();
 
         if (descriptor.layout_id() != layout_id) {
             throw std::runtime_error("stored object layout does not match layout ID");
@@ -2215,39 +2365,49 @@ class PostgresMetadataRepository::Impl {
             throw std::runtime_error("stored canonical descriptor does not match object layout");
         }
 
+        if (!stored_fastcdc_columns_match(stored_fastcdc_min, stored_fastcdc_avg, stored_fastcdc_max, descriptor)) {
+            throw std::runtime_error("stored object layout FastCDC columns do not match descriptor");
+        }
+
         return descriptor;
     }
 
     void verify_registered_object_layout(pqxx::work& transaction, const ObjectLayoutDescriptor& descriptor) {
         const ObjectLayout& layout = descriptor.layout();
 
-        auto stored = transaction.query01<std::string, int, std::string, std::string, long long, long long>(
-            "SELECT "
-            "    object_id, "
-            "    descriptor_version, "
-            "    chunking_strategy, "
-            "    encode("
-            "        canonical_descriptor, "
-            "        'hex'"
-            "    ), "
-            "    total_size_bytes, "
-            "    chunk_count "
-            "FROM object_layouts "
-            "WHERE layout_id = $1",
-            pqxx::params{
-                descriptor.layout_id(),
-            });
+        auto stored =
+            transaction.query01<std::string, int, std::string, std::optional<long long>, std::optional<long long>,
+                                std::optional<long long>, std::string, long long, long long>(
+                "SELECT "
+                "    object_id, "
+                "    descriptor_version, "
+                "    chunking_strategy, "
+                "    fastcdc_min_chunk_size_bytes, "
+                "    fastcdc_avg_chunk_size_bytes, "
+                "    fastcdc_max_chunk_size_bytes, "
+                "    encode("
+                "        canonical_descriptor, "
+                "        'hex'"
+                "    ), "
+                "    total_size_bytes, "
+                "    chunk_count "
+                "FROM object_layouts "
+                "WHERE layout_id = $1",
+                pqxx::params{
+                    descriptor.layout_id(),
+                });
 
         if (!stored.has_value()) {
             throw std::runtime_error("registered object layout is missing from database");
         }
 
-        const auto& [stored_object_id, descriptor_version, stored_strategy, stored_descriptor_hex, stored_total_size,
-                     stored_chunk_count] = *stored;
+        const auto& [stored_object_id, descriptor_version, stored_strategy, stored_fastcdc_min, stored_fastcdc_avg,
+                     stored_fastcdc_max, stored_descriptor_hex, stored_total_size, stored_chunk_count] = *stored;
 
         if (stored_object_id != descriptor.object_id() ||
             std::cmp_not_equal(descriptor_version, ObjectLayoutDescriptor::kFormatVersion) ||
             stored_strategy != chunking_strategy_to_string(descriptor.chunking_strategy()) ||
+            !stored_fastcdc_columns_match(stored_fastcdc_min, stored_fastcdc_avg, stored_fastcdc_max, descriptor) ||
             stored_descriptor_hex != bytes_to_hex(std::span<const std::byte>{
                                          descriptor.canonical_bytes(),
                                      }) ||

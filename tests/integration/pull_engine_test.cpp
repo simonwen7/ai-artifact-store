@@ -22,6 +22,7 @@
 #include <utility>
 #include <vector>
 
+#include "aistore/chunking/fastcdc_chunker.hpp"
 #include "aistore/client/client_error.hpp"
 #include "aistore/client/metadata_client.hpp"
 #include "aistore/client/storage_node_client.hpp"
@@ -30,6 +31,7 @@
 #include "aistore/http/http_server.hpp"
 #include "aistore/metadata/artifact_model.hpp"
 #include "aistore/metadata/chunk_metadata.hpp"
+#include "aistore/metadata/chunking.hpp"
 #include "aistore/metadata/object_layout_descriptor.hpp"
 #include "aistore/metadata/postgres_metadata_repository.hpp"
 #include "aistore/metadata/storage_location.hpp"
@@ -40,6 +42,8 @@
 
 namespace {
 
+using aistore::chunking::ChunkBuffer;
+using aistore::chunking::FastCdcChunker;
 using aistore::client::MetadataClient;
 using aistore::client::RemoteApiError;
 using aistore::client::StorageNodeClient;
@@ -54,6 +58,7 @@ using aistore::metadata::ArtifactVersion;
 using aistore::metadata::ChunkingStrategy;
 using aistore::metadata::ChunkMetadata;
 using aistore::metadata::ChunkRef;
+using aistore::metadata::FastCdcParameters;
 using aistore::metadata::Object;
 using aistore::metadata::ObjectLayout;
 using aistore::metadata::ObjectLayoutDescriptor;
@@ -73,6 +78,23 @@ namespace beast_http = aistore::http::beast_http;
 
 constexpr std::uint64_t kMaxBodyBytes = 8ULL * 1024ULL * 1024ULL;
 constexpr std::string_view kSourceNode = "m5-pull-source";
+
+constexpr FastCdcParameters kPullFastCdcParams{
+    .min_chunk_size_bytes = 64U,
+    .avg_chunk_size_bytes = 128U,
+    .max_chunk_size_bytes = 256U,
+};
+
+std::vector<std::byte> make_fastcdc_golden_fixture() {
+    std::vector<std::byte> fixture;
+    fixture.reserve(4096U);
+
+    for (std::size_t index = 0; index < 4096U; ++index) {
+        fixture.push_back(static_cast<std::byte>(index % 251U));
+    }
+
+    return fixture;
+}
 
 std::string test_database_connection_string() {
     const char* configured = std::getenv("AISTORE_TEST_DB_URL");
@@ -186,6 +208,27 @@ void write_bytes_at(const std::filesystem::path& path, std::uint64_t offset, std
 
     return ObjectLayoutDescriptor{Object{sha256_hex(content), content.size()}, ChunkingStrategy::FixedSize,
                                   ObjectLayout{std::move(refs)}};
+}
+
+[[nodiscard]] ObjectLayoutDescriptor make_fastcdc_descriptor(std::span<const std::byte> bytes,
+                                                             const FastCdcParameters& parameters) {
+    FastCdcChunker chunker{static_cast<std::size_t>(parameters.min_chunk_size_bytes),
+                           static_cast<std::size_t>(parameters.avg_chunk_size_bytes),
+                           static_cast<std::size_t>(parameters.max_chunk_size_bytes)};
+
+    std::vector<ChunkRef> refs;
+    const auto collect = [&](ChunkBuffer chunk) {
+        refs.push_back(ChunkRef{
+            .chunk_id = sha256_hex(chunk.bytes),
+            .offset = chunk.offset,
+            .size = chunk.bytes.size(),
+        });
+    };
+
+    chunker.update(bytes, collect);
+    chunker.finalize(collect);
+
+    return ObjectLayoutDescriptor{Object{sha256_hex(bytes), bytes.size()}, parameters, ObjectLayout{std::move(refs)}};
 }
 
 [[nodiscard]] std::filesystem::path partial_path_for(const std::filesystem::path& destination,
@@ -686,9 +729,9 @@ TEST_F(PullEngineFixture, DownloadConcurrencyNeverExceedsFourAndWindowRemainsBou
 
     std::atomic<int> in_flight{0};
     std::atomic<int> max_in_flight{0};
-    std::atomic<int> peak_started_while_first_active{0};
-    std::atomic<int> started_while_first_active{0};
-    std::atomic<bool> first_active{false};
+    std::atomic<int> starts_before_first_done{0};
+    std::atomic<int> peak_starts_before_first_done{0};
+    std::atomic<bool> first_done{false};
     const std::string first_chunk_id = chunk_ids.front();
 
     RunningHttpServer instrumented_storage{[&, first_chunk_id](const HttpRequest& request) {
@@ -702,26 +745,21 @@ TEST_F(PullEngineFixture, DownloadConcurrencyNeverExceedsFourAndWindowRemainsBou
                !max_in_flight.compare_exchange_weak(observed_max, current, std::memory_order_relaxed)) {
         }
 
-        const bool is_first = request.target() == std::string{"/v1/chunks/"} + first_chunk_id;
-        if (is_first) {
-            first_active.store(true, std::memory_order_relaxed);
-        } else if (first_active.load(std::memory_order_relaxed)) {
-            const int started = started_while_first_active.fetch_add(1, std::memory_order_relaxed) + 1;
-            int peak = peak_started_while_first_active.load(std::memory_order_relaxed);
+        if (!first_done.load(std::memory_order_relaxed)) {
+            const int started = starts_before_first_done.fetch_add(1, std::memory_order_relaxed) + 1;
+            int peak = peak_starts_before_first_done.load(std::memory_order_relaxed);
             while (started > peak &&
-                   !peak_started_while_first_active.compare_exchange_weak(peak, started, std::memory_order_relaxed)) {
+                   !peak_starts_before_first_done.compare_exchange_weak(peak, started, std::memory_order_relaxed)) {
             }
         }
 
+        const bool is_first = request.target() == std::string{"/v1/chunks/"} + first_chunk_id;
         if (is_first) {
             std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            first_done.store(true, std::memory_order_relaxed);
         }
 
         HttpResponse response = storage_service_->handle_request(request);
-
-        if (is_first) {
-            first_active.store(false, std::memory_order_relaxed);
-        }
 
         in_flight.fetch_sub(1, std::memory_order_relaxed);
         return response;
@@ -738,7 +776,39 @@ TEST_F(PullEngineFixture, DownloadConcurrencyNeverExceedsFourAndWindowRemainsBou
     EXPECT_EQ(read_file(destination), contents);
     EXPECT_EQ(result.stats.total_chunks, 20U);
     EXPECT_LE(max_in_flight.load(), static_cast<int>(PullEngine::kWorkerCount));
-    EXPECT_LE(peak_started_while_first_active.load(), static_cast<int>(PullEngine::kWindowCapacity));
+    EXPECT_LE(peak_starts_before_first_done.load(), static_cast<int>(PullEngine::kWindowCapacity));
+}
+
+TEST_F(PullEngineFixture, PullsFastCdcVariableSizedLayoutWithoutChunkingSpecificLogic) {
+    const std::vector<std::byte> fixture = make_fastcdc_golden_fixture();
+    const ObjectLayoutDescriptor descriptor = make_fastcdc_descriptor(fixture, kPullFastCdcParams);
+
+    ASSERT_EQ(descriptor.chunking_strategy(), ChunkingStrategy::FastCdc);
+    ASSERT_TRUE(descriptor.fastcdc_parameters().has_value());
+    EXPECT_EQ(*descriptor.fastcdc_parameters(), kPullFastCdcParams);
+    ASSERT_GT(descriptor.layout().chunks().size(), 1U);
+
+    for (const ChunkRef& chunk : descriptor.layout().chunks()) {
+        const auto offset = static_cast<std::size_t>(chunk.offset);
+        const std::string chunk_bytes{
+            reinterpret_cast<const char*>(fixture.data() + offset),
+            chunk.size,
+        };
+        store_chunk(chunk_bytes);
+    }
+
+    const ArtifactVersion version = create_committed_version(descriptor);
+    const auto destination = destination_path("fastcdc-restored.bin");
+
+    const PullResult result = engine().pull(
+        PullRequest{.version_id = version.version_id(), .destination_path = destination, .overwrite = false});
+
+    const std::string restored = read_file(destination);
+    const std::string expected{reinterpret_cast<const char*>(fixture.data()), fixture.size()};
+    EXPECT_EQ(restored, expected);
+    EXPECT_EQ(result.object_id, descriptor.object_id());
+    EXPECT_EQ(result.stats.bytes_restored, fixture.size());
+    EXPECT_EQ(result.stats.total_chunks, descriptor.layout().chunks().size());
 }
 
 }  // namespace

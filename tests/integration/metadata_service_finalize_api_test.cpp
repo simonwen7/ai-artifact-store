@@ -208,6 +208,7 @@ class MetadataServiceFinalizeApiTest : public ::testing::Test {
         return boost::json::serialize(boost::json::object{{"object_id", value.object_id()},
                                                           {"total_size_bytes", value.object().total_size()},
                                                           {"chunking_strategy", "fixed-size"},
+                                                          {"chunking_parameters", boost::json::object{}},
                                                           {"chunks", std::move(chunks)}});
     }
 
@@ -294,10 +295,12 @@ TEST_F(MetadataServiceFinalizeApiTest, FinalizeRejectsMalformedOrInvalidDescript
         http_exchange(server_->port(), beast_http::verb::post, target(session_id_), "{", "application/json");
     EXPECT_EQ(malformed.result(), beast_http::status::bad_request);
     EXPECT_EQ(boost::json::parse(malformed.body()).at("error").as_string(), "invalid_json");
-    const std::string invalid = boost::json::serialize(boost::json::object{{"object_id", "not-a-hash"},
-                                                                           {"total_size_bytes", 0},
-                                                                           {"chunking_strategy", "fixed-size"},
-                                                                           {"chunks", boost::json::array{}}});
+    const std::string invalid =
+        boost::json::serialize(boost::json::object{{"object_id", "not-a-hash"},
+                                                   {"total_size_bytes", 0},
+                                                   {"chunking_strategy", "fixed-size"},
+                                                   {"chunking_parameters", boost::json::object{}},
+                                                   {"chunks", boost::json::array{}}});
     const HttpResponse invalid_response =
         http_exchange(server_->port(), beast_http::verb::post, target(session_id_), invalid, "application/json");
     EXPECT_EQ(invalid_response.result(), beast_http::status::bad_request);
@@ -315,6 +318,63 @@ TEST_F(MetadataServiceFinalizeApiTest, FinalizeRejectsUnsupportedMediaTypeAndMet
     EXPECT_EQ(method.result(), beast_http::status::method_not_allowed);
     EXPECT_EQ(method[beast_http::field::allow], "POST");
     EXPECT_EQ(boost::json::parse(method.body()).at("error").as_string(), "method_not_allowed");
+}
+
+TEST_F(MetadataServiceFinalizeApiTest, FinalizesFastCdcUploadThroughHttp) {
+    const aistore::metadata::FastCdcParameters parameters{
+        .min_chunk_size_bytes = 64,
+        .avg_chunk_size_bytes = 256,
+        .max_chunk_size_bytes = 1024,
+    };
+
+    repository_->create_upload_session(UploadSession{session_id_,
+                                                     artifact_id_,
+                                                     "m6-fastcdc-target",
+                                                     parameters,
+                                                     std::nullopt,
+                                                     {{"source", marker_}},
+                                                     UploadSessionState::Open,
+                                                     std::nullopt});
+
+    const std::string object_id = sha256_hex(marker_ + "-fastcdc-object");
+    const std::string chunk_id = sha256_hex(marker_ + "-fastcdc-chunk");
+    object_ids_.push_back(object_id);
+    chunk_ids_.push_back(chunk_id);
+
+    const ObjectLayoutDescriptor value{
+        Object{object_id, 128},
+        parameters,
+        ObjectLayout{{ChunkRef{.chunk_id = chunk_id, .offset = 0, .size = 128}}},
+    };
+
+    make_available(value, "m6-fastcdc-target");
+
+    boost::json::array chunks;
+    chunks.push_back(boost::json::object{
+        {"chunk_id", chunk_id},
+        {"offset", 0},
+        {"size_bytes", 128},
+    });
+
+    const std::string body = boost::json::serialize(boost::json::object{
+        {"object_id", object_id},
+        {"total_size_bytes", 128},
+        {"chunking_strategy", "fastcdc"},
+        {"chunking_parameters",
+         boost::json::object{
+             {"min_chunk_size_bytes", 64},
+             {"avg_chunk_size_bytes", 256},
+             {"max_chunk_size_bytes", 1024},
+         }},
+        {"chunks", std::move(chunks)},
+    });
+
+    const HttpResponse response =
+        http_exchange(server_->port(), beast_http::verb::post, target(session_id_), body, "application/json");
+
+    ASSERT_EQ(response.result(), beast_http::status::ok);
+    EXPECT_EQ(boost::json::parse(response.body()).at("layout_id").as_string(), value.layout_id());
+    ASSERT_TRUE(repository_->get_object_layout(value.layout_id()).has_value());
 }
 
 }  // namespace

@@ -6,9 +6,12 @@
 #include <stdexcept>
 #include <string>
 
+#include "aistore/metadata/chunking.hpp"
+
 namespace {
 
 using aistore::metadata::ChunkingStrategy;
+using aistore::metadata::FastCdcParameters;
 using aistore::metadata::UploadSession;
 using aistore::metadata::UploadSessionState;
 using aistore::metadata::UuidV7;
@@ -221,6 +224,108 @@ TEST(UploadSessionTest, RejectsEmptyImmutableMetadataKey) {
                      std::nullopt,
                  }),
                  std::invalid_argument);
+}
+
+TEST(UploadSessionTest, AcceptsValidFastCdcSession) {
+    const UuidV7 session_id = UuidV7::generate();
+    const UuidV7 artifact_id = UuidV7::generate();
+    const FastCdcParameters parameters{
+        .min_chunk_size_bytes = 64,
+        .avg_chunk_size_bytes = 256,
+        .max_chunk_size_bytes = 1024,
+    };
+
+    const UploadSession session{
+        session_id,
+        artifact_id,
+        "node-a",
+        parameters,
+        std::nullopt,
+        UploadSession::ImmutableMetadata{
+            {"framework", "pytorch"},
+        },
+        UploadSessionState::Open,
+        std::nullopt,
+    };
+
+    EXPECT_EQ(session.session_id(), session_id);
+    EXPECT_EQ(session.chunking_strategy(), ChunkingStrategy::FastCdc);
+    EXPECT_EQ(session.fastcdc_parameters(), parameters);
+    EXPECT_FALSE(session.fixed_chunk_size_bytes().has_value());
+}
+
+TEST(UploadSessionTest, RejectsInvalidFastCdcParameters) {
+    EXPECT_THROW((UploadSession{
+                     UuidV7::generate(),
+                     UuidV7::generate(),
+                     "node-a",
+                     FastCdcParameters{
+                         .min_chunk_size_bytes = 64,
+                         .avg_chunk_size_bytes = 300,
+                         .max_chunk_size_bytes = 1024,
+                     },
+                     std::nullopt,
+                     UploadSession::ImmutableMetadata{},
+                     UploadSessionState::Open,
+                     std::nullopt,
+                 }),
+                 std::invalid_argument);
+}
+
+TEST(UploadSessionTest, ExposesStrategySpecificConfiguration) {
+    const FastCdcParameters parameters{
+        .min_chunk_size_bytes = 64,
+        .avg_chunk_size_bytes = 256,
+        .max_chunk_size_bytes = 1024,
+    };
+
+    const UploadSession fastcdc_session{
+        UuidV7::generate(),
+        UuidV7::generate(),
+        "node-a",
+        parameters,
+        std::nullopt,
+        UploadSession::ImmutableMetadata{},
+        UploadSessionState::Open,
+        std::nullopt,
+    };
+
+    EXPECT_THROW((void)fastcdc_session.chunk_size_bytes(), std::logic_error);
+    EXPECT_EQ(fastcdc_session.fastcdc_parameters(), parameters);
+
+    const UploadSession fixed_session{
+        UuidV7::generate(),
+        UuidV7::generate(),
+        "node-a",
+        ChunkingStrategy::FixedSize,
+        kFourMiB,
+        std::nullopt,
+        UploadSession::ImmutableMetadata{},
+        UploadSessionState::Open,
+        std::nullopt,
+    };
+
+    EXPECT_EQ(fixed_session.chunk_size_bytes(), kFourMiB);
+    EXPECT_FALSE(fixed_session.fastcdc_parameters().has_value());
+}
+
+TEST(UploadSessionTest, PreservesFixedSizeSessionSemantics) {
+    const UploadSession session{
+        UuidV7::generate(),
+        UuidV7::generate(),
+        "node-a",
+        ChunkingStrategy::FixedSize,
+        kFourMiB,
+        std::nullopt,
+        UploadSession::ImmutableMetadata{},
+        UploadSessionState::Open,
+        std::nullopt,
+    };
+
+    EXPECT_EQ(session.chunking_strategy(), ChunkingStrategy::FixedSize);
+    EXPECT_EQ(session.fixed_chunk_size_bytes(), kFourMiB);
+    EXPECT_EQ(session.chunk_size_bytes(), kFourMiB);
+    EXPECT_FALSE(session.fastcdc_parameters().has_value());
 }
 
 }  // namespace

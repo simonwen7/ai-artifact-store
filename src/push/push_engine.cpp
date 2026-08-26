@@ -21,10 +21,12 @@
 #include <utility>
 #include <vector>
 
+#include "aistore/chunking/fastcdc_chunker.hpp"
 #include "aistore/chunking/fixed_size_chunker.hpp"
 #include "aistore/client/client_error.hpp"
 #include "aistore/hashing/sha256.hpp"
 #include "aistore/metadata/chunk_metadata.hpp"
+#include "aistore/metadata/chunking.hpp"
 #include "aistore/metadata/object.hpp"
 #include "aistore/metadata/object_layout.hpp"
 #include "aistore/metadata/storage_location.hpp"
@@ -72,6 +74,46 @@ namespace {
 
 [[nodiscard]] std::string logical_storage_path(std::string_view chunk_id) {
     return std::string{"/v1/chunks/"} + std::string{chunk_id};
+}
+
+[[nodiscard]] std::uint64_t resolve_fixed_chunk_size_bytes(const aistore::metadata::UploadSession& session) {
+    const std::uint64_t chunk_size =
+        session.fixed_chunk_size_bytes().has_value() ? *session.fixed_chunk_size_bytes() : session.chunk_size_bytes();
+
+    if (chunk_size == 0U || chunk_size > PushEngine::kMaxM4ChunkSize ||
+        chunk_size > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max())) {
+        throw std::invalid_argument("upload session chunk size exceeds M4 storage limits");
+    }
+
+    return chunk_size;
+}
+
+[[nodiscard]] aistore::metadata::FastCdcParameters resolve_fastcdc_parameters(
+    const aistore::metadata::UploadSession& session) {
+    if (session.chunking_strategy() != aistore::metadata::ChunkingStrategy::FastCdc) {
+        throw std::invalid_argument("upload session chunking strategy must be FastCDC");
+    }
+
+    if (!session.fastcdc_parameters().has_value()) {
+        throw std::invalid_argument("upload session FastCDC parameters are missing");
+    }
+
+    return *session.fastcdc_parameters();
+}
+
+[[nodiscard]] aistore::metadata::ObjectLayoutDescriptor make_layout_descriptor(
+    aistore::metadata::Object object, aistore::metadata::ChunkingStrategy strategy,
+    const std::optional<aistore::metadata::FastCdcParameters>& fastcdc_parameters,
+    aistore::metadata::ObjectLayout layout) {
+    if (strategy == aistore::metadata::ChunkingStrategy::FixedSize) {
+        return aistore::metadata::ObjectLayoutDescriptor{std::move(object), strategy, std::move(layout)};
+    }
+
+    if (!fastcdc_parameters.has_value()) {
+        throw std::logic_error("FastCDC layout descriptor requires parameters");
+    }
+
+    return aistore::metadata::ObjectLayoutDescriptor{std::move(object), *fastcdc_parameters, std::move(layout)};
 }
 
 struct UploadTask {
@@ -245,43 +287,19 @@ class WorkerJoinGuard {
     std::vector<std::thread>& workers_;
 };
 
-}  // namespace
+using ChunkConsumer = std::function<void(aistore::chunking::ChunkBuffer)>;
 
-PushEngine::PushEngine(client::MetadataClient& metadata_client, client::StorageNodeClient& storage_client,
-                       std::string storage_node_id)
-    : metadata_client_{metadata_client}, storage_client_{storage_client}, storage_node_id_{std::move(storage_node_id)} {
-    if (!is_valid_node_id(storage_node_id_)) {
-        throw std::invalid_argument("storage node ID is invalid");
-    }
-}
+struct ChunkFeedCallbacks {
+    std::function<void(std::span<const std::byte>, const ChunkConsumer&)> update;
+    std::function<void(const ChunkConsumer&)> finalize;
+};
 
-PreparedPush PushEngine::push(const PushRequest& request) const {
-    const std::optional<aistore::metadata::UploadSession> session =
-        metadata_client_.get_upload_session(request.session_id);
-
-    if (!session.has_value()) {
-        throw std::runtime_error("upload session does not exist");
-    }
-
-    if (session->state() != aistore::metadata::UploadSessionState::Open) {
-        throw std::runtime_error("upload session must be open");
-    }
-
-    if (session->target_node_id() != storage_node_id_) {
-        throw std::invalid_argument("upload session target node does not match storage client node");
-    }
-
-    if (session->chunking_strategy() != aistore::metadata::ChunkingStrategy::FixedSize) {
-        throw std::invalid_argument("upload session chunking strategy must be fixed-size");
-    }
-
-    if (session->chunk_size_bytes() == 0U || session->chunk_size_bytes() > kMaxM4ChunkSize ||
-        session->chunk_size_bytes() > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max())) {
-        throw std::invalid_argument("upload session chunk size exceeds M4 storage limits");
-    }
-
-    const auto chunk_size = static_cast<std::size_t>(session->chunk_size_bytes());
-
+[[nodiscard]] PreparedPush execute_push_data_plane(
+    const PushRequest& request, const aistore::metadata::UploadSession& session,
+    aistore::client::MetadataClient& metadata_client, aistore::client::StorageNodeClient& storage_client,
+    const std::string& storage_node_id, const ChunkFeedCallbacks& chunk_feed,
+    aistore::metadata::ChunkingStrategy chunking_strategy,
+    const std::optional<aistore::metadata::FastCdcParameters>& fastcdc_parameters) {
     std::ifstream input{request.source_path, std::ios::binary};
 
     if (!input.is_open()) {
@@ -290,15 +308,14 @@ PreparedPush PushEngine::push(const PushRequest& request) const {
 
     SharedWorkerState shared;
     std::vector<std::thread> workers;
-    workers.reserve(kWorkerCount);
+    workers.reserve(PushEngine::kWorkerCount);
 
     std::vector<aistore::metadata::ChunkRef> layout_refs;
     std::set<std::string> seen_chunk_ids;
     std::vector<StagedChunk> staging;
-    staging.reserve(kNegotiationBatchSize);
+    staging.reserve(PushEngine::kNegotiationBatchSize);
 
     aistore::hashing::Sha256 object_hasher;
-    aistore::chunking::FixedSizeChunker chunker{chunk_size};
     std::uint64_t bytes_read = 0;
 
     const auto enqueue_negotiated = [&](std::vector<StagedChunk> batch) {
@@ -314,10 +331,10 @@ PreparedPush PushEngine::push(const PushRequest& request) const {
         }
 
         const aistore::client::ChunkNegotiationResult negotiation =
-            metadata_client_.negotiate_chunks(request.session_id, metadata_batch);
+            metadata_client.negotiate_chunks(request.session_id, metadata_batch);
 
-        if (negotiation.session_id != request.session_id || negotiation.target_node_id != session->target_node_id() ||
-            negotiation.target_node_id != storage_node_id_ || negotiation.chunks.size() != batch.size()) {
+        if (negotiation.session_id != request.session_id || negotiation.target_node_id != session.target_node_id() ||
+            negotiation.target_node_id != storage_node_id || negotiation.chunks.size() != batch.size()) {
             throw aistore::client::RemoteProtocolError{"negotiation response does not match staged batch"};
         }
 
@@ -353,23 +370,44 @@ PreparedPush PushEngine::push(const PushRequest& request) const {
         };
         staging.push_back(std::move(staged));
 
-        if (staging.size() == kNegotiationBatchSize) {
+        if (staging.size() == PushEngine::kNegotiationBatchSize) {
             std::vector<StagedChunk> batch = std::move(staging);
             staging.clear();
             enqueue_negotiated(std::move(batch));
         }
     };
 
+    const auto record_chunk = [&](aistore::chunking::ChunkBuffer chunk) {
+        aistore::hashing::Sha256 chunk_hasher;
+        chunk_hasher.update(chunk.bytes);
+        const std::string chunk_id = digest_to_hex(chunk_hasher.finalize());
+
+        layout_refs.push_back(aistore::metadata::ChunkRef{
+            .chunk_id = chunk_id,
+            .offset = chunk.offset,
+            .size = chunk.bytes.size(),
+        });
+
+        const auto [iterator, inserted] = seen_chunk_ids.insert(chunk_id);
+
+        if (!inserted) {
+            return;
+        }
+
+        (void)iterator;
+        stage_unique_chunk(chunk_id, std::move(chunk.bytes));
+    };
+
     {
         WorkerJoinGuard join_guard{workers};
 
         try {
-            for (std::size_t index = 0; index < kWorkerCount; ++index) {
-                workers.emplace_back(worker_loop, std::ref(shared), std::ref(metadata_client_),
-                                     std::ref(storage_client_), std::cref(storage_node_id_));
+            for (std::size_t index = 0; index < PushEngine::kWorkerCount; ++index) {
+                workers.emplace_back(worker_loop, std::ref(shared), std::ref(metadata_client), std::ref(storage_client),
+                                     std::cref(storage_node_id));
             }
 
-            std::vector<std::byte> read_buffer(kReadBufferSize);
+            std::vector<std::byte> read_buffer(PushEngine::kReadBufferSize);
 
             while (input) {
                 if (shared.queue.cancelled()) {
@@ -392,53 +430,14 @@ PreparedPush PushEngine::push(const PushRequest& request) const {
                 const std::span<const std::byte> span{read_buffer.data(), bytes_just_read};
                 object_hasher.update(span);
                 bytes_read += bytes_just_read;
-
-                chunker.update(span, [&](aistore::chunking::ChunkBuffer chunk) {
-                    aistore::hashing::Sha256 chunk_hasher;
-                    chunk_hasher.update(chunk.bytes);
-                    const std::string chunk_id = digest_to_hex(chunk_hasher.finalize());
-
-                    layout_refs.push_back(aistore::metadata::ChunkRef{
-                        .chunk_id = chunk_id,
-                        .offset = chunk.offset,
-                        .size = chunk.bytes.size(),
-                    });
-
-                    const auto [iterator, inserted] = seen_chunk_ids.insert(chunk_id);
-
-                    if (!inserted) {
-                        return;
-                    }
-
-                    (void)iterator;
-                    stage_unique_chunk(chunk_id, std::move(chunk.bytes));
-                });
+                chunk_feed.update(span, record_chunk);
             }
 
             if (input.bad()) {
                 throw std::runtime_error("failed while reading source file");
             }
 
-            chunker.finalize([&](aistore::chunking::ChunkBuffer chunk) {
-                aistore::hashing::Sha256 chunk_hasher;
-                chunk_hasher.update(chunk.bytes);
-                const std::string chunk_id = digest_to_hex(chunk_hasher.finalize());
-
-                layout_refs.push_back(aistore::metadata::ChunkRef{
-                    .chunk_id = chunk_id,
-                    .offset = chunk.offset,
-                    .size = chunk.bytes.size(),
-                });
-
-                const auto [iterator, inserted] = seen_chunk_ids.insert(chunk_id);
-
-                if (!inserted) {
-                    return;
-                }
-
-                (void)iterator;
-                stage_unique_chunk(chunk_id, std::move(chunk.bytes));
-            });
+            chunk_feed.finalize(record_chunk);
 
             if (!staging.empty()) {
                 enqueue_negotiated(std::move(staging));
@@ -464,8 +463,8 @@ PreparedPush PushEngine::push(const PushRequest& request) const {
 
     aistore::metadata::Object object{object_id, bytes_read};
     aistore::metadata::ObjectLayout layout{std::move(layout_refs)};
-    aistore::metadata::ObjectLayoutDescriptor descriptor{
-        std::move(object), aistore::metadata::ChunkingStrategy::FixedSize, std::move(layout)};
+    aistore::metadata::ObjectLayoutDescriptor descriptor =
+        make_layout_descriptor(std::move(object), chunking_strategy, fastcdc_parameters, std::move(layout));
 
     const std::size_t total_chunks = descriptor.layout().chunks().size();
     const std::size_t unique_chunks = seen_chunk_ids.size();
@@ -486,35 +485,10 @@ PreparedPush PushEngine::push(const PushRequest& request) const {
     };
 }
 
-PreparedPush PushEngine::prepare_committed_retry(const PushRequest& request,
-                                                 const metadata::UploadSession& committed_session) const {
-    if (request.session_id != committed_session.session_id()) {
-        throw std::invalid_argument("committed retry session ID does not match request session ID");
-    }
-
-    if (committed_session.state() != aistore::metadata::UploadSessionState::Committed) {
-        throw std::invalid_argument("committed retry requires a committed upload session");
-    }
-
-    if (!committed_session.finalized_version_id().has_value()) {
-        throw std::invalid_argument("committed retry requires a finalized version ID");
-    }
-
-    if (committed_session.target_node_id() != storage_node_id_) {
-        throw std::invalid_argument("committed retry target node does not match storage client node");
-    }
-
-    if (committed_session.chunking_strategy() != aistore::metadata::ChunkingStrategy::FixedSize) {
-        throw std::invalid_argument("committed retry chunking strategy must be fixed-size");
-    }
-
-    if (committed_session.chunk_size_bytes() == 0U || committed_session.chunk_size_bytes() > kMaxM4ChunkSize ||
-        committed_session.chunk_size_bytes() > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max())) {
-        throw std::invalid_argument("committed retry chunk size exceeds M4 storage limits");
-    }
-
-    const auto chunk_size = static_cast<std::size_t>(committed_session.chunk_size_bytes());
-
+[[nodiscard]] PreparedPush execute_committed_rescan(
+    const PushRequest& request, const ChunkFeedCallbacks& chunk_feed,
+    aistore::metadata::ChunkingStrategy chunking_strategy,
+    const std::optional<aistore::metadata::FastCdcParameters>& fastcdc_parameters) {
     std::ifstream input{request.source_path, std::ios::binary};
 
     if (!input.is_open()) {
@@ -525,7 +499,6 @@ PreparedPush PushEngine::prepare_committed_retry(const PushRequest& request,
     std::set<std::string> seen_chunk_ids;
 
     aistore::hashing::Sha256 object_hasher;
-    aistore::chunking::FixedSizeChunker chunker{chunk_size};
     std::uint64_t bytes_read = 0;
 
     const auto record_chunk = [&](aistore::chunking::ChunkBuffer chunk) {
@@ -542,7 +515,7 @@ PreparedPush PushEngine::prepare_committed_retry(const PushRequest& request,
         (void)seen_chunk_ids.insert(chunk_id);
     };
 
-    std::vector<std::byte> read_buffer(kReadBufferSize);
+    std::vector<std::byte> read_buffer(PushEngine::kReadBufferSize);
 
     while (input) {
         input.read(reinterpret_cast<char*>(read_buffer.data()), static_cast<std::streamsize>(read_buffer.size()));
@@ -560,22 +533,22 @@ PreparedPush PushEngine::prepare_committed_retry(const PushRequest& request,
         const std::span<const std::byte> span{read_buffer.data(), bytes_just_read};
         object_hasher.update(span);
         bytes_read += bytes_just_read;
-        chunker.update(span, record_chunk);
+        chunk_feed.update(span, record_chunk);
     }
 
     if (input.bad()) {
         throw std::runtime_error("failed while reading source file for committed retry");
     }
 
-    chunker.finalize(record_chunk);
+    chunk_feed.finalize(record_chunk);
 
     const aistore::hashing::Sha256::Digest object_digest = object_hasher.finalize();
     const std::string object_id = digest_to_hex(object_digest);
 
     aistore::metadata::Object object{object_id, bytes_read};
     aistore::metadata::ObjectLayout layout{std::move(layout_refs)};
-    aistore::metadata::ObjectLayoutDescriptor descriptor{
-        std::move(object), aistore::metadata::ChunkingStrategy::FixedSize, std::move(layout)};
+    aistore::metadata::ObjectLayoutDescriptor descriptor =
+        make_layout_descriptor(std::move(object), chunking_strategy, fastcdc_parameters, std::move(layout));
 
     const std::size_t total_chunks = descriptor.layout().chunks().size();
     const std::size_t unique_chunks = seen_chunk_ids.size();
@@ -594,6 +567,124 @@ PreparedPush PushEngine::prepare_committed_retry(const PushRequest& request,
                 .bytes_sent_to_storage = 0U,
             },
     };
+}
+
+}  // namespace
+
+PushEngine::PushEngine(client::MetadataClient& metadata_client, client::StorageNodeClient& storage_client,
+                       std::string storage_node_id)
+    : metadata_client_{metadata_client}, storage_client_{storage_client}, storage_node_id_{std::move(storage_node_id)} {
+    if (!is_valid_node_id(storage_node_id_)) {
+        throw std::invalid_argument("storage node ID is invalid");
+    }
+}
+
+PreparedPush PushEngine::push(const PushRequest& request) const {
+    const std::optional<aistore::metadata::UploadSession> session =
+        metadata_client_.get_upload_session(request.session_id);
+
+    if (!session.has_value()) {
+        throw std::runtime_error("upload session does not exist");
+    }
+
+    if (session->state() != aistore::metadata::UploadSessionState::Open) {
+        throw std::runtime_error("upload session must be open");
+    }
+
+    if (session->target_node_id() != storage_node_id_) {
+        throw std::invalid_argument("upload session target node does not match storage client node");
+    }
+
+    switch (session->chunking_strategy()) {
+        case aistore::metadata::ChunkingStrategy::FixedSize: {
+            const auto chunk_size = static_cast<std::size_t>(resolve_fixed_chunk_size_bytes(*session));
+            aistore::chunking::FixedSizeChunker chunker{chunk_size};
+
+            return execute_push_data_plane(
+                request, *session, metadata_client_, storage_client_, storage_node_id_,
+                ChunkFeedCallbacks{
+                    .update = [&chunker](std::span<const std::byte> data,
+                                         const ChunkConsumer& consumer) { chunker.update(data, consumer); },
+                    .finalize = [&chunker](const ChunkConsumer& consumer) { chunker.finalize(consumer); },
+                },
+                aistore::metadata::ChunkingStrategy::FixedSize, std::nullopt);
+        }
+
+        case aistore::metadata::ChunkingStrategy::FastCdc: {
+            const aistore::metadata::FastCdcParameters parameters = resolve_fastcdc_parameters(*session);
+            aistore::chunking::FastCdcChunker chunker{
+                static_cast<std::size_t>(parameters.min_chunk_size_bytes),
+                static_cast<std::size_t>(parameters.avg_chunk_size_bytes),
+                static_cast<std::size_t>(parameters.max_chunk_size_bytes),
+            };
+
+            return execute_push_data_plane(
+                request, *session, metadata_client_, storage_client_, storage_node_id_,
+                ChunkFeedCallbacks{
+                    .update = [&chunker](std::span<const std::byte> data,
+                                         const ChunkConsumer& consumer) { chunker.update(data, consumer); },
+                    .finalize = [&chunker](const ChunkConsumer& consumer) { chunker.finalize(consumer); },
+                },
+                aistore::metadata::ChunkingStrategy::FastCdc, parameters);
+        }
+    }
+
+    throw std::logic_error("unsupported upload session chunking strategy");
+}
+
+PreparedPush PushEngine::prepare_committed_retry(const PushRequest& request,
+                                                 const metadata::UploadSession& committed_session) const {
+    if (request.session_id != committed_session.session_id()) {
+        throw std::invalid_argument("committed retry session ID does not match request session ID");
+    }
+
+    if (committed_session.state() != aistore::metadata::UploadSessionState::Committed) {
+        throw std::invalid_argument("committed retry requires a committed upload session");
+    }
+
+    if (!committed_session.finalized_version_id().has_value()) {
+        throw std::invalid_argument("committed retry requires a finalized version ID");
+    }
+
+    if (committed_session.target_node_id() != storage_node_id_) {
+        throw std::invalid_argument("committed retry target node does not match storage client node");
+    }
+
+    switch (committed_session.chunking_strategy()) {
+        case aistore::metadata::ChunkingStrategy::FixedSize: {
+            const auto chunk_size = static_cast<std::size_t>(resolve_fixed_chunk_size_bytes(committed_session));
+            aistore::chunking::FixedSizeChunker chunker{chunk_size};
+
+            return execute_committed_rescan(
+                request,
+                ChunkFeedCallbacks{
+                    .update = [&chunker](std::span<const std::byte> data,
+                                         const ChunkConsumer& consumer) { chunker.update(data, consumer); },
+                    .finalize = [&chunker](const ChunkConsumer& consumer) { chunker.finalize(consumer); },
+                },
+                aistore::metadata::ChunkingStrategy::FixedSize, std::nullopt);
+        }
+
+        case aistore::metadata::ChunkingStrategy::FastCdc: {
+            const aistore::metadata::FastCdcParameters parameters = resolve_fastcdc_parameters(committed_session);
+            aistore::chunking::FastCdcChunker chunker{
+                static_cast<std::size_t>(parameters.min_chunk_size_bytes),
+                static_cast<std::size_t>(parameters.avg_chunk_size_bytes),
+                static_cast<std::size_t>(parameters.max_chunk_size_bytes),
+            };
+
+            return execute_committed_rescan(
+                request,
+                ChunkFeedCallbacks{
+                    .update = [&chunker](std::span<const std::byte> data,
+                                         const ChunkConsumer& consumer) { chunker.update(data, consumer); },
+                    .finalize = [&chunker](const ChunkConsumer& consumer) { chunker.finalize(consumer); },
+                },
+                aistore::metadata::ChunkingStrategy::FastCdc, parameters);
+        }
+    }
+
+    throw std::logic_error("unsupported committed retry chunking strategy");
 }
 
 }  // namespace aistore::push

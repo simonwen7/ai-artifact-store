@@ -17,6 +17,7 @@
 #include "aistore/client/metadata_client.hpp"
 #include "aistore/client/storage_node_client.hpp"
 #include "aistore/http/http_client.hpp"
+#include "aistore/metadata/chunking.hpp"
 #include "aistore/metadata/finalize_upload.hpp"
 #include "aistore/metadata/upload_session.hpp"
 #include "aistore/metadata/uuid_v7.hpp"
@@ -69,7 +70,11 @@ void print_push_usage(std::ostream& out) {
            "\n"
            "Optional:\n"
            "  --session-id <uuidv7>\n"
+           "  --chunking-strategy <fixed-size|fastcdc>\n"
            "  --chunk-size <bytes>\n"
+           "  --min-chunk-size <bytes>\n"
+           "  --avg-chunk-size <bytes>\n"
+           "  --max-chunk-size <bytes>\n"
            "  --parent-version <64-lowercase-hex>\n"
            "  --metadata <KEY=VALUE>\n"
            "  --metadata-address <numeric-ip>\n"
@@ -80,7 +85,11 @@ void print_push_usage(std::ostream& out) {
            "Defaults:\n"
            "  metadata 127.0.0.1:8080\n"
            "  storage  127.0.0.1:8081\n"
-           "  chunk-size 4194304\n";
+           "  chunking-strategy fixed-size\n"
+           "  chunk-size 4194304\n"
+           "  min-chunk-size 2097152\n"
+           "  avg-chunk-size 4194304\n"
+           "  max-chunk-size 8388608\n";
 }
 
 void print_pull_usage(std::ostream& out) {
@@ -220,7 +229,11 @@ struct PushOptions {
     aistore::metadata::UuidV7 artifact_id;
     std::string storage_node_id;
     aistore::metadata::UuidV7 session_id;
+    aistore::metadata::ChunkingStrategy chunking_strategy = aistore::metadata::ChunkingStrategy::FixedSize;
     std::uint64_t chunk_size_bytes = 4194304ULL;
+    std::uint64_t min_chunk_size_bytes = 2097152ULL;
+    std::uint64_t avg_chunk_size_bytes = 4194304ULL;
+    std::uint64_t max_chunk_size_bytes = 8388608ULL;
     std::optional<std::string> parent_version_id;
     aistore::metadata::UploadSession::ImmutableMetadata immutable_metadata;
     std::string metadata_address = "127.0.0.1";
@@ -229,12 +242,28 @@ struct PushOptions {
     std::uint16_t storage_port = 8081;
 };
 
+[[nodiscard]] aistore::metadata::ChunkingStrategy parse_chunking_strategy(std::string_view text) {
+    if (text == "fixed-size") {
+        return aistore::metadata::ChunkingStrategy::FixedSize;
+    }
+
+    if (text == "fastcdc") {
+        return aistore::metadata::ChunkingStrategy::FastCdc;
+    }
+
+    throw CliUsageError{"--chunking-strategy must be fixed-size or fastcdc"};
+}
+
 [[nodiscard]] PushOptions parse_push_options(int argc, char** argv) {
     std::optional<aistore::metadata::UuidV7> artifact_id;
     std::optional<aistore::metadata::UuidV7> session_id;
     std::filesystem::path file_path;
     std::string storage_node_id;
+    aistore::metadata::ChunkingStrategy chunking_strategy = aistore::metadata::ChunkingStrategy::FixedSize;
     std::uint64_t chunk_size_bytes = 4194304ULL;
+    std::uint64_t min_chunk_size_bytes = 2097152ULL;
+    std::uint64_t avg_chunk_size_bytes = 4194304ULL;
+    std::uint64_t max_chunk_size_bytes = 8388608ULL;
     std::optional<std::string> parent_version_id;
     aistore::metadata::UploadSession::ImmutableMetadata immutable_metadata;
     std::string metadata_address = "127.0.0.1";
@@ -246,7 +275,11 @@ struct PushOptions {
     bool has_artifact_id = false;
     bool has_storage_node_id = false;
     bool has_session_id = false;
+    bool has_chunking_strategy = false;
     bool has_chunk_size = false;
+    bool has_min_chunk_size = false;
+    bool has_avg_chunk_size = false;
+    bool has_max_chunk_size = false;
     bool has_parent_version = false;
     bool has_metadata_address = false;
     bool has_metadata_port = false;
@@ -303,10 +336,41 @@ struct PushOptions {
             continue;
         }
 
+        if (arg == "--chunking-strategy") {
+            require_unset(has_chunking_strategy, "--chunking-strategy");
+            has_chunking_strategy = true;
+            chunking_strategy = parse_chunking_strategy(next_arg(argc, argv, index, "--chunking-strategy"));
+            continue;
+        }
+
         if (arg == "--chunk-size") {
             require_unset(has_chunk_size, "--chunk-size");
             has_chunk_size = true;
             chunk_size_bytes = parse_strict_u64(next_arg(argc, argv, index, "--chunk-size"), "--chunk-size");
+            continue;
+        }
+
+        if (arg == "--min-chunk-size") {
+            require_unset(has_min_chunk_size, "--min-chunk-size");
+            has_min_chunk_size = true;
+            min_chunk_size_bytes =
+                parse_strict_u64(next_arg(argc, argv, index, "--min-chunk-size"), "--min-chunk-size");
+            continue;
+        }
+
+        if (arg == "--avg-chunk-size") {
+            require_unset(has_avg_chunk_size, "--avg-chunk-size");
+            has_avg_chunk_size = true;
+            avg_chunk_size_bytes =
+                parse_strict_u64(next_arg(argc, argv, index, "--avg-chunk-size"), "--avg-chunk-size");
+            continue;
+        }
+
+        if (arg == "--max-chunk-size") {
+            require_unset(has_max_chunk_size, "--max-chunk-size");
+            has_max_chunk_size = true;
+            max_chunk_size_bytes =
+                parse_strict_u64(next_arg(argc, argv, index, "--max-chunk-size"), "--max-chunk-size");
             continue;
         }
 
@@ -378,11 +442,33 @@ struct PushOptions {
 
     validate_storage_node_id(storage_node_id);
 
-    if (chunk_size_bytes == 0ULL) {
-        throw CliUsageError{"--chunk-size must be greater than 0"};
-    }
-    if (chunk_size_bytes > aistore::push::PushEngine::kMaxM4ChunkSize) {
-        throw CliUsageError{"--chunk-size exceeds maximum supported chunk size"};
+    const bool has_fastcdc_flag = has_min_chunk_size || has_avg_chunk_size || has_max_chunk_size;
+
+    if (chunking_strategy == aistore::metadata::ChunkingStrategy::FixedSize) {
+        if (has_fastcdc_flag) {
+            throw CliUsageError{"FastCDC chunk size flags are not valid with fixed-size chunking strategy"};
+        }
+
+        if (chunk_size_bytes == 0ULL) {
+            throw CliUsageError{"--chunk-size must be greater than 0"};
+        }
+        if (chunk_size_bytes > aistore::push::PushEngine::kMaxM4ChunkSize) {
+            throw CliUsageError{"--chunk-size exceeds maximum supported chunk size"};
+        }
+    } else {
+        if (has_chunk_size) {
+            throw CliUsageError{"--chunk-size is not valid with fastcdc chunking strategy"};
+        }
+
+        try {
+            aistore::metadata::validate_fastcdc_parameters(aistore::metadata::FastCdcParameters{
+                .min_chunk_size_bytes = min_chunk_size_bytes,
+                .avg_chunk_size_bytes = avg_chunk_size_bytes,
+                .max_chunk_size_bytes = max_chunk_size_bytes,
+            });
+        } catch (const std::invalid_argument& error) {
+            throw CliUsageError{error.what()};
+        }
     }
 
     validate_numeric_ip(metadata_address, "--metadata-address");
@@ -397,7 +483,11 @@ struct PushOptions {
         .artifact_id = std::move(*artifact_id),
         .storage_node_id = std::move(storage_node_id),
         .session_id = std::move(*session_id),
+        .chunking_strategy = chunking_strategy,
         .chunk_size_bytes = chunk_size_bytes,
+        .min_chunk_size_bytes = min_chunk_size_bytes,
+        .avg_chunk_size_bytes = avg_chunk_size_bytes,
+        .max_chunk_size_bytes = max_chunk_size_bytes,
         .parent_version_id = std::move(parent_version_id),
         .immutable_metadata = std::move(immutable_metadata),
         .metadata_address = std::move(metadata_address),
@@ -542,12 +632,49 @@ struct PullOptions {
 
 [[nodiscard]] bool creation_identity_matches(const aistore::metadata::UploadSession& requested,
                                              const aistore::metadata::UploadSession& existing) {
-    return existing.artifact_id() == requested.artifact_id() &&
-           existing.target_node_id() == requested.target_node_id() &&
-           existing.chunking_strategy() == requested.chunking_strategy() &&
-           existing.chunk_size_bytes() == requested.chunk_size_bytes() &&
-           existing.parent_version_id() == requested.parent_version_id() &&
-           existing.immutable_metadata() == requested.immutable_metadata();
+    if (existing.artifact_id() != requested.artifact_id() || existing.target_node_id() != requested.target_node_id() ||
+        existing.chunking_strategy() != requested.chunking_strategy() ||
+        existing.parent_version_id() != requested.parent_version_id() ||
+        existing.immutable_metadata() != requested.immutable_metadata()) {
+        return false;
+    }
+
+    if (requested.chunking_strategy() == aistore::metadata::ChunkingStrategy::FixedSize) {
+        return existing.fixed_chunk_size_bytes() == requested.fixed_chunk_size_bytes();
+    }
+
+    return existing.fastcdc_parameters() == requested.fastcdc_parameters();
+}
+
+[[nodiscard]] aistore::metadata::UploadSession build_push_session(const PushOptions& options) {
+    if (options.chunking_strategy == aistore::metadata::ChunkingStrategy::FixedSize) {
+        return aistore::metadata::UploadSession{
+            options.session_id,
+            options.artifact_id,
+            options.storage_node_id,
+            aistore::metadata::ChunkingStrategy::FixedSize,
+            options.chunk_size_bytes,
+            options.parent_version_id,
+            options.immutable_metadata,
+            aistore::metadata::UploadSessionState::Open,
+            std::nullopt,
+        };
+    }
+
+    return aistore::metadata::UploadSession{
+        options.session_id,
+        options.artifact_id,
+        options.storage_node_id,
+        aistore::metadata::FastCdcParameters{
+            .min_chunk_size_bytes = options.min_chunk_size_bytes,
+            .avg_chunk_size_bytes = options.avg_chunk_size_bytes,
+            .max_chunk_size_bytes = options.max_chunk_size_bytes,
+        },
+        options.parent_version_id,
+        options.immutable_metadata,
+        aistore::metadata::UploadSessionState::Open,
+        std::nullopt,
+    };
 }
 
 void emit_success_json(const std::string& target_node_id, const aistore::metadata::UuidV7& artifact_id,
@@ -626,17 +753,7 @@ void emit_pull_success_json(const aistore::pull::PullResult& result) {
 
         aistore::push::PushEngine push_engine{metadata_client, storage_client, options.storage_node_id};
 
-        const aistore::metadata::UploadSession session{
-            session_id,
-            artifact_id,
-            options.storage_node_id,
-            aistore::metadata::ChunkingStrategy::FixedSize,
-            options.chunk_size_bytes,
-            options.parent_version_id,
-            options.immutable_metadata,
-            aistore::metadata::UploadSessionState::Open,
-            std::nullopt,
-        };
+        const aistore::metadata::UploadSession session = build_push_session(options);
 
         std::optional<aistore::push::PreparedPush> prepared;
 

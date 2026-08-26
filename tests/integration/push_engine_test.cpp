@@ -21,6 +21,7 @@
 #include <utility>
 #include <vector>
 
+#include "aistore/chunking/fastcdc_chunker.hpp"
 #include "aistore/client/client_error.hpp"
 #include "aistore/client/metadata_client.hpp"
 #include "aistore/client/storage_node_client.hpp"
@@ -29,6 +30,7 @@
 #include "aistore/http/http_server.hpp"
 #include "aistore/metadata/artifact_model.hpp"
 #include "aistore/metadata/chunk_metadata.hpp"
+#include "aistore/metadata/chunking.hpp"
 #include "aistore/metadata/object_layout_descriptor.hpp"
 #include "aistore/metadata/postgres_metadata_repository.hpp"
 #include "aistore/metadata/storage_location.hpp"
@@ -40,6 +42,8 @@
 
 namespace {
 
+using aistore::chunking::ChunkBuffer;
+using aistore::chunking::FastCdcChunker;
 using aistore::client::MetadataClient;
 using aistore::client::RemoteApiError;
 using aistore::client::StorageNodeClient;
@@ -52,6 +56,7 @@ using aistore::http::HttpServerConfig;
 using aistore::metadata::Artifact;
 using aistore::metadata::ChunkingStrategy;
 using aistore::metadata::ChunkMetadata;
+using aistore::metadata::FastCdcParameters;
 using aistore::metadata::PostgresMetadataRepository;
 using aistore::metadata::StorageLocation;
 using aistore::metadata::StorageLocationState;
@@ -70,6 +75,45 @@ namespace beast_http = aistore::http::beast_http;
 constexpr std::uint64_t kMaxBodyBytes = 8ULL * 1024ULL * 1024ULL;
 constexpr std::string_view kTargetNode = "m4s4-target";
 constexpr std::string_view kOtherNode = "m4s4-other";
+
+constexpr FastCdcParameters kTestFastCdcParams{
+    .min_chunk_size_bytes = 64U,
+    .avg_chunk_size_bytes = 128U,
+    .max_chunk_size_bytes = 256U,
+};
+
+std::vector<std::byte> make_fastcdc_golden_fixture() {
+    std::vector<std::byte> fixture;
+    fixture.reserve(4096U);
+
+    for (std::size_t index = 0; index < 4096U; ++index) {
+        fixture.push_back(static_cast<std::byte>(index % 251U));
+    }
+
+    return fixture;
+}
+
+std::vector<ChunkBuffer> chunk_bytes_fastcdc(std::span<const std::byte> data, const FastCdcParameters& parameters) {
+    FastCdcChunker chunker{static_cast<std::size_t>(parameters.min_chunk_size_bytes),
+                           static_cast<std::size_t>(parameters.avg_chunk_size_bytes),
+                           static_cast<std::size_t>(parameters.max_chunk_size_bytes)};
+
+    std::vector<ChunkBuffer> chunks;
+    const auto collect = [&chunks](ChunkBuffer chunk) { chunks.push_back(std::move(chunk)); };
+
+    chunker.update(data, collect);
+    chunker.finalize(collect);
+    return chunks;
+}
+
+std::filesystem::path write_temp_bytes(const std::filesystem::path& directory, std::string_view name,
+                                       std::span<const std::byte> bytes) {
+    const std::filesystem::path path = directory / std::string{name};
+    std::ofstream output{path, std::ios::binary};
+    output.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+    output.close();
+    return path;
+}
 
 std::string test_database_connection_string() {
     const char* configured = std::getenv("AISTORE_TEST_DB_URL");
@@ -235,6 +279,18 @@ class PushEngineFixture : public ::testing::Test {
             session_id_,      artifact_id_, std::string{target_node}, ChunkingStrategy::FixedSize,
             chunk_size_bytes, std::nullopt, {{"source", "m4s4"}},     UploadSessionState::Open,
             std::nullopt};
+        (void)metadata_client_->create_upload_session(session);
+    }
+
+    void create_open_fastcdc_session(const FastCdcParameters& parameters, std::string_view target_node = kTargetNode) {
+        const UploadSession session{session_id_,
+                                    artifact_id_,
+                                    std::string{target_node},
+                                    parameters,
+                                    std::nullopt,
+                                    {{"source", "m6-fastcdc"}},
+                                    UploadSessionState::Open,
+                                    std::nullopt};
         (void)metadata_client_->create_upload_session(session);
     }
 
@@ -597,6 +653,163 @@ TEST(PushEngineRecoveryTest, PrepareCommittedRetryReconstructsDescriptorWithoutR
     EXPECT_EQ(refs[2].chunk_id, sha256_hex("EFGH"));
     EXPECT_EQ(prepared.layout_descriptor.object_id(), sha256_hex(contents));
     EXPECT_EQ(prepared.layout_descriptor.object().total_size(), 12U);
+}
+
+TEST_F(PushEngineFixture, PushesFastCdcFileAndBuildsVariableLayout) {
+    create_open_fastcdc_session(kTestFastCdcParams);
+    const std::vector<std::byte> fixture = make_fastcdc_golden_fixture();
+    const auto source = write_temp_bytes(source_dir_->path(), "fastcdc.bin", fixture);
+
+    const PreparedPush prepared = engine().push(PushRequest{.source_path = source, .session_id = session_id_});
+
+    EXPECT_EQ(prepared.stats.bytes_read, fixture.size());
+    EXPECT_EQ(prepared.layout_descriptor.chunking_strategy(), ChunkingStrategy::FastCdc);
+    ASSERT_TRUE(prepared.layout_descriptor.fastcdc_parameters().has_value());
+    EXPECT_EQ(*prepared.layout_descriptor.fastcdc_parameters(), kTestFastCdcParams);
+
+    const auto expected_chunks = chunk_bytes_fastcdc(fixture, kTestFastCdcParams);
+    ASSERT_FALSE(expected_chunks.empty());
+    ASSERT_EQ(prepared.layout_descriptor.layout().chunks().size(), expected_chunks.size());
+
+    std::size_t non_final_count = 0;
+    std::size_t non_avg_count = 0;
+    for (std::size_t index = 0; index < expected_chunks.size(); ++index) {
+        const auto& ref = prepared.layout_descriptor.layout().chunks()[index];
+        const auto& expected = expected_chunks[index];
+
+        EXPECT_EQ(ref.offset, expected.offset);
+        EXPECT_EQ(ref.size, expected.bytes.size());
+        EXPECT_EQ(ref.chunk_id, sha256_hex(expected.bytes));
+        track_chunk(ref.chunk_id);
+
+        if (index + 1U < expected_chunks.size()) {
+            ++non_final_count;
+            if (ref.size != kTestFastCdcParams.avg_chunk_size_bytes) {
+                ++non_avg_count;
+            }
+        }
+    }
+
+    EXPECT_GT(non_final_count, 0U);
+    EXPECT_GT(non_avg_count, 0U);
+    EXPECT_EQ(prepared.stats.put_requests, prepared.stats.unique_chunks);
+}
+
+TEST_F(PushEngineFixture, FastCdcPushReusesKnownChunks) {
+    create_open_fastcdc_session(kTestFastCdcParams);
+    const std::vector<std::byte> fixture = make_fastcdc_golden_fixture();
+    const std::vector<ChunkBuffer> expected_chunks = chunk_bytes_fastcdc(fixture, kTestFastCdcParams);
+    ASSERT_GE(expected_chunks.size(), 2U);
+
+    const std::string chunk_id = sha256_hex(expected_chunks.front().bytes);
+    track_chunk(chunk_id);
+
+    repository_->register_chunks(
+        {ChunkMetadata{.chunk_id = chunk_id, .size_bytes = expected_chunks.front().bytes.size()}});
+    chunk_store_->put(chunk_id, expected_chunks.front().bytes);
+    repository_->register_storage_location(StorageLocation{
+        .chunk_id = chunk_id,
+        .node_id = std::string{kTargetNode},
+        .storage_path = std::string{"/v1/chunks/"} + chunk_id,
+        .state = StorageLocationState::Available,
+    });
+
+    const auto source = write_temp_bytes(source_dir_->path(), "fastcdc-reuse.bin", fixture);
+    const PreparedPush prepared = engine().push(PushRequest{.source_path = source, .session_id = session_id_});
+
+    EXPECT_EQ(prepared.stats.verified_target_chunks, 1U);
+    EXPECT_LT(prepared.stats.put_requests, prepared.stats.unique_chunks);
+}
+
+TEST(PushEngineRecoveryTest, FastCdcCommittedRetryReconstructsExactDescriptorWithoutRemoteIo) {
+    MetadataClient unused_metadata{HttpClientConfig{
+        .endpoint = HttpEndpoint{.address = "127.0.0.1", .port = 1},
+    }};
+    StorageNodeClient unused_storage{HttpClientConfig{
+        .endpoint = HttpEndpoint{.address = "127.0.0.1", .port = 2},
+    }};
+
+    constexpr std::string_view kRecoveryNode = "m6-fastcdc-recovery-node";
+    PushEngine engine{unused_metadata, unused_storage, std::string{kRecoveryNode}};
+
+    TemporaryDirectory source_dir;
+    const std::vector<std::byte> fixture = make_fastcdc_golden_fixture();
+    const auto source = write_temp_bytes(source_dir.path(), "fastcdc-recovery.bin", fixture);
+
+    const UuidV7 session_id = UuidV7::generate();
+    const UuidV7 artifact_id = UuidV7::generate();
+    const std::string finalized_version_id = std::string(64, 'b');
+
+    const UploadSession committed_session{
+        session_id,   artifact_id, std::string{kRecoveryNode},    kTestFastCdcParams,
+        std::nullopt, {},          UploadSessionState::Committed, finalized_version_id};
+
+    const PreparedPush prepared =
+        engine.prepare_committed_retry(PushRequest{.source_path = source, .session_id = session_id}, committed_session);
+
+    EXPECT_EQ(prepared.session_id, session_id);
+    EXPECT_EQ(prepared.stats.bytes_read, fixture.size());
+    EXPECT_EQ(prepared.stats.put_requests, 0U);
+    EXPECT_EQ(prepared.stats.verified_target_chunks, 0U);
+    EXPECT_EQ(prepared.stats.repaired_target_chunks, 0U);
+    EXPECT_EQ(prepared.stats.bytes_sent_to_storage, 0U);
+    EXPECT_EQ(prepared.layout_descriptor.chunking_strategy(), ChunkingStrategy::FastCdc);
+    ASSERT_TRUE(prepared.layout_descriptor.fastcdc_parameters().has_value());
+    EXPECT_EQ(*prepared.layout_descriptor.fastcdc_parameters(), kTestFastCdcParams);
+
+    const auto expected_chunks = chunk_bytes_fastcdc(fixture, kTestFastCdcParams);
+    const auto& refs = prepared.layout_descriptor.layout().chunks();
+    ASSERT_EQ(refs.size(), expected_chunks.size());
+
+    for (std::size_t index = 0; index < refs.size(); ++index) {
+        EXPECT_EQ(refs[index].offset, expected_chunks[index].offset);
+        EXPECT_EQ(refs[index].size, expected_chunks[index].bytes.size());
+        EXPECT_EQ(refs[index].chunk_id, sha256_hex(expected_chunks[index].bytes));
+    }
+
+    EXPECT_EQ(prepared.layout_descriptor.object_id(), sha256_hex(fixture));
+    EXPECT_EQ(prepared.layout_descriptor.object().total_size(), fixture.size());
+}
+
+TEST_F(PushEngineFixture, FastCdcPushRemainsOnePassAndBounded) {
+    create_open_fastcdc_session(kTestFastCdcParams);
+    const std::vector<std::byte> fixture = make_fastcdc_golden_fixture();
+    const auto source = write_temp_bytes(source_dir_->path(), "fastcdc-bounded.bin", fixture);
+
+    std::atomic<int> in_flight{0};
+    std::atomic<int> max_in_flight{0};
+
+    RunningHttpServer instrumented_storage{[&](const HttpRequest& request) {
+        if (request.method() == beast_http::verb::put) {
+            const int current = in_flight.fetch_add(1, std::memory_order_relaxed) + 1;
+            int observed_max = max_in_flight.load(std::memory_order_relaxed);
+            while (current > observed_max &&
+                   !max_in_flight.compare_exchange_weak(observed_max, current, std::memory_order_relaxed)) {
+            }
+
+            HttpResponse response = storage_service_->handle_request(request);
+            in_flight.fetch_sub(1, std::memory_order_relaxed);
+            return response;
+        }
+
+        return storage_service_->handle_request(request);
+    }};
+
+    StorageNodeClient instrumented_client{HttpClientConfig{
+        .endpoint = HttpEndpoint{.address = "127.0.0.1", .port = instrumented_storage.port()},
+    }};
+    PushEngine instrumented_engine{*metadata_client_, instrumented_client, std::string{kTargetNode}};
+
+    const PreparedPush prepared =
+        instrumented_engine.push(PushRequest{.source_path = source, .session_id = session_id_});
+
+    for (const auto& ref : prepared.layout_descriptor.layout().chunks()) {
+        track_chunk(ref.chunk_id);
+    }
+
+    EXPECT_EQ(prepared.stats.bytes_read, fixture.size());
+    EXPECT_LE(max_in_flight.load(), static_cast<int>(PushEngine::kWorkerCount));
+    EXPECT_LE(max_in_flight.load(), static_cast<int>(PushEngine::kQueueCapacity));
 }
 
 }  // namespace

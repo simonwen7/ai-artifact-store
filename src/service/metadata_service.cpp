@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "aistore/metadata/chunk_metadata.hpp"
+#include "aistore/metadata/chunking.hpp"
 #include "aistore/metadata/finalize_upload.hpp"
 #include "aistore/metadata/object.hpp"
 #include "aistore/metadata/object_layout.hpp"
@@ -157,13 +158,62 @@ aistore::http::HttpResponse make_method_not_allowed(const aistore::http::HttpReq
     throw std::logic_error("unsupported upload session state");
 }
 
-[[nodiscard]] std::string_view chunking_strategy_to_string(aistore::metadata::ChunkingStrategy strategy) {
-    switch (strategy) {
-        case aistore::metadata::ChunkingStrategy::FixedSize:
-            return "fixed-size";
+[[nodiscard]] boost::json::object chunking_parameters_to_json(const aistore::metadata::UploadSession& session) {
+    if (session.chunking_strategy() == aistore::metadata::ChunkingStrategy::FixedSize) {
+        return boost::json::object{
+            {"chunk_size_bytes", session.chunk_size_bytes()},
+        };
     }
 
-    throw std::logic_error("unsupported chunking strategy");
+    const std::optional<aistore::metadata::FastCdcParameters> optional_parameters = session.fastcdc_parameters();
+
+    if (!optional_parameters.has_value()) {
+        throw std::logic_error("FastCDC upload session is missing FastCDC parameters");
+    }
+
+    const aistore::metadata::FastCdcParameters& parameters = *optional_parameters;
+
+    return boost::json::object{
+        {"min_chunk_size_bytes", parameters.min_chunk_size_bytes},
+        {"avg_chunk_size_bytes", parameters.avg_chunk_size_bytes},
+        {"max_chunk_size_bytes", parameters.max_chunk_size_bytes},
+    };
+}
+
+[[nodiscard]] boost::json::object chunking_parameters_to_json(
+    const aistore::metadata::ObjectLayoutDescriptor& descriptor) {
+    if (descriptor.chunking_strategy() == aistore::metadata::ChunkingStrategy::FixedSize) {
+        return boost::json::object{};
+    }
+
+    const std::optional<aistore::metadata::FastCdcParameters> optional_parameters = descriptor.fastcdc_parameters();
+
+    if (!optional_parameters.has_value()) {
+        throw std::logic_error("FastCDC object layout descriptor is missing FastCDC parameters");
+    }
+
+    const aistore::metadata::FastCdcParameters& parameters = *optional_parameters;
+
+    return boost::json::object{
+        {"min_chunk_size_bytes", parameters.min_chunk_size_bytes},
+        {"avg_chunk_size_bytes", parameters.avg_chunk_size_bytes},
+        {"max_chunk_size_bytes", parameters.max_chunk_size_bytes},
+    };
+}
+
+[[nodiscard]] bool json_object_has_exact_keys(const boost::json::object& object,
+                                              std::initializer_list<std::string_view> keys) {
+    if (object.size() != keys.size()) {
+        return false;
+    }
+
+    for (const std::string_view key : keys) {
+        if (!object.contains(key)) {
+            return false;
+        }
+    }
+
+    return true;
 }
 
 [[nodiscard]] boost::json::object upload_session_to_json(const aistore::metadata::UploadSession& session) {
@@ -177,8 +227,8 @@ aistore::http::HttpResponse make_method_not_allowed(const aistore::http::HttpReq
         {"session_id", session.session_id().str()},
         {"artifact_id", session.artifact_id().str()},
         {"target_node_id", session.target_node_id()},
-        {"chunking_strategy", chunking_strategy_to_string(session.chunking_strategy())},
-        {"chunk_size_bytes", session.chunk_size_bytes()},
+        {"chunking_strategy", aistore::metadata::chunking_strategy_to_string(session.chunking_strategy())},
+        {"chunking_parameters", chunking_parameters_to_json(session)},
         {"immutable_metadata", std::move(metadata_object)},
         {"state", upload_session_state_to_string(session.state())},
     };
@@ -254,12 +304,45 @@ aistore::http::HttpResponse make_method_not_allowed(const aistore::http::HttpReq
     return number;
 }
 
+[[nodiscard]] std::optional<aistore::metadata::FastCdcParameters> parse_fastcdc_parameters_json(
+    const boost::json::object& object) {
+    if (!json_object_has_exact_keys(object, {"min_chunk_size_bytes", "avg_chunk_size_bytes", "max_chunk_size_bytes"})) {
+        return std::nullopt;
+    }
+
+    const std::optional<std::uint64_t> min_chunk_size_bytes =
+        extract_positive_uint64(object.at("min_chunk_size_bytes"));
+    const std::optional<std::uint64_t> avg_chunk_size_bytes =
+        extract_positive_uint64(object.at("avg_chunk_size_bytes"));
+    const std::optional<std::uint64_t> max_chunk_size_bytes =
+        extract_positive_uint64(object.at("max_chunk_size_bytes"));
+
+    if (!min_chunk_size_bytes.has_value() || !avg_chunk_size_bytes.has_value() || !max_chunk_size_bytes.has_value()) {
+        return std::nullopt;
+    }
+
+    const aistore::metadata::FastCdcParameters parameters{
+        .min_chunk_size_bytes = *min_chunk_size_bytes,
+        .avg_chunk_size_bytes = *avg_chunk_size_bytes,
+        .max_chunk_size_bytes = *max_chunk_size_bytes,
+    };
+
+    try {
+        aistore::metadata::validate_fastcdc_parameters(parameters);
+    } catch (const std::invalid_argument&) {
+        return std::nullopt;
+    }
+
+    return parameters;
+}
+
 [[nodiscard]] bool creation_fields_match(const aistore::metadata::UploadSession& existing,
                                          const aistore::metadata::UploadSession& requested) {
     return existing.session_id() == requested.session_id() && existing.artifact_id() == requested.artifact_id() &&
            existing.target_node_id() == requested.target_node_id() &&
            existing.chunking_strategy() == requested.chunking_strategy() &&
-           existing.chunk_size_bytes() == requested.chunk_size_bytes() &&
+           existing.fixed_chunk_size_bytes() == requested.fixed_chunk_size_bytes() &&
+           existing.fastcdc_parameters() == requested.fastcdc_parameters() &&
            existing.parent_version_id() == requested.parent_version_id() &&
            existing.immutable_metadata() == requested.immutable_metadata() &&
            existing.state() == aistore::metadata::UploadSessionState::Open &&
@@ -477,7 +560,8 @@ struct ParsedRestorePlanRoute {
         {"object_id", descriptor.object_id()},
         {"total_size_bytes", descriptor.object().total_size()},
         {"layout_id", descriptor.layout_id()},
-        {"chunking_strategy", "fixed-size"},
+        {"chunking_strategy", aistore::metadata::chunking_strategy_to_string(descriptor.chunking_strategy())},
+        {"chunking_parameters", chunking_parameters_to_json(descriptor)},
         {"chunk_count", chunks.size()},
         {"chunks", std::move(chunks)},
     };
@@ -545,8 +629,9 @@ struct ParsedRestorePlanRoute {
     const boost::json::object& body = parsed.as_object();
 
     if (body.size() != 7U || !body.contains("session_id") || !body.contains("artifact_id") ||
-        !body.contains("target_node_id") || !body.contains("chunking_strategy") || !body.contains("chunk_size_bytes") ||
-        !body.contains("parent_version_id") || !body.contains("immutable_metadata")) {
+        !body.contains("target_node_id") || !body.contains("chunking_strategy") ||
+        !body.contains("chunking_parameters") || !body.contains("parent_version_id") ||
+        !body.contains("immutable_metadata")) {
         return make_json_response(request, beast_http::status::bad_request,
                                   boost::json::object{
                                       {"error", "invalid_request"},
@@ -555,7 +640,7 @@ struct ParsedRestorePlanRoute {
 
     if (!body.at("session_id").is_string() || !body.at("artifact_id").is_string() ||
         !body.at("target_node_id").is_string() || !body.at("chunking_strategy").is_string() ||
-        !body.at("immutable_metadata").is_object()) {
+        !body.at("chunking_parameters").is_object() || !body.at("immutable_metadata").is_object()) {
         return make_json_response(request, beast_http::status::bad_request,
                                   boost::json::object{
                                       {"error", "invalid_request"},
@@ -563,21 +648,55 @@ struct ParsedRestorePlanRoute {
     }
 
     const std::string chunking_strategy{body.at("chunking_strategy").as_string()};
+    const boost::json::object& chunking_parameters = body.at("chunking_parameters").as_object();
 
-    if (chunking_strategy != "fixed-size") {
+    std::optional<aistore::metadata::ChunkingStrategy> parsed_strategy;
+
+    if (chunking_strategy == "fixed-size") {
+        parsed_strategy = aistore::metadata::ChunkingStrategy::FixedSize;
+    } else if (chunking_strategy == "fastcdc") {
+        parsed_strategy = aistore::metadata::ChunkingStrategy::FastCdc;
+    } else {
         return make_json_response(request, beast_http::status::bad_request,
                                   boost::json::object{
                                       {"error", "invalid_request"},
                                   });
     }
 
-    const std::optional<std::uint64_t> chunk_size_bytes = extract_positive_uint64(body.at("chunk_size_bytes"));
+    std::optional<std::uint64_t> fixed_chunk_size_bytes;
+    std::optional<aistore::metadata::FastCdcParameters> fastcdc_parameters;
+    std::uint64_t resolved_fixed_chunk_size_bytes = 0;
+    aistore::metadata::FastCdcParameters resolved_fastcdc_parameters{};
 
-    if (!chunk_size_bytes.has_value()) {
-        return make_json_response(request, beast_http::status::bad_request,
-                                  boost::json::object{
-                                      {"error", "invalid_request"},
-                                  });
+    if (*parsed_strategy == aistore::metadata::ChunkingStrategy::FixedSize) {
+        if (!json_object_has_exact_keys(chunking_parameters, {"chunk_size_bytes"})) {
+            return make_json_response(request, beast_http::status::bad_request,
+                                      boost::json::object{
+                                          {"error", "invalid_request"},
+                                      });
+        }
+
+        fixed_chunk_size_bytes = extract_positive_uint64(chunking_parameters.at("chunk_size_bytes"));
+
+        if (!fixed_chunk_size_bytes.has_value()) {
+            return make_json_response(request, beast_http::status::bad_request,
+                                      boost::json::object{
+                                          {"error", "invalid_request"},
+                                      });
+        }
+
+        resolved_fixed_chunk_size_bytes = *fixed_chunk_size_bytes;
+    } else {
+        fastcdc_parameters = parse_fastcdc_parameters_json(chunking_parameters);
+
+        if (!fastcdc_parameters.has_value()) {
+            return make_json_response(request, beast_http::status::bad_request,
+                                      boost::json::object{
+                                          {"error", "invalid_request"},
+                                      });
+        }
+
+        resolved_fastcdc_parameters = *fastcdc_parameters;
     }
 
     std::optional<std::string> parent_version_id;
@@ -611,10 +730,19 @@ struct ParsedRestorePlanRoute {
     try {
         aistore::metadata::UuidV7 session_id{std::string{body.at("session_id").as_string()}};
         aistore::metadata::UuidV7 artifact_id{std::string{body.at("artifact_id").as_string()}};
-        requested.emplace(
-            std::move(session_id), std::move(artifact_id), std::string{body.at("target_node_id").as_string()},
-            aistore::metadata::ChunkingStrategy::FixedSize, *chunk_size_bytes, std::move(parent_version_id),
-            std::move(immutable_metadata), aistore::metadata::UploadSessionState::Open, std::nullopt);
+
+        if (*parsed_strategy == aistore::metadata::ChunkingStrategy::FixedSize) {
+            requested.emplace(std::move(session_id), std::move(artifact_id),
+                              std::string{body.at("target_node_id").as_string()},
+                              aistore::metadata::ChunkingStrategy::FixedSize, resolved_fixed_chunk_size_bytes,
+                              std::move(parent_version_id), std::move(immutable_metadata),
+                              aistore::metadata::UploadSessionState::Open, std::nullopt);
+        } else {
+            requested.emplace(std::move(session_id), std::move(artifact_id),
+                              std::string{body.at("target_node_id").as_string()}, resolved_fastcdc_parameters,
+                              std::move(parent_version_id), std::move(immutable_metadata),
+                              aistore::metadata::UploadSessionState::Open, std::nullopt);
+        }
     } catch (const std::invalid_argument&) {
         return make_json_response(request, beast_http::status::bad_request,
                                   boost::json::object{
@@ -758,9 +886,10 @@ struct ParsedRestorePlanRoute {
 
     const boost::json::object& body = parsed.as_object();
 
-    if (body.size() != 4U || !body.contains("object_id") || !body.contains("total_size_bytes") ||
-        !body.contains("chunking_strategy") || !body.contains("chunks") || !body.at("object_id").is_string() ||
-        !body.at("chunking_strategy").is_string() || !body.at("chunks").is_array()) {
+    if (body.size() != 5U || !body.contains("object_id") || !body.contains("total_size_bytes") ||
+        !body.contains("chunking_strategy") || !body.contains("chunking_parameters") || !body.contains("chunks") ||
+        !body.at("object_id").is_string() || !body.at("chunking_strategy").is_string() ||
+        !body.at("chunking_parameters").is_object() || !body.at("chunks").is_array()) {
         return make_json_response(request, beast_http::status::bad_request,
                                   boost::json::object{
                                       {"error", "invalid_request"},
@@ -769,13 +898,50 @@ struct ParsedRestorePlanRoute {
 
     const std::string object_id{body.at("object_id").as_string()};
     const std::optional<std::uint64_t> total_size_bytes = extract_nonnegative_uint64(body.at("total_size_bytes"));
+    const std::string chunking_strategy{body.at("chunking_strategy").as_string()};
+    const boost::json::object& chunking_parameters = body.at("chunking_parameters").as_object();
 
-    if (!is_valid_chunk_id(object_id) || !total_size_bytes.has_value() ||
-        body.at("chunking_strategy").as_string() != "fixed-size") {
+    if (!is_valid_chunk_id(object_id) || !total_size_bytes.has_value()) {
         return make_json_response(request, beast_http::status::bad_request,
                                   boost::json::object{
                                       {"error", "invalid_request"},
                                   });
+    }
+
+    std::optional<aistore::metadata::ChunkingStrategy> parsed_strategy;
+
+    if (chunking_strategy == "fixed-size") {
+        parsed_strategy = aistore::metadata::ChunkingStrategy::FixedSize;
+    } else if (chunking_strategy == "fastcdc") {
+        parsed_strategy = aistore::metadata::ChunkingStrategy::FastCdc;
+    } else {
+        return make_json_response(request, beast_http::status::bad_request,
+                                  boost::json::object{
+                                      {"error", "invalid_request"},
+                                  });
+    }
+
+    std::optional<aistore::metadata::FastCdcParameters> finalize_fastcdc_parameters;
+    aistore::metadata::FastCdcParameters resolved_finalize_fastcdc_parameters{};
+
+    if (*parsed_strategy == aistore::metadata::ChunkingStrategy::FixedSize) {
+        if (!chunking_parameters.empty()) {
+            return make_json_response(request, beast_http::status::bad_request,
+                                      boost::json::object{
+                                          {"error", "invalid_request"},
+                                      });
+        }
+    } else {
+        finalize_fastcdc_parameters = parse_fastcdc_parameters_json(chunking_parameters);
+
+        if (!finalize_fastcdc_parameters.has_value()) {
+            return make_json_response(request, beast_http::status::bad_request,
+                                      boost::json::object{
+                                          {"error", "invalid_request"},
+                                      });
+        }
+
+        resolved_finalize_fastcdc_parameters = *finalize_fastcdc_parameters;
     }
 
     const boost::json::array& chunks_json = body.at("chunks").as_array();
@@ -813,17 +979,23 @@ struct ParsedRestorePlanRoute {
 
         chunks.push_back(aistore::metadata::ChunkRef{
             .chunk_id = chunk_id,
-            .offset = *offset,
-            .size = *size_bytes,
+            .offset = offset.value(),
+            .size = size_bytes.value(),
         });
     }
 
     std::optional<aistore::metadata::ObjectLayoutDescriptor> descriptor;
 
     try {
-        descriptor.emplace(aistore::metadata::Object{object_id, *total_size_bytes},
-                           aistore::metadata::ChunkingStrategy::FixedSize,
-                           aistore::metadata::ObjectLayout{std::move(chunks)});
+        if (*parsed_strategy == aistore::metadata::ChunkingStrategy::FixedSize) {
+            descriptor.emplace(aistore::metadata::Object{object_id, total_size_bytes.value()},
+                               aistore::metadata::ChunkingStrategy::FixedSize,
+                               aistore::metadata::ObjectLayout{std::move(chunks)});
+        } else {
+            descriptor.emplace(aistore::metadata::Object{object_id, total_size_bytes.value()},
+                               resolved_finalize_fastcdc_parameters,
+                               aistore::metadata::ObjectLayout{std::move(chunks)});
+        }
     } catch (const std::invalid_argument&) {
         return make_json_response(request, beast_http::status::bad_request,
                                   boost::json::object{

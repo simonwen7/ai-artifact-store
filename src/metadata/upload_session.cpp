@@ -6,26 +6,41 @@
 namespace aistore::metadata {
 
 UploadSession::UploadSession(UuidV7 session_id, UuidV7 artifact_id, std::string target_node_id,
-                             ChunkingStrategy chunking_strategy, std::uint64_t chunk_size_bytes,
+                             ChunkingStrategy chunking_strategy, std::optional<std::uint64_t> fixed_chunk_size_bytes,
+                             std::optional<FastCdcParameters> fastcdc_parameters,
                              std::optional<std::string> parent_version_id, ImmutableMetadata immutable_metadata,
                              UploadSessionState state, std::optional<std::string> finalized_version_id)
     : session_id_(std::move(session_id)),
       artifact_id_(std::move(artifact_id)),
       target_node_id_(std::move(target_node_id)),
       chunking_strategy_(chunking_strategy),
-      chunk_size_bytes_(chunk_size_bytes),
+      fixed_chunk_size_bytes_(fixed_chunk_size_bytes),
+      fastcdc_parameters_(fastcdc_parameters),
       parent_version_id_(std::move(parent_version_id)),
       immutable_metadata_(std::move(immutable_metadata)),
       state_(state),
       finalized_version_id_(std::move(finalized_version_id)) {
     validate_node_id(target_node_id_);
 
-    if (chunk_size_bytes_ == 0U) {
-        throw std::invalid_argument("upload session chunk size must be greater than zero");
-    }
+    switch (chunking_strategy_) {
+        case ChunkingStrategy::FixedSize:
+            if (!fixed_chunk_size_bytes_.has_value() || *fixed_chunk_size_bytes_ == 0U) {
+                throw std::invalid_argument("upload session FixedSize chunk size must be greater than zero");
+            }
+            if (fastcdc_parameters_.has_value()) {
+                throw std::invalid_argument("upload session FixedSize must not carry FastCDC parameters");
+            }
+            break;
 
-    if (chunking_strategy_ != ChunkingStrategy::FixedSize) {
-        throw std::invalid_argument("upload session uses an unsupported chunking strategy");
+        case ChunkingStrategy::FastCdc:
+            if (fixed_chunk_size_bytes_.has_value()) {
+                throw std::invalid_argument("upload session FastCDC must not carry fixed chunk size");
+            }
+            if (!fastcdc_parameters_.has_value()) {
+                throw std::invalid_argument("upload session FastCDC requires FastCDC parameters");
+            }
+            validate_fastcdc_parameters(*fastcdc_parameters_);
+            break;
     }
 
     if (parent_version_id_.has_value()) {
@@ -59,6 +74,26 @@ UploadSession::UploadSession(UuidV7 session_id, UuidV7 artifact_id, std::string 
     }
 }
 
+UploadSession::UploadSession(UuidV7 session_id, UuidV7 artifact_id, std::string target_node_id,
+                             ChunkingStrategy chunking_strategy, std::uint64_t chunk_size_bytes,
+                             std::optional<std::string> parent_version_id, ImmutableMetadata immutable_metadata,
+                             UploadSessionState state, std::optional<std::string> finalized_version_id)
+    : UploadSession(std::move(session_id), std::move(artifact_id), std::move(target_node_id), chunking_strategy,
+                    std::optional<std::uint64_t>{chunk_size_bytes}, std::nullopt, std::move(parent_version_id),
+                    std::move(immutable_metadata), state, std::move(finalized_version_id)) {
+    if (chunking_strategy != ChunkingStrategy::FixedSize) {
+        throw std::invalid_argument("FixedSize UploadSession constructor requires FixedSize strategy");
+    }
+}
+
+UploadSession::UploadSession(UuidV7 session_id, UuidV7 artifact_id, std::string target_node_id,
+                             FastCdcParameters fastcdc_parameters, std::optional<std::string> parent_version_id,
+                             ImmutableMetadata immutable_metadata, UploadSessionState state,
+                             std::optional<std::string> finalized_version_id)
+    : UploadSession(std::move(session_id), std::move(artifact_id), std::move(target_node_id), ChunkingStrategy::FastCdc,
+                    std::nullopt, std::optional<FastCdcParameters>{fastcdc_parameters}, std::move(parent_version_id),
+                    std::move(immutable_metadata), state, std::move(finalized_version_id)) {}
+
 const UuidV7& UploadSession::session_id() const noexcept { return session_id_; }
 
 const UuidV7& UploadSession::artifact_id() const noexcept { return artifact_id_; }
@@ -67,7 +102,17 @@ const std::string& UploadSession::target_node_id() const noexcept { return targe
 
 ChunkingStrategy UploadSession::chunking_strategy() const noexcept { return chunking_strategy_; }
 
-std::uint64_t UploadSession::chunk_size_bytes() const noexcept { return chunk_size_bytes_; }
+std::optional<std::uint64_t> UploadSession::fixed_chunk_size_bytes() const noexcept { return fixed_chunk_size_bytes_; }
+
+std::optional<FastCdcParameters> UploadSession::fastcdc_parameters() const noexcept { return fastcdc_parameters_; }
+
+std::uint64_t UploadSession::chunk_size_bytes() const {
+    if (!fixed_chunk_size_bytes_.has_value()) {
+        throw std::logic_error("chunk_size_bytes() is only valid for FixedSize upload sessions");
+    }
+
+    return *fixed_chunk_size_bytes_;
+}
 
 const std::optional<std::string>& UploadSession::parent_version_id() const noexcept { return parent_version_id_; }
 

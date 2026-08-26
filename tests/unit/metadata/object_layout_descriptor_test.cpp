@@ -7,10 +7,13 @@
 #include <string>
 #include <vector>
 
+#include "aistore/metadata/chunking.hpp"
+
 namespace {
 
 using aistore::metadata::ChunkingStrategy;
 using aistore::metadata::ChunkRef;
+using aistore::metadata::FastCdcParameters;
 using aistore::metadata::Object;
 using aistore::metadata::ObjectLayout;
 using aistore::metadata::ObjectLayoutDescriptor;
@@ -222,6 +225,113 @@ TEST(ObjectLayoutDescriptorTest, DifferentObjectIdentityChangesLayoutId) {
     };
 
     EXPECT_NE(first.layout_id(), second.layout_id());
+}
+
+TEST(ObjectLayoutDescriptorTest, CanonicalizesKnownFastCdcLayout) {
+    const FastCdcParameters fastcdc_parameters{
+        .min_chunk_size_bytes = 64,
+        .avg_chunk_size_bytes = 256,
+        .max_chunk_size_bytes = 1024,
+    };
+
+    const ObjectLayoutDescriptor descriptor{
+        Object{
+            kObjectA,
+            128,
+        },
+        fastcdc_parameters,
+        ObjectLayout{
+            {
+                ChunkRef{
+                    .chunk_id = kChunkA,
+                    .offset = 0,
+                    .size = 128,
+                },
+            },
+        },
+    };
+
+    EXPECT_EQ(bytes_to_hex(descriptor.canonical_bytes()),
+              "414953544f52455f4c41594f5554"
+              "00000001"
+              "11111111111111111111111111111111"
+              "11111111111111111111111111111111"
+              "02"
+              "0000000000000040"
+              "0000000000000100"
+              "0000000000000400"
+              "0000000000000080"
+              "0000000000000001"
+              "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+              "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+              "0000000000000000"
+              "0000000000000080");
+
+    EXPECT_EQ(descriptor.layout_id(),
+              "8cfa747f1291b7491bb11e922b72a4c0"
+              "0103bc66473352f3004d573abb2d9ea2");
+}
+
+TEST(ObjectLayoutDescriptorTest, DifferentFastCdcParametersChangeLayoutId) {
+    const Object object{
+        kObjectA,
+        128,
+    };
+
+    const ObjectLayout layout{
+        {
+            ChunkRef{
+                .chunk_id = kChunkA,
+                .offset = 0,
+                .size = 128,
+            },
+        },
+    };
+
+    const ObjectLayoutDescriptor first{
+        object,
+        FastCdcParameters{
+            .min_chunk_size_bytes = 64,
+            .avg_chunk_size_bytes = 256,
+            .max_chunk_size_bytes = 1024,
+        },
+        layout,
+    };
+
+    const ObjectLayoutDescriptor second{
+        object,
+        FastCdcParameters{
+            .min_chunk_size_bytes = 128,
+            .avg_chunk_size_bytes = 512,
+            .max_chunk_size_bytes = 2048,
+        },
+        layout,
+    };
+
+    EXPECT_NE(first.layout_id(), second.layout_id());
+}
+
+TEST(ObjectLayoutDescriptorTest, FixedSizeGoldenIdentityRemainsUnchanged) {
+    const ObjectLayoutDescriptor descriptor{
+        Object{
+            kObjectA,
+            4,
+        },
+        ChunkingStrategy::FixedSize,
+        ObjectLayout{
+            {
+                ChunkRef{
+                    .chunk_id = kChunkA,
+                    .offset = 0,
+                    .size = 4,
+                },
+            },
+        },
+    };
+
+    EXPECT_EQ(descriptor.layout_id(),
+              "c369806353f848a91d93e88f63fc99ef"
+              "190265ccd7eaba94187aa7d783786be8");
 }
 
 }  // namespace

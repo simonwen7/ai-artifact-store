@@ -8,7 +8,7 @@
 #include <string_view>
 
 #include "aistore/metadata/artifact_model.hpp"
-#include "aistore/metadata/object_layout_descriptor.hpp"
+#include "aistore/metadata/chunking.hpp"
 #include "aistore/metadata/uuid_v7.hpp"
 
 namespace aistore::metadata {
@@ -28,6 +28,11 @@ class UploadSession {
                   ImmutableMetadata immutable_metadata, UploadSessionState state,
                   std::optional<std::string> finalized_version_id);
 
+    UploadSession(UuidV7 session_id, UuidV7 artifact_id, std::string target_node_id,
+                  FastCdcParameters fastcdc_parameters, std::optional<std::string> parent_version_id,
+                  ImmutableMetadata immutable_metadata, UploadSessionState state,
+                  std::optional<std::string> finalized_version_id);
+
     [[nodiscard]] const UuidV7& session_id() const noexcept;
 
     [[nodiscard]] const UuidV7& artifact_id() const noexcept;
@@ -36,7 +41,12 @@ class UploadSession {
 
     [[nodiscard]] ChunkingStrategy chunking_strategy() const noexcept;
 
-    [[nodiscard]] std::uint64_t chunk_size_bytes() const noexcept;
+    [[nodiscard]] std::optional<std::uint64_t> fixed_chunk_size_bytes() const noexcept;
+
+    [[nodiscard]] std::optional<FastCdcParameters> fastcdc_parameters() const noexcept;
+
+    // Convenience for FixedSize call sites; throws if strategy is not FixedSize.
+    [[nodiscard]] std::uint64_t chunk_size_bytes() const;
 
     [[nodiscard]] const std::optional<std::string>& parent_version_id() const noexcept;
 
@@ -47,6 +57,12 @@ class UploadSession {
     [[nodiscard]] const std::optional<std::string>& finalized_version_id() const noexcept;
 
    private:
+    UploadSession(UuidV7 session_id, UuidV7 artifact_id, std::string target_node_id, ChunkingStrategy chunking_strategy,
+                  std::optional<std::uint64_t> fixed_chunk_size_bytes,
+                  std::optional<FastCdcParameters> fastcdc_parameters, std::optional<std::string> parent_version_id,
+                  ImmutableMetadata immutable_metadata, UploadSessionState state,
+                  std::optional<std::string> finalized_version_id);
+
     static void validate_node_id(std::string_view node_id);
 
     static void validate_content_id(const std::string& content_id, const char* field_name);
@@ -57,7 +73,8 @@ class UploadSession {
     UuidV7 artifact_id_;
     std::string target_node_id_;
     ChunkingStrategy chunking_strategy_;
-    std::uint64_t chunk_size_bytes_;
+    std::optional<std::uint64_t> fixed_chunk_size_bytes_;
+    std::optional<FastCdcParameters> fastcdc_parameters_;
     std::optional<std::string> parent_version_id_;
     ImmutableMetadata immutable_metadata_;
     UploadSessionState state_;

@@ -10,9 +10,9 @@ The project uses AI/ML workloads as the design context, while storage systems en
 
 ## Current Status
 
-**Milestone 5 — Pull / Restore**
+**Milestone 6 — Content-Defined Chunking**
 
-The local content-addressed core, metadata model, push path, and production pull/restore path are in place through M5:
+The local content-addressed core, metadata model, push path, pull/restore path, and FastCDC chunking dispatch are in place through M6:
 
 - content-addressed local CAS
 - Object / immutable layout model
@@ -29,6 +29,20 @@ The local content-addressed core, metadata model, push path, and production pull
 - resumable partial restore via `.aistore.<version_id>.part`
 - atomic publish (hard-link or rename)
 - production `aistore pull`
+- FastCDC content-defined chunking in PushEngine
+- FixedSize chunking still supported
+- strategy-specific UploadSession identity and committed retry
+- pull without chunking flags (layout-driven restore)
+
+Fixed-size chunking remains the default and is fully supported. FastCDC improves deduplication when similar content shifts inside large artifacts because chunk boundaries follow content rather than fixed offsets.
+
+Object IDs remain whole-object SHA-256 hashes and are independent of chunking strategy.
+
+Pull does not require chunking flags; restore uses the committed layout descriptor.
+
+FastCDC CLI defaults: min 2 MiB, avg 4 MiB, max 8 MiB.
+
+Benchmarking and production performance tuning are future polish; no production benchmark claims are made here.
 
 ## CLI
 
@@ -39,6 +53,8 @@ Default local endpoints:
 
 `--artifact-id` must already exist in metadata. Artifact creation is outside the push CLI.
 
+### Push (FixedSize)
+
 Example:
 
 ```bash
@@ -47,6 +63,25 @@ Example:
   --artifact-id <uuidv7> \
   --storage-node-id node-1
 ```
+
+Defaults: `--chunking-strategy fixed-size`, `--chunk-size 4194304`.
+
+### Push (FastCDC)
+
+Example:
+
+```bash
+./build/aistore push \
+  --file ./artifact.bin \
+  --artifact-id <uuidv7> \
+  --storage-node-id node-1 \
+  --chunking-strategy fastcdc \
+  --min-chunk-size 2097152 \
+  --avg-chunk-size 4194304 \
+  --max-chunk-size 8388608
+```
+
+FastCDC flags cannot be combined with `--chunk-size`. Fixed-size pushes cannot combine with FastCDC size flags.
 
 Rerunning with the same `--session-id` handles both:
 
@@ -110,7 +145,7 @@ Additional dependencies are introduced only when required by a milestone.
 - Multi-node storage and replication
 - AI-workload-aware lifecycle policies
 
-Items such as CDC, GC, replication, multi-node placement, and AI lifecycle policies are planned and not claimed as implemented.
+Items such as GC, replication, multi-node placement, and AI lifecycle policies are planned and not claimed as implemented.
 
 ## Development Philosophy
 

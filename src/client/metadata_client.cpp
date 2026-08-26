@@ -10,6 +10,7 @@
 #include <utility>
 
 #include "aistore/client/client_error.hpp"
+#include "aistore/metadata/chunking.hpp"
 #include "aistore/metadata/object.hpp"
 #include "aistore/metadata/object_layout.hpp"
 #include "aistore/metadata/object_layout_descriptor.hpp"
@@ -137,15 +138,6 @@ constexpr std::uint64_t kPostgresBigintMax = static_cast<std::uint64_t>(std::num
     return true;
 }
 
-[[nodiscard]] std::string_view chunking_strategy_to_string(aistore::metadata::ChunkingStrategy strategy) {
-    switch (strategy) {
-        case aistore::metadata::ChunkingStrategy::FixedSize:
-            return "fixed-size";
-    }
-
-    throw std::logic_error("unsupported chunking strategy");
-}
-
 [[nodiscard]] aistore::metadata::UploadSessionState upload_session_state_from_string(std::string_view state) {
     if (state == "open") {
         return aistore::metadata::UploadSessionState::Open;
@@ -178,6 +170,96 @@ constexpr std::uint64_t kPostgresBigintMax = static_cast<std::uint64_t>(std::num
     throw RemoteProtocolError{"chunk availability is invalid"};
 }
 
+[[nodiscard]] bool json_object_has_exact_keys(const boost::json::object& object,
+                                              std::initializer_list<std::string_view> keys) {
+    if (object.size() != keys.size()) {
+        return false;
+    }
+
+    for (const std::string_view key : keys) {
+        if (!object.contains(key)) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+[[nodiscard]] std::optional<aistore::metadata::FastCdcParameters> parse_fastcdc_parameters_json(
+    const boost::json::object& object) {
+    if (!json_object_has_exact_keys(object, {"min_chunk_size_bytes", "avg_chunk_size_bytes", "max_chunk_size_bytes"})) {
+        return std::nullopt;
+    }
+
+    const std::optional<std::uint64_t> min_chunk_size_bytes =
+        extract_positive_uint64(object.at("min_chunk_size_bytes"));
+    const std::optional<std::uint64_t> avg_chunk_size_bytes =
+        extract_positive_uint64(object.at("avg_chunk_size_bytes"));
+    const std::optional<std::uint64_t> max_chunk_size_bytes =
+        extract_positive_uint64(object.at("max_chunk_size_bytes"));
+
+    if (!min_chunk_size_bytes.has_value() || !avg_chunk_size_bytes.has_value() || !max_chunk_size_bytes.has_value()) {
+        return std::nullopt;
+    }
+
+    const aistore::metadata::FastCdcParameters parameters{
+        .min_chunk_size_bytes = *min_chunk_size_bytes,
+        .avg_chunk_size_bytes = *avg_chunk_size_bytes,
+        .max_chunk_size_bytes = *max_chunk_size_bytes,
+    };
+
+    try {
+        aistore::metadata::validate_fastcdc_parameters(parameters);
+    } catch (const std::invalid_argument&) {
+        return std::nullopt;
+    }
+
+    return parameters;
+}
+
+[[nodiscard]] boost::json::object chunking_parameters_to_json(const aistore::metadata::UploadSession& session) {
+    if (session.chunking_strategy() == aistore::metadata::ChunkingStrategy::FixedSize) {
+        return boost::json::object{
+            {"chunk_size_bytes", session.chunk_size_bytes()},
+        };
+    }
+
+    const std::optional<aistore::metadata::FastCdcParameters> optional_parameters = session.fastcdc_parameters();
+
+    if (!optional_parameters.has_value()) {
+        throw std::logic_error("FastCDC upload session is missing FastCDC parameters");
+    }
+
+    const aistore::metadata::FastCdcParameters& parameters = *optional_parameters;
+
+    return boost::json::object{
+        {"min_chunk_size_bytes", parameters.min_chunk_size_bytes},
+        {"avg_chunk_size_bytes", parameters.avg_chunk_size_bytes},
+        {"max_chunk_size_bytes", parameters.max_chunk_size_bytes},
+    };
+}
+
+[[nodiscard]] boost::json::object chunking_parameters_to_json(
+    const aistore::metadata::ObjectLayoutDescriptor& descriptor) {
+    if (descriptor.chunking_strategy() == aistore::metadata::ChunkingStrategy::FixedSize) {
+        return boost::json::object{};
+    }
+
+    const std::optional<aistore::metadata::FastCdcParameters> optional_parameters = descriptor.fastcdc_parameters();
+
+    if (!optional_parameters.has_value()) {
+        throw std::logic_error("FastCDC object layout descriptor is missing FastCDC parameters");
+    }
+
+    const aistore::metadata::FastCdcParameters& parameters = *optional_parameters;
+
+    return boost::json::object{
+        {"min_chunk_size_bytes", parameters.min_chunk_size_bytes},
+        {"avg_chunk_size_bytes", parameters.avg_chunk_size_bytes},
+        {"max_chunk_size_bytes", parameters.max_chunk_size_bytes},
+    };
+}
+
 [[nodiscard]] aistore::metadata::UploadSession parse_upload_session_json(const std::string& body) {
     boost::system::error_code parse_error;
     const boost::json::value parsed = boost::json::parse(body, parse_error);
@@ -190,7 +272,7 @@ constexpr std::uint64_t kPostgresBigintMax = static_cast<std::uint64_t>(std::num
 
     if (object.size() != 9U || !object.contains("session_id") || !object.contains("artifact_id") ||
         !object.contains("target_node_id") || !object.contains("chunking_strategy") ||
-        !object.contains("chunk_size_bytes") || !object.contains("parent_version_id") ||
+        !object.contains("chunking_parameters") || !object.contains("parent_version_id") ||
         !object.contains("immutable_metadata") || !object.contains("state") ||
         !object.contains("finalized_version_id")) {
         throw RemoteProtocolError{"upload session response has unexpected fields"};
@@ -198,21 +280,13 @@ constexpr std::uint64_t kPostgresBigintMax = static_cast<std::uint64_t>(std::num
 
     if (!object.at("session_id").is_string() || !object.at("artifact_id").is_string() ||
         !object.at("target_node_id").is_string() || !object.at("chunking_strategy").is_string() ||
-        !object.at("immutable_metadata").is_object() || !object.at("state").is_string()) {
+        !object.at("chunking_parameters").is_object() || !object.at("immutable_metadata").is_object() ||
+        !object.at("state").is_string()) {
         throw RemoteProtocolError{"upload session response field types are invalid"};
     }
 
     const std::string chunking_strategy{object.at("chunking_strategy").as_string()};
-
-    if (chunking_strategy != "fixed-size") {
-        throw RemoteProtocolError{"upload session chunking strategy is unsupported"};
-    }
-
-    const std::optional<std::uint64_t> chunk_size_bytes = extract_positive_uint64(object.at("chunk_size_bytes"));
-
-    if (!chunk_size_bytes.has_value()) {
-        throw RemoteProtocolError{"upload session chunk_size_bytes is invalid"};
-    }
+    const boost::json::object& chunking_parameters = object.at("chunking_parameters").as_object();
 
     std::optional<std::string> parent_version_id;
 
@@ -250,17 +324,54 @@ constexpr std::uint64_t kPostgresBigintMax = static_cast<std::uint64_t>(std::num
         const aistore::metadata::UploadSessionState state =
             upload_session_state_from_string(std::string{object.at("state").as_string()});
 
-        return aistore::metadata::UploadSession{
-            std::move(session_id),
-            std::move(artifact_id),
-            std::string{object.at("target_node_id").as_string()},
-            aistore::metadata::ChunkingStrategy::FixedSize,
-            *chunk_size_bytes,
-            std::move(parent_version_id),
-            std::move(immutable_metadata),
-            state,
-            std::move(finalized_version_id),
-        };
+        return [&]() {
+            if (chunking_strategy == "fixed-size") {
+                if (!json_object_has_exact_keys(chunking_parameters, {"chunk_size_bytes"})) {
+                    throw RemoteProtocolError{"upload session chunking_parameters are invalid"};
+                }
+
+                const std::optional<std::uint64_t> chunk_size_bytes =
+                    extract_positive_uint64(chunking_parameters.at("chunk_size_bytes"));
+
+                if (!chunk_size_bytes.has_value()) {
+                    throw RemoteProtocolError{"upload session chunk_size_bytes is invalid"};
+                }
+
+                return aistore::metadata::UploadSession{
+                    std::move(session_id),
+                    std::move(artifact_id),
+                    std::string{object.at("target_node_id").as_string()},
+                    aistore::metadata::ChunkingStrategy::FixedSize,
+                    *chunk_size_bytes,
+                    std::move(parent_version_id),
+                    std::move(immutable_metadata),
+                    state,
+                    std::move(finalized_version_id),
+                };
+            }
+
+            if (chunking_strategy != "fastcdc") {
+                throw RemoteProtocolError{"upload session chunking strategy is unsupported"};
+            }
+
+            const std::optional<aistore::metadata::FastCdcParameters> fastcdc_parameters =
+                parse_fastcdc_parameters_json(chunking_parameters);
+
+            if (!fastcdc_parameters.has_value()) {
+                throw RemoteProtocolError{"upload session chunking_parameters are invalid"};
+            }
+
+            return aistore::metadata::UploadSession{
+                std::move(session_id),
+                std::move(artifact_id),
+                std::string{object.at("target_node_id").as_string()},
+                *fastcdc_parameters,
+                std::move(parent_version_id),
+                std::move(immutable_metadata),
+                state,
+                std::move(finalized_version_id),
+            };
+        }();
     } catch (const RemoteProtocolError&) {
         throw;
     } catch (const std::exception&) {
@@ -279,8 +390,8 @@ constexpr std::uint64_t kPostgresBigintMax = static_cast<std::uint64_t>(std::num
         {"session_id", session.session_id().str()},
         {"artifact_id", session.artifact_id().str()},
         {"target_node_id", session.target_node_id()},
-        {"chunking_strategy", chunking_strategy_to_string(session.chunking_strategy())},
-        {"chunk_size_bytes", session.chunk_size_bytes()},
+        {"chunking_strategy", aistore::metadata::chunking_strategy_to_string(session.chunking_strategy())},
+        {"chunking_parameters", chunking_parameters_to_json(session)},
         {"immutable_metadata", std::move(metadata_object)},
     };
 
@@ -359,7 +470,8 @@ aistore::metadata::FinalizeUploadResult MetadataClient::finalize_upload(
     const std::string body = boost::json::serialize(boost::json::object{
         {"object_id", descriptor.object_id()},
         {"total_size_bytes", descriptor.object().total_size()},
-        {"chunking_strategy", "fixed-size"},
+        {"chunking_strategy", aistore::metadata::chunking_strategy_to_string(descriptor.chunking_strategy())},
+        {"chunking_parameters", chunking_parameters_to_json(descriptor)},
         {"chunks", std::move(chunks)},
     });
     const std::string target = std::string{"/v1/upload-sessions/"} + session_id.str() + "/finalize";
@@ -453,13 +565,14 @@ aistore::metadata::RestorePlan MetadataClient::get_restore_plan(std::string_view
 
     const boost::json::object& object = parsed.as_object();
 
-    if (object.size() != 9U || !object.contains("version_id") || !object.contains("artifact_id") ||
+    if (object.size() != 10U || !object.contains("version_id") || !object.contains("artifact_id") ||
         !object.contains("source_node_id") || !object.contains("object_id") || !object.contains("total_size_bytes") ||
-        !object.contains("layout_id") || !object.contains("chunking_strategy") || !object.contains("chunk_count") ||
-        !object.contains("chunks") || !object.at("version_id").is_string() || !object.at("artifact_id").is_string() ||
+        !object.contains("layout_id") || !object.contains("chunking_strategy") ||
+        !object.contains("chunking_parameters") || !object.contains("chunk_count") || !object.contains("chunks") ||
+        !object.at("version_id").is_string() || !object.at("artifact_id").is_string() ||
         !object.at("source_node_id").is_string() || !object.at("object_id").is_string() ||
         !object.at("layout_id").is_string() || !object.at("chunking_strategy").is_string() ||
-        !object.at("chunks").is_array()) {
+        !object.at("chunking_parameters").is_object() || !object.at("chunks").is_array()) {
         throw RemoteProtocolError{"restore plan response has unexpected fields"};
     }
 
@@ -481,9 +594,8 @@ aistore::metadata::RestorePlan MetadataClient::get_restore_plan(std::string_view
         throw RemoteProtocolError{"restore plan response contains an invalid content ID"};
     }
 
-    if (object.at("chunking_strategy").as_string() != "fixed-size") {
-        throw RemoteProtocolError{"restore plan chunking strategy is unsupported"};
-    }
+    const std::string chunking_strategy{object.at("chunking_strategy").as_string()};
+    const boost::json::object& chunking_parameters = object.at("chunking_parameters").as_object();
 
     const std::optional<std::uint64_t> total_size_bytes = extract_nonnegative_uint64(object.at("total_size_bytes"));
 
@@ -548,11 +660,32 @@ aistore::metadata::RestorePlan MetadataClient::get_restore_plan(std::string_view
     try {
         aistore::metadata::Object layout_object{object_id, *total_size_bytes};
         aistore::metadata::ObjectLayout layout{std::move(chunk_refs)};
-        aistore::metadata::ObjectLayoutDescriptor descriptor{
-            std::move(layout_object),
-            aistore::metadata::ChunkingStrategy::FixedSize,
-            std::move(layout),
-        };
+        aistore::metadata::ObjectLayoutDescriptor descriptor = [&]() {
+            if (chunking_strategy == "fixed-size") {
+                if (!chunking_parameters.empty()) {
+                    throw RemoteProtocolError{"restore plan chunking_parameters are invalid"};
+                }
+
+                return aistore::metadata::ObjectLayoutDescriptor{
+                    layout_object,
+                    aistore::metadata::ChunkingStrategy::FixedSize,
+                    layout,
+                };
+            }
+
+            if (chunking_strategy != "fastcdc") {
+                throw RemoteProtocolError{"restore plan chunking strategy is unsupported"};
+            }
+
+            const std::optional<aistore::metadata::FastCdcParameters> fastcdc_parameters =
+                parse_fastcdc_parameters_json(chunking_parameters);
+
+            if (!fastcdc_parameters.has_value()) {
+                throw RemoteProtocolError{"restore plan chunking_parameters are invalid"};
+            }
+
+            return aistore::metadata::ObjectLayoutDescriptor{layout_object, *fastcdc_parameters, layout};
+        }();
 
         if (descriptor.object_id() != object_id) {
             throw RemoteProtocolError{"restore plan reconstructed object_id does not match response"};

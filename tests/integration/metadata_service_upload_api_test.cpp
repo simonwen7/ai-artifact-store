@@ -266,7 +266,10 @@ class MetadataServiceUploadApiTest : public ::testing::Test {
             {"artifact_id", artifact_id.str()},
             {"target_node_id", target_node_id},
             {"chunking_strategy", "fixed-size"},
-            {"chunk_size_bytes", kChunkSizeBytes},
+            {"chunking_parameters",
+             boost::json::object{
+                 {"chunk_size_bytes", kChunkSizeBytes},
+             }},
             {"parent_version_id", nullptr},
             {"immutable_metadata",
              boost::json::object{
@@ -319,7 +322,7 @@ TEST_F(MetadataServiceUploadApiTest, CreatesUploadSessionOverHttp) {
     EXPECT_EQ(body.at("artifact_id").as_string(), artifact_id_.str());
     EXPECT_EQ(body.at("target_node_id").as_string(), "m4s2-target");
     EXPECT_EQ(body.at("chunking_strategy").as_string(), "fixed-size");
-    EXPECT_EQ(json_uint64(body.at("chunk_size_bytes")), kChunkSizeBytes);
+    EXPECT_EQ(json_uint64(body.at("chunking_parameters").as_object().at("chunk_size_bytes")), kChunkSizeBytes);
     EXPECT_TRUE(body.at("parent_version_id").is_null());
     EXPECT_EQ(body.at("immutable_metadata").as_object().at("source").as_string(), "m4s2");
     EXPECT_EQ(body.at("state").as_string(), "open");
@@ -744,6 +747,71 @@ TEST_F(MetadataServiceUploadApiTest, NegotiationRejectsUnsupportedMediaTypeAndMe
     EXPECT_EQ(method.result(), beast_http::status::method_not_allowed);
     EXPECT_EQ(method[beast_http::field::allow], "POST");
     EXPECT_EQ(boost::json::parse(method.body()).at("error").as_string(), "method_not_allowed");
+}
+
+TEST_F(MetadataServiceUploadApiTest, CreatesAndGetsFastCdcUploadSession) {
+    const UuidV7 session_id = UuidV7::generate();
+    track_session(session_id);
+
+    const std::string payload = boost::json::serialize(boost::json::object{
+        {"session_id", session_id.str()},
+        {"artifact_id", artifact_id_.str()},
+        {"target_node_id", "m6-fastcdc-target"},
+        {"chunking_strategy", "fastcdc"},
+        {"chunking_parameters",
+         boost::json::object{
+             {"min_chunk_size_bytes", 64},
+             {"avg_chunk_size_bytes", 256},
+             {"max_chunk_size_bytes", 1024},
+         }},
+        {"parent_version_id", nullptr},
+        {"immutable_metadata",
+         boost::json::object{
+             {"source", "m6-fastcdc"},
+         }},
+    });
+
+    const HttpResponse create =
+        http_exchange(server_->port(), beast_http::verb::post, "/v1/upload-sessions", payload, "application/json");
+
+    ASSERT_EQ(create.result(), beast_http::status::ok);
+
+    const auto create_body = boost::json::parse(create.body()).as_object();
+    EXPECT_EQ(create_body.at("chunking_strategy").as_string(), "fastcdc");
+    EXPECT_EQ(json_uint64(create_body.at("chunking_parameters").as_object().at("avg_chunk_size_bytes")), 256U);
+
+    const HttpResponse get =
+        http_exchange(server_->port(), beast_http::verb::get, std::string{"/v1/upload-sessions/"} + session_id.str());
+
+    ASSERT_EQ(get.result(), beast_http::status::ok);
+    const auto get_body = boost::json::parse(get.body()).as_object();
+    EXPECT_EQ(get_body.at("chunking_strategy").as_string(), "fastcdc");
+    EXPECT_EQ(json_uint64(get_body.at("chunking_parameters").as_object().at("max_chunk_size_bytes")), 1024U);
+}
+
+TEST_F(MetadataServiceUploadApiTest, RejectsMalformedFastCdcChunkingParameters) {
+    const UuidV7 session_id = UuidV7::generate();
+
+    const std::string payload = boost::json::serialize(boost::json::object{
+        {"session_id", session_id.str()},
+        {"artifact_id", artifact_id_.str()},
+        {"target_node_id", "m6-fastcdc-target"},
+        {"chunking_strategy", "fastcdc"},
+        {"chunking_parameters",
+         boost::json::object{
+             {"min_chunk_size_bytes", 64},
+             {"avg_chunk_size_bytes", 300},
+             {"max_chunk_size_bytes", 1024},
+         }},
+        {"parent_version_id", nullptr},
+        {"immutable_metadata", boost::json::object{}},
+    });
+
+    const HttpResponse response =
+        http_exchange(server_->port(), beast_http::verb::post, "/v1/upload-sessions", payload, "application/json");
+
+    EXPECT_EQ(response.result(), beast_http::status::bad_request);
+    EXPECT_EQ(boost::json::parse(response.body()).at("error").as_string(), "invalid_request");
 }
 
 }  // namespace
