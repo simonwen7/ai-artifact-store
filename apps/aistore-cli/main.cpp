@@ -20,6 +20,7 @@
 #include "aistore/metadata/finalize_upload.hpp"
 #include "aistore/metadata/upload_session.hpp"
 #include "aistore/metadata/uuid_v7.hpp"
+#include "aistore/pull/pull_engine.hpp"
 #include "aistore/push/push_engine.hpp"
 
 namespace {
@@ -47,11 +48,14 @@ void require_unset(bool already_set, std::string_view option_name) {
 void print_top_level_usage(std::ostream& out) {
     out << "Usage:\n"
            "  aistore push [options]\n"
+           "  aistore pull [options]\n"
            "\n"
            "Commands:\n"
            "  push\n"
+           "  pull\n"
            "\n"
-           "Run `aistore push --help` for push options.\n";
+           "Run `aistore push --help` for push options.\n"
+           "Run `aistore pull --help` for pull options.\n";
 }
 
 void print_push_usage(std::ostream& out) {
@@ -77,6 +81,27 @@ void print_push_usage(std::ostream& out) {
            "  metadata 127.0.0.1:8080\n"
            "  storage  127.0.0.1:8081\n"
            "  chunk-size 4194304\n";
+}
+
+void print_pull_usage(std::ostream& out) {
+    out << "Usage:\n"
+           "  aistore pull [options]\n"
+           "\n"
+           "Required:\n"
+           "  --version-id <64-lowercase-hex>\n"
+           "  --output <path>\n"
+           "  --storage-node-id <node-id>\n"
+           "\n"
+           "Optional:\n"
+           "  --overwrite\n"
+           "  --metadata-address <numeric-ip>\n"
+           "  --metadata-port <port>\n"
+           "  --storage-address <numeric-ip>\n"
+           "  --storage-port <port>\n"
+           "\n"
+           "Defaults:\n"
+           "  metadata 127.0.0.1:8080\n"
+           "  storage  127.0.0.1:8081\n";
 }
 
 [[nodiscard]] bool is_regular_file_path(const std::filesystem::path& path) {
@@ -157,6 +182,20 @@ void validate_parent_version(std::string_view parent_version) {
         const bool is_lower_hex = character >= 'a' && character <= 'f';
         if (!is_digit && !is_lower_hex) {
             throw CliUsageError{"--parent-version must be exactly 64 lowercase hex characters"};
+        }
+    }
+}
+
+void validate_version_id(std::string_view version_id) {
+    if (version_id.size() != 64U) {
+        throw CliUsageError{"--version-id must be exactly 64 lowercase hex characters"};
+    }
+
+    for (const char character : version_id) {
+        const bool is_digit = character >= '0' && character <= '9';
+        const bool is_lower_hex = character >= 'a' && character <= 'f';
+        if (!is_digit && !is_lower_hex) {
+            throw CliUsageError{"--version-id must be exactly 64 lowercase hex characters"};
         }
     }
 }
@@ -368,6 +407,139 @@ struct PushOptions {
     };
 }
 
+struct PullOptions {
+    std::string version_id;
+    std::filesystem::path output_path;
+    std::string storage_node_id;
+    bool overwrite = false;
+    std::string metadata_address = "127.0.0.1";
+    std::uint16_t metadata_port = 8080;
+    std::string storage_address = "127.0.0.1";
+    std::uint16_t storage_port = 8081;
+};
+
+[[nodiscard]] PullOptions parse_pull_options(int argc, char** argv) {
+    std::string version_id;
+    std::filesystem::path output_path;
+    std::string storage_node_id;
+    bool overwrite = false;
+    std::string metadata_address = "127.0.0.1";
+    std::uint16_t metadata_port = 8080;
+    std::string storage_address = "127.0.0.1";
+    std::uint16_t storage_port = 8081;
+
+    bool has_version_id = false;
+    bool has_output = false;
+    bool has_storage_node_id = false;
+    bool has_overwrite = false;
+    bool has_metadata_address = false;
+    bool has_metadata_port = false;
+    bool has_storage_address = false;
+    bool has_storage_port = false;
+
+    for (int index = 2; index < argc; ++index) {
+        const std::string_view arg{argv[index]};
+
+        if (arg == "--help") {
+            print_pull_usage(std::cout);
+            std::exit(0);
+        }
+
+        if (!arg.empty() && arg[0] != '-') {
+            throw CliUsageError{"positional arguments are not supported after pull"};
+        }
+
+        if (arg == "--version-id") {
+            require_unset(has_version_id, "--version-id");
+            has_version_id = true;
+            version_id = std::string{next_arg(argc, argv, index, "--version-id")};
+            continue;
+        }
+
+        if (arg == "--output") {
+            require_unset(has_output, "--output");
+            has_output = true;
+            output_path = std::filesystem::path{std::string{next_arg(argc, argv, index, "--output")}};
+            continue;
+        }
+
+        if (arg == "--storage-node-id") {
+            require_unset(has_storage_node_id, "--storage-node-id");
+            has_storage_node_id = true;
+            storage_node_id = std::string{next_arg(argc, argv, index, "--storage-node-id")};
+            continue;
+        }
+
+        if (arg == "--overwrite") {
+            require_unset(has_overwrite, "--overwrite");
+            has_overwrite = true;
+            overwrite = true;
+            continue;
+        }
+
+        if (arg == "--metadata-address") {
+            require_unset(has_metadata_address, "--metadata-address");
+            has_metadata_address = true;
+            metadata_address = std::string{next_arg(argc, argv, index, "--metadata-address")};
+            continue;
+        }
+
+        if (arg == "--metadata-port") {
+            require_unset(has_metadata_port, "--metadata-port");
+            has_metadata_port = true;
+            metadata_port = parse_port(next_arg(argc, argv, index, "--metadata-port"), "--metadata-port");
+            continue;
+        }
+
+        if (arg == "--storage-address") {
+            require_unset(has_storage_address, "--storage-address");
+            has_storage_address = true;
+            storage_address = std::string{next_arg(argc, argv, index, "--storage-address")};
+            continue;
+        }
+
+        if (arg == "--storage-port") {
+            require_unset(has_storage_port, "--storage-port");
+            has_storage_port = true;
+            storage_port = parse_port(next_arg(argc, argv, index, "--storage-port"), "--storage-port");
+            continue;
+        }
+
+        throw CliUsageError{std::string{"unknown option "} + std::string{arg}};
+    }
+
+    if (!has_version_id) {
+        throw CliUsageError{"--version-id is required"};
+    }
+    if (!has_output) {
+        throw CliUsageError{"--output is required"};
+    }
+    if (!has_storage_node_id) {
+        throw CliUsageError{"--storage-node-id is required"};
+    }
+
+    validate_version_id(version_id);
+
+    if (output_path.empty()) {
+        throw CliUsageError{"--output must be nonempty"};
+    }
+
+    validate_storage_node_id(storage_node_id);
+    validate_numeric_ip(metadata_address, "--metadata-address");
+    validate_numeric_ip(storage_address, "--storage-address");
+
+    return PullOptions{
+        .version_id = std::move(version_id),
+        .output_path = std::move(output_path),
+        .storage_node_id = std::move(storage_node_id),
+        .overwrite = overwrite,
+        .metadata_address = std::move(metadata_address),
+        .metadata_port = metadata_port,
+        .storage_address = std::move(storage_address),
+        .storage_port = storage_port,
+    };
+}
+
 [[nodiscard]] bool creation_identity_matches(const aistore::metadata::UploadSession& requested,
                                              const aistore::metadata::UploadSession& existing) {
     return existing.artifact_id() == requested.artifact_id() &&
@@ -408,6 +580,24 @@ void emit_success_json(const std::string& target_node_id, const aistore::metadat
     body["verified_target_chunks"] = prepared.stats.verified_target_chunks;
     body["repaired_target_chunks"] = prepared.stats.repaired_target_chunks;
     body["bytes_sent_to_storage"] = prepared.stats.bytes_sent_to_storage;
+
+    std::cout << boost::json::serialize(body) << '\n';
+}
+
+void emit_pull_success_json(const aistore::pull::PullResult& result) {
+    boost::json::object body;
+    body["status"] = "restored";
+    body["version_id"] = result.version_id;
+    body["artifact_id"] = result.artifact_id.str();
+    body["source_node_id"] = result.source_node_id;
+    body["object_id"] = result.object_id;
+    body["layout_id"] = result.layout_id;
+    body["destination"] = result.destination_path.string();
+    body["bytes_restored"] = result.stats.bytes_restored;
+    body["total_chunks"] = result.stats.total_chunks;
+    body["chunks_downloaded"] = result.stats.chunks_downloaded;
+    body["chunks_reused_from_partial"] = result.stats.chunks_reused_from_partial;
+    body["bytes_received_from_storage"] = result.stats.bytes_received_from_storage;
 
     std::cout << boost::json::serialize(body) << '\n';
 }
@@ -505,6 +695,40 @@ void emit_success_json(const std::string& target_node_id, const aistore::metadat
     }
 }
 
+[[nodiscard]] int run_pull(const PullOptions& options) {
+    try {
+        aistore::client::MetadataClient metadata_client{aistore::http::HttpClientConfig{
+            .endpoint =
+                aistore::http::HttpEndpoint{
+                    .address = options.metadata_address,
+                    .port = options.metadata_port,
+                },
+        }};
+
+        aistore::client::StorageNodeClient storage_client{aistore::http::HttpClientConfig{
+            .endpoint =
+                aistore::http::HttpEndpoint{
+                    .address = options.storage_address,
+                    .port = options.storage_port,
+                },
+        }};
+
+        aistore::pull::PullEngine pull_engine{metadata_client, storage_client, options.storage_node_id};
+
+        const aistore::pull::PullResult result = pull_engine.pull(aistore::pull::PullRequest{
+            .version_id = options.version_id,
+            .destination_path = options.output_path,
+            .overwrite = options.overwrite,
+        });
+
+        emit_pull_success_json(result);
+        return 0;
+    } catch (const std::exception& error) {
+        std::cerr << "aistore pull error: " << error.what() << '\n';
+        return 1;
+    }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -529,6 +753,17 @@ int main(int argc, char** argv) {
             } catch (const CliUsageError& error) {
                 std::cerr << "aistore: " << error.what() << '\n';
                 print_push_usage(std::cerr);
+                return 2;
+            }
+        }
+
+        if (command == "pull") {
+            try {
+                const PullOptions options = parse_pull_options(argc, argv);
+                return run_pull(options);
+            } catch (const CliUsageError& error) {
+                std::cerr << "aistore: " << error.what() << '\n';
+                print_pull_usage(std::cerr);
                 return 2;
             }
         }

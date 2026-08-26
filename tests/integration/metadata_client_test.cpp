@@ -26,6 +26,7 @@
 #include "aistore/metadata/finalize_upload.hpp"
 #include "aistore/metadata/object_layout_descriptor.hpp"
 #include "aistore/metadata/postgres_metadata_repository.hpp"
+#include "aistore/metadata/restore_plan.hpp"
 #include "aistore/metadata/storage_location.hpp"
 #include "aistore/metadata/upload_session.hpp"
 #include "aistore/metadata/uuid_v7.hpp"
@@ -44,6 +45,7 @@ using aistore::http::HttpResponse;
 using aistore::http::HttpServer;
 using aistore::http::HttpServerConfig;
 using aistore::metadata::Artifact;
+using aistore::metadata::ArtifactVersion;
 using aistore::metadata::ChunkingStrategy;
 using aistore::metadata::ChunkMetadata;
 using aistore::metadata::ChunkRef;
@@ -51,11 +53,13 @@ using aistore::metadata::Object;
 using aistore::metadata::ObjectLayout;
 using aistore::metadata::ObjectLayoutDescriptor;
 using aistore::metadata::PostgresMetadataRepository;
+using aistore::metadata::RestorePlan;
 using aistore::metadata::StorageLocation;
 using aistore::metadata::StorageLocationState;
 using aistore::metadata::UploadSession;
 using aistore::metadata::UploadSessionState;
 using aistore::metadata::UuidV7;
+using aistore::metadata::VersionState;
 using aistore::service::MetadataService;
 
 namespace beast_http = aistore::http::beast_http;
@@ -224,6 +228,30 @@ class MetadataClientFixture : public ::testing::Test {
     }
 
     void track_chunk(std::string chunk_id) { owned_chunk_ids_.push_back(std::move(chunk_id)); }
+
+    [[nodiscard]] ArtifactVersion create_committed_version(const ObjectLayoutDescriptor& descriptor,
+                                                           std::string_view source_node = "m4s3-target") {
+        repository_->register_object(descriptor.object());
+        repository_->register_object_layout(descriptor);
+        for (const ChunkRef& chunk : descriptor.layout().chunks()) {
+            repository_->register_chunks({ChunkMetadata{.chunk_id = chunk.chunk_id, .size_bytes = chunk.size}});
+            repository_->register_storage_location(StorageLocation{
+                .chunk_id = chunk.chunk_id,
+                .node_id = std::string{source_node},
+                .storage_path = std::string{"/v1/chunks/"} + chunk.chunk_id,
+                .state = StorageLocationState::Available,
+            });
+        }
+        ArtifactVersion version{
+            artifact_id_,
+            descriptor.object_id(),
+            std::nullopt,
+            ArtifactVersion::ImmutableMetadata{{"source", "m4s3"}},
+            VersionState::Committed,
+        };
+        repository_->create_version(version);
+        return version;
+    }
 
     [[nodiscard]] ObjectLayoutDescriptor make_descriptor() {
         const std::string marker = UuidV7::generate().str();
@@ -565,6 +593,75 @@ TEST(MetadataClientStandaloneTest, MalformedFinalizeSuccessProducesProtocolError
     }};
 
     EXPECT_THROW((void)client.finalize_upload(session_id, descriptor), RemoteProtocolError);
+}
+
+TEST_F(MetadataClientFixture, GetRestorePlanParsesStrictSuccessfulResponse) {
+    const ObjectLayoutDescriptor descriptor = make_descriptor();
+    const ArtifactVersion version = create_committed_version(descriptor);
+    const RestorePlan plan = client_->get_restore_plan(version.version_id(), "m4s3-target");
+
+    EXPECT_EQ(plan.artifact_id, artifact_id_);
+    EXPECT_EQ(plan.version_id, version.version_id());
+    EXPECT_EQ(plan.source_node_id, "m4s3-target");
+    EXPECT_EQ(plan.layout_descriptor.object_id(), descriptor.object_id());
+    EXPECT_EQ(plan.layout_descriptor.layout_id(), descriptor.layout_id());
+    EXPECT_EQ(plan.layout_descriptor.object().total_size(), 4U);
+    ASSERT_EQ(plan.layout_descriptor.layout().chunks().size(), 1U);
+    EXPECT_EQ(plan.layout_descriptor.layout().chunks().front().chunk_id, descriptor.layout().chunks().front().chunk_id);
+}
+
+TEST_F(MetadataClientFixture, GetRestorePlanPropagatesRemoteRestoreErrors) {
+    const std::string missing_version = sha256_hex(std::string{"m5s5-missing-version-"} + UuidV7::generate().str());
+
+    try {
+        (void)client_->get_restore_plan(missing_version, "m4s3-target");
+        FAIL() << "expected RemoteApiError";
+    } catch (const RemoteApiError& error) {
+        EXPECT_EQ(error.status_code(), 404U);
+        EXPECT_EQ(error.error_code(), "artifact_version_not_found");
+    }
+}
+
+TEST(MetadataClientStandaloneTest, GetRestorePlanRejectsMalformedSuccessfulResponse) {
+    const std::string version_id = sha256_hex("m5s5-malformed-restore-" + UuidV7::generate().str());
+    const std::string source_node = "m4s3-target";
+
+    RunningHttpServer server{[version_id, source_node](const HttpRequest& request) {
+        EXPECT_EQ(request.method(), beast_http::verb::get);
+        EXPECT_EQ(request.target(),
+                  std::string{"/v1/artifact-versions/"} + version_id + "/restore-plan/" + source_node);
+        HttpResponse response{beast_http::status::ok, request.version()};
+        response.set(beast_http::field::content_type, "application/json");
+        response.body() = boost::json::serialize(boost::json::object{
+            {"version_id", version_id},
+            {"artifact_id", UuidV7::generate().str()},
+            {"source_node_id", source_node},
+            {"object_id", std::string(64, '1')},
+            {"total_size_bytes", 4},
+            {"layout_id", std::string(64, '2')},
+            {"chunking_strategy", "fixed-size"},
+            {"chunk_count", 1},
+            {"chunks", boost::json::array{}},
+            {"extra_field", "unexpected"},
+        });
+        response.prepare_payload();
+        return response;
+    }};
+
+    MetadataClient client{HttpClientConfig{
+        .endpoint = HttpEndpoint{.address = "127.0.0.1", .port = server.port()},
+    }};
+
+    EXPECT_THROW((void)client.get_restore_plan(version_id, source_node), RemoteProtocolError);
+}
+
+TEST(MetadataClientStandaloneTest, GetRestorePlanValidatesArgumentsBeforeNetworkIo) {
+    MetadataClient client{HttpClientConfig{
+        .endpoint = HttpEndpoint{.address = "127.0.0.1", .port = 1},
+    }};
+
+    EXPECT_THROW((void)client.get_restore_plan("not-a-version-id", "m4s3-target"), std::invalid_argument);
+    EXPECT_THROW((void)client.get_restore_plan(std::string(64, 'a'), "not a node"), std::invalid_argument);
 }
 
 }  // namespace

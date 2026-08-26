@@ -12,8 +12,11 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <utility>
 #include <vector>
+
+#include "aistore/metadata/restore_plan.hpp"
 
 namespace aistore::metadata {
 
@@ -102,6 +105,23 @@ void validate_version_id(std::string_view version_id) {
 
         if (!is_digit && !is_lower_hex) {
             throw std::invalid_argument("version ID must use lowercase hexadecimal characters");
+        }
+    }
+}
+
+void validate_source_node_id(std::string_view node_id) {
+    if (node_id.empty() || node_id.size() > 128U) {
+        throw std::invalid_argument("source node ID is invalid");
+    }
+
+    for (const char character : node_id) {
+        const bool is_upper = character >= 'A' && character <= 'Z';
+        const bool is_lower = character >= 'a' && character <= 'z';
+        const bool is_digit = character >= '0' && character <= '9';
+        const bool is_allowed_punct = character == '-' || character == '_' || character == '.';
+
+        if (!is_upper && !is_lower && !is_digit && !is_allowed_punct) {
+            throw std::invalid_argument("source node ID is invalid");
         }
     }
 }
@@ -472,11 +492,7 @@ class PostgresMetadataRepository::Impl {
         transaction.commit();
     }
 
-    [[nodiscard]] std::optional<ArtifactVersion> get_version(std::string_view version_id) {
-        validate_version_id(version_id);
-
-        pqxx::work transaction{connection_};
-
+    [[nodiscard]] std::optional<ArtifactVersion> load_version(pqxx::work& transaction, std::string_view version_id) {
         auto stored = transaction.query01<std::string, std::string, std::string, std::optional<std::string>, int,
                                           std::string, std::string>(
             "SELECT "
@@ -497,7 +513,6 @@ class PostgresMetadataRepository::Impl {
             });
 
         if (!stored.has_value()) {
-            transaction.commit();
             return std::nullopt;
         }
 
@@ -545,9 +560,89 @@ class PostgresMetadataRepository::Impl {
             throw std::runtime_error("stored canonical descriptor does not match artifact version");
         }
 
+        return reconstructed;
+    }
+
+    [[nodiscard]] std::optional<ArtifactVersion> get_version(std::string_view version_id) {
+        validate_version_id(version_id);
+
+        pqxx::work transaction{connection_};
+
+        auto reconstructed = load_version(transaction, version_id);
+
         transaction.commit();
 
         return reconstructed;
+    }
+
+    // NOLINTNEXTLINE(bugprone-easily-swappable-parameters) — frozen M5 restore-plan API parameter order
+    [[nodiscard]] RestorePlan resolve_restore_plan(std::string_view version_id, std::string_view source_node_id) {
+        validate_version_id(version_id);
+        validate_source_node_id(source_node_id);
+
+        pqxx::work transaction{connection_};
+
+        auto version = load_version(transaction, version_id);
+
+        if (!version.has_value()) {
+            throw RestorePlanError{RestorePlanErrorKind::VersionNotFound,
+                                   "artifact version does not exist: " + std::string{version_id}};
+        }
+
+        if (version->state() != VersionState::Committed) {
+            throw RestorePlanError{RestorePlanErrorKind::VersionNotCommitted,
+                                   "artifact version is not committed: " + std::string{version_id}};
+        }
+
+        auto selected_layout = transaction.query01<std::string>(
+            "SELECT "
+            "    layout_id "
+            "FROM object_layouts ol "
+            "WHERE ol.object_id = $1 "
+            "  AND NOT EXISTS ( "
+            "      SELECT 1 "
+            "      FROM object_layout_chunks olc "
+            "      WHERE olc.layout_id = ol.layout_id "
+            "        AND NOT EXISTS ( "
+            "            SELECT 1 "
+            "            FROM storage_locations sl "
+            "            WHERE sl.chunk_id = olc.chunk_id "
+            "              AND sl.node_id = $2 "
+            "              AND sl.state = 'available' "
+            "        ) "
+            "  ) "
+            "ORDER BY layout_id "
+            "LIMIT 1",
+            pqxx::params{
+                version->root_object_id(),
+                source_node_id,
+            });
+
+        if (!selected_layout.has_value()) {
+            throw RestorePlanError{RestorePlanErrorKind::SourceUnavailable,
+                                   "no fully available layout for requested source node"};
+        }
+
+        auto descriptor = load_object_layout(transaction, std::get<0>(*selected_layout));
+
+        if (!descriptor.has_value()) {
+            throw std::runtime_error("selected restore layout could not be loaded");
+        }
+
+        if (descriptor->object_id() != version->root_object_id()) {
+            throw std::runtime_error("selected restore layout object does not match version root object");
+        }
+
+        RestorePlan plan{
+            .artifact_id = version->artifact_id(),
+            .version_id = version->version_id(),
+            .source_node_id = std::string{source_node_id},
+            .layout_descriptor = std::move(*descriptor),
+        };
+
+        transaction.commit();
+
+        return plan;
     }
 
     void set_version_state(std::string_view version_id, VersionState state) {
@@ -2353,6 +2448,11 @@ void PostgresMetadataRepository::abort_upload_session(const UuidV7& session_id) 
 FinalizeUploadResult PostgresMetadataRepository::finalize_upload(const UuidV7& session_id,
                                                                  const ObjectLayoutDescriptor& descriptor) {
     return impl_->finalize_upload(session_id, descriptor);
+}
+
+RestorePlan PostgresMetadataRepository::resolve_restore_plan(std::string_view version_id,
+                                                             std::string_view source_node_id) {
+    return impl_->resolve_restore_plan(version_id, source_node_id);
 }
 
 }  // namespace aistore::metadata

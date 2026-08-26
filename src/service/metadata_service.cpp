@@ -18,6 +18,7 @@
 #include "aistore/metadata/object.hpp"
 #include "aistore/metadata/object_layout.hpp"
 #include "aistore/metadata/object_layout_descriptor.hpp"
+#include "aistore/metadata/restore_plan.hpp"
 #include "aistore/metadata/storage_location.hpp"
 #include "aistore/metadata/upload_session.hpp"
 #include "aistore/metadata/uuid_v7.hpp"
@@ -36,6 +37,8 @@ constexpr std::string_view kAbortSuffix = "/abort";
 constexpr std::string_view kFinalizeSuffix = "/finalize";
 constexpr std::string_view kLocationsSuffix = "/locations";
 constexpr std::string_view kLocationsPrefix = "/locations/";
+constexpr std::string_view kArtifactVersionsPrefix = "/v1/artifact-versions/";
+constexpr std::string_view kRestorePlanInfix = "/restore-plan/";
 constexpr std::string_view kApplicationJson = "application/json";
 constexpr std::size_t kMaxNegotiationChunks = 256U;
 constexpr std::uint64_t kPostgresBigintMax = static_cast<std::uint64_t>(std::numeric_limits<long long>::max());
@@ -388,6 +391,128 @@ struct ParsedUploadSessionRoute {
 
     parsed.kind = UploadSessionRouteKind::UnknownSubroute;
     return parsed;
+}
+
+enum class RestorePlanRouteKind : std::uint8_t {
+    NotRestorePlan,
+    Item,
+    UnknownSubroute,
+};
+
+struct ParsedRestorePlanRoute {
+    RestorePlanRouteKind kind{RestorePlanRouteKind::NotRestorePlan};
+    std::string_view version_id;
+    std::string_view source_node_id;
+    bool invalid_version_id{false};
+    bool invalid_node_id{false};
+};
+
+[[nodiscard]] ParsedRestorePlanRoute parse_restore_plan_route(std::string_view path) {
+    ParsedRestorePlanRoute parsed;
+
+    if (!path.starts_with(kArtifactVersionsPrefix)) {
+        return parsed;
+    }
+
+    const std::string_view after_prefix = path.substr(kArtifactVersionsPrefix.size());
+    const std::size_t infix_pos = after_prefix.find(kRestorePlanInfix);
+
+    if (infix_pos == std::string_view::npos) {
+        return parsed;
+    }
+
+    const std::string_view version_id = after_prefix.substr(0, infix_pos);
+    const std::string_view after_infix = after_prefix.substr(infix_pos + kRestorePlanInfix.size());
+
+    if (!is_valid_chunk_id(version_id)) {
+        parsed.invalid_version_id = true;
+        parsed.version_id = version_id;
+        return parsed;
+    }
+
+    parsed.version_id = version_id;
+
+    if (after_infix.empty() || after_infix.starts_with('/')) {
+        parsed.kind = RestorePlanRouteKind::UnknownSubroute;
+        return parsed;
+    }
+
+    const std::size_t slash = after_infix.find('/');
+
+    if (slash != std::string_view::npos) {
+        parsed.kind = RestorePlanRouteKind::UnknownSubroute;
+        return parsed;
+    }
+
+    const std::string_view source_node_id = after_infix;
+
+    if (!is_valid_node_id(source_node_id)) {
+        parsed.invalid_node_id = true;
+        parsed.source_node_id = source_node_id;
+        return parsed;
+    }
+
+    parsed.kind = RestorePlanRouteKind::Item;
+    parsed.source_node_id = source_node_id;
+    return parsed;
+}
+
+[[nodiscard]] boost::json::object restore_plan_to_json(const aistore::metadata::RestorePlan& plan) {
+    const aistore::metadata::ObjectLayoutDescriptor& descriptor = plan.layout_descriptor;
+    boost::json::array chunks;
+    chunks.reserve(descriptor.layout().chunks().size());
+
+    for (const aistore::metadata::ChunkRef& chunk : descriptor.layout().chunks()) {
+        chunks.push_back(boost::json::object{
+            {"chunk_id", chunk.chunk_id},
+            {"offset", chunk.offset},
+            {"size_bytes", chunk.size},
+        });
+    }
+
+    return boost::json::object{
+        {"version_id", plan.version_id},
+        {"artifact_id", plan.artifact_id.str()},
+        {"source_node_id", plan.source_node_id},
+        {"object_id", descriptor.object_id()},
+        {"total_size_bytes", descriptor.object().total_size()},
+        {"layout_id", descriptor.layout_id()},
+        {"chunking_strategy", "fixed-size"},
+        {"chunk_count", chunks.size()},
+        {"chunks", std::move(chunks)},
+    };
+}
+
+[[nodiscard]] aistore::http::HttpResponse handle_get_restore_plan(
+    const aistore::http::HttpRequest& request, aistore::metadata::PostgresMetadataRepository& repository,
+    std::mutex& repository_mutex, std::string_view version_id, std::string_view source_node_id) {
+    try {
+        const std::scoped_lock lock{repository_mutex};
+        const aistore::metadata::RestorePlan plan = repository.resolve_restore_plan(version_id, source_node_id);
+        return make_json_response(request, beast_http::status::ok, restore_plan_to_json(plan));
+    } catch (const aistore::metadata::RestorePlanError& error) {
+        switch (error.kind()) {
+            case aistore::metadata::RestorePlanErrorKind::VersionNotFound:
+                return make_json_response(request, beast_http::status::not_found,
+                                          boost::json::object{
+                                              {"error", "artifact_version_not_found"},
+                                          });
+
+            case aistore::metadata::RestorePlanErrorKind::VersionNotCommitted:
+                return make_json_response(request, beast_http::status::conflict,
+                                          boost::json::object{
+                                              {"error", "artifact_version_not_committed"},
+                                          });
+
+            case aistore::metadata::RestorePlanErrorKind::SourceUnavailable:
+                return make_json_response(request, beast_http::status::conflict,
+                                          boost::json::object{
+                                              {"error", "restore_source_unavailable"},
+                                          });
+        }
+
+        throw std::logic_error("unsupported restore plan error kind");
+    }
 }
 
 [[nodiscard]] aistore::http::HttpResponse handle_create_upload_session(
@@ -1186,6 +1311,52 @@ aistore::http::HttpResponse MetadataService::handle_request(const aistore::http:
         }
 
         return handle_negotiate_chunks(request, repository_, repository_mutex_);
+    }
+
+    if (path.starts_with(kArtifactVersionsPrefix)) {
+        const ParsedRestorePlanRoute route = parse_restore_plan_route(path);
+
+        if (route.invalid_version_id) {
+            return make_json_response(request, beast_http::status::bad_request,
+                                      boost::json::object{
+                                          {"error", "invalid_version_id"},
+                                      });
+        }
+
+        if (route.invalid_node_id) {
+            return make_json_response(request, beast_http::status::bad_request,
+                                      boost::json::object{
+                                          {"error", "invalid_node_id"},
+                                      });
+        }
+
+        if (route.kind == RestorePlanRouteKind::UnknownSubroute) {
+            return make_json_response(request, beast_http::status::not_found,
+                                      boost::json::object{
+                                          {"error", "not_found"},
+                                      });
+        }
+
+        if (route.kind == RestorePlanRouteKind::Item) {
+            if (has_query_or_fragment) {
+                return make_json_response(request, beast_http::status::bad_request,
+                                          boost::json::object{
+                                              {"error", "invalid_request"},
+                                          });
+            }
+
+            if (request.method() != beast_http::verb::get) {
+                return make_method_not_allowed(request, "GET");
+            }
+
+            return handle_get_restore_plan(request, repository_, repository_mutex_, route.version_id,
+                                           route.source_node_id);
+        }
+
+        return make_json_response(request, beast_http::status::not_found,
+                                  boost::json::object{
+                                      {"error", "not_found"},
+                                  });
     }
 
     if (path.starts_with(kChunkRoutePrefix)) {

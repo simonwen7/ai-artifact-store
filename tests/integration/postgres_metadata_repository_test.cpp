@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "aistore/metadata/finalize_upload.hpp"
+#include "aistore/metadata/restore_plan.hpp"
 
 namespace {
 
@@ -27,6 +28,9 @@ using aistore::metadata::Object;
 using aistore::metadata::ObjectLayout;
 using aistore::metadata::ObjectLayoutDescriptor;
 using aistore::metadata::PostgresMetadataRepository;
+using aistore::metadata::RestorePlan;
+using aistore::metadata::RestorePlanError;
+using aistore::metadata::RestorePlanErrorKind;
 using aistore::metadata::StorageLocation;
 using aistore::metadata::StorageLocationState;
 using aistore::metadata::UploadSession;
@@ -2353,6 +2357,173 @@ TEST(PostgresMetadataRepositoryTest, DifferentSessionsReuseIdenticalArtifactVers
                   pqxx::params{first_session_id.str(), second_session_id.str()}),
               2);
     transaction.commit();
+}
+
+TEST(PostgresMetadataRepositoryTest, ResolveRestorePlanReturnsLexicographicallyFirstFullyAvailableLayout) {
+    reset_metadata_data();
+    PostgresMetadataRepository repository{test_database_connection_string()};
+    const UuidV7 marker = UuidV7::generate();
+    const UuidV7 artifact_id = UuidV7::generate();
+    const std::string source_node = "m5s5-source";
+
+    repository.create_artifact(Artifact{artifact_id, "restore-lex-" + marker.str(), "m5s5"});
+    repository.register_object(make_object());
+
+    const auto primary = make_object_layout_descriptor();
+    const auto alternate = make_alternate_object_layout_descriptor();
+    repository.register_object_layout(primary);
+    repository.register_object_layout(alternate);
+    register_finalize_chunks(repository, primary, source_node, StorageLocationState::Available);
+    register_finalize_chunks(repository, alternate, source_node, StorageLocationState::Available);
+
+    const ArtifactVersion version{
+        artifact_id,
+        kObjectId,
+        std::nullopt,
+        ArtifactVersion::ImmutableMetadata{{"marker", marker.str()}},
+        VersionState::Committed,
+    };
+    repository.create_version(version);
+
+    const std::string expected_layout_id = std::min(primary.layout_id(), alternate.layout_id());
+    const RestorePlan plan = repository.resolve_restore_plan(version.version_id(), source_node);
+
+    EXPECT_EQ(plan.artifact_id, artifact_id);
+    EXPECT_EQ(plan.version_id, version.version_id());
+    EXPECT_EQ(plan.source_node_id, source_node);
+    EXPECT_EQ(plan.layout_descriptor.layout_id(), expected_layout_id);
+    EXPECT_EQ(plan.layout_descriptor.object_id(), kObjectId);
+}
+
+TEST(PostgresMetadataRepositoryTest, ResolveRestorePlanSkipsUnavailableLayoutAndSelectsNext) {
+    reset_metadata_data();
+    PostgresMetadataRepository repository{test_database_connection_string()};
+    const UuidV7 marker = UuidV7::generate();
+    const UuidV7 artifact_id = UuidV7::generate();
+    const std::string source_node = "m5s5-source";
+
+    repository.create_artifact(Artifact{artifact_id, "restore-skip-" + marker.str(), "m5s5"});
+    repository.register_object(make_object());
+
+    const auto primary = make_object_layout_descriptor();
+    const auto alternate = make_alternate_object_layout_descriptor();
+    repository.register_object_layout(primary);
+    repository.register_object_layout(alternate);
+
+    const auto& smaller = primary.layout_id() < alternate.layout_id() ? primary : alternate;
+    const auto& larger = primary.layout_id() < alternate.layout_id() ? alternate : primary;
+    register_finalize_chunks(repository, smaller, source_node, StorageLocationState::Missing);
+    register_finalize_chunks(repository, larger, source_node, StorageLocationState::Available);
+
+    const ArtifactVersion version{
+        artifact_id,
+        kObjectId,
+        std::nullopt,
+        ArtifactVersion::ImmutableMetadata{{"marker", marker.str()}},
+        VersionState::Committed,
+    };
+    repository.create_version(version);
+
+    const RestorePlan plan = repository.resolve_restore_plan(version.version_id(), source_node);
+    EXPECT_EQ(plan.layout_descriptor.layout_id(), larger.layout_id());
+}
+
+TEST(PostgresMetadataRepositoryTest, ResolveRestorePlanRejectsMissingVersion) {
+    reset_metadata_data();
+    PostgresMetadataRepository repository{test_database_connection_string()};
+
+    try {
+        (void)repository.resolve_restore_plan(std::string(64, 'f'), "m5s5-source");
+        FAIL() << "expected RestorePlanError";
+    } catch (const RestorePlanError& error) {
+        EXPECT_EQ(error.kind(), RestorePlanErrorKind::VersionNotFound);
+    }
+}
+
+TEST(PostgresMetadataRepositoryTest, ResolveRestorePlanRejectsNonCommittedVersion) {
+    reset_metadata_data();
+    PostgresMetadataRepository repository{test_database_connection_string()};
+    const UuidV7 marker = UuidV7::generate();
+    const UuidV7 artifact_id = UuidV7::generate();
+
+    repository.create_artifact(Artifact{artifact_id, "restore-staging-" + marker.str(), "m5s5"});
+    register_test_object_and_layout(repository);
+
+    const ArtifactVersion version{
+        artifact_id,           kObjectId, std::nullopt, ArtifactVersion::ImmutableMetadata{{"marker", marker.str()}},
+        VersionState::Staging,
+    };
+    repository.create_version(version);
+
+    try {
+        (void)repository.resolve_restore_plan(version.version_id(), "m5s5-source");
+        FAIL() << "expected RestorePlanError";
+    } catch (const RestorePlanError& error) {
+        EXPECT_EQ(error.kind(), RestorePlanErrorKind::VersionNotCommitted);
+    }
+}
+
+TEST(PostgresMetadataRepositoryTest, ResolveRestorePlanRejectsWhenNoLayoutIsAvailableOnSource) {
+    reset_metadata_data();
+    PostgresMetadataRepository repository{test_database_connection_string()};
+    const UuidV7 marker = UuidV7::generate();
+    const UuidV7 artifact_id = UuidV7::generate();
+    const std::string source_node = "m5s5-source";
+
+    repository.create_artifact(Artifact{artifact_id, "restore-unavail-" + marker.str(), "m5s5"});
+    register_test_object_and_layout(repository);
+    const auto descriptor = make_object_layout_descriptor();
+    register_finalize_chunks(repository, descriptor, "m5s5-other", StorageLocationState::Available);
+
+    const ArtifactVersion version{
+        artifact_id,
+        kObjectId,
+        std::nullopt,
+        ArtifactVersion::ImmutableMetadata{{"marker", marker.str()}},
+        VersionState::Committed,
+    };
+    repository.create_version(version);
+
+    try {
+        (void)repository.resolve_restore_plan(version.version_id(), source_node);
+        FAIL() << "expected RestorePlanError";
+    } catch (const RestorePlanError& error) {
+        EXPECT_EQ(error.kind(), RestorePlanErrorKind::SourceUnavailable);
+    }
+}
+
+TEST(PostgresMetadataRepositoryTest, ResolveRestorePlanSupportsEmptyObject) {
+    reset_metadata_data();
+    PostgresMetadataRepository repository{test_database_connection_string()};
+    const UuidV7 marker = UuidV7::generate();
+    const UuidV7 artifact_id = UuidV7::generate();
+    const std::string source_node = "m5s5-source";
+    constexpr std::string_view kEmptyObjectId = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+
+    repository.create_artifact(Artifact{artifact_id, "restore-empty-" + marker.str(), "m5s5"});
+
+    const ObjectLayoutDescriptor empty_descriptor{
+        Object{std::string{kEmptyObjectId}, 0},
+        ChunkingStrategy::FixedSize,
+        ObjectLayout{{}},
+    };
+    repository.register_object(empty_descriptor.object());
+    repository.register_object_layout(empty_descriptor);
+
+    const ArtifactVersion version{
+        artifact_id,
+        std::string{kEmptyObjectId},
+        std::nullopt,
+        ArtifactVersion::ImmutableMetadata{{"marker", marker.str()}},
+        VersionState::Committed,
+    };
+    repository.create_version(version);
+
+    const RestorePlan plan = repository.resolve_restore_plan(version.version_id(), source_node);
+    EXPECT_EQ(plan.layout_descriptor.object_id(), kEmptyObjectId);
+    EXPECT_EQ(plan.layout_descriptor.object().total_size(), 0U);
+    EXPECT_TRUE(plan.layout_descriptor.layout().chunks().empty());
+    EXPECT_EQ(plan.layout_descriptor.layout_id(), empty_descriptor.layout_id());
 }
 
 }  // namespace

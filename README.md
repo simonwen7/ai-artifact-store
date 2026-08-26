@@ -10,9 +10,9 @@ The project uses AI/ML workloads as the design context, while storage systems en
 
 ## Current Status
 
-**Milestone 4 — One-Pass Push Protocol**
+**Milestone 5 — Pull / Restore**
 
-The local content-addressed core, metadata model, and production push path are in place through M4 Step 6:
+The local content-addressed core, metadata model, push path, and production pull/restore path are in place through M5:
 
 - content-addressed local CAS
 - Object / immutable layout model
@@ -20,14 +20,15 @@ The local content-addressed core, metadata model, and production push path are i
 - metadata + storage services
 - production HTTP clients
 - persistent UploadSession
-- batch dedup negotiation
 - bounded one-pass push
-- Hybrid Verification
-- 4 upload workers / backpressure
 - atomic finalize
-- idempotent finalize
 - resumable Open-session push
 - production `aistore push`
+- RestorePlan resolution for committed versions
+- bounded pull with 4 download workers / window backpressure
+- resumable partial restore via `.aistore.<version_id>.part`
+- atomic publish (hard-link or rename)
+- production `aistore pull`
 
 ## CLI
 
@@ -53,6 +54,35 @@ Rerunning with the same `--session-id` handles both:
 - a Committed session whose finalize acknowledgement may not have been observed by the client
 
 For the latter, the CLI locally rescans the source, reconstructs the descriptor, and uses idempotent finalize.
+
+### Pull
+
+`aistore pull` restores a committed ArtifactVersion from a configured source storage node.
+
+Required flags:
+
+- `--version-id` — committed ArtifactVersion to restore
+- `--output` — destination file path (parent directory must exist)
+- `--storage-node-id` — source node that holds Available chunk locations
+
+Optional flags:
+
+- `--overwrite` — replace an existing destination file (default: fail if destination exists)
+
+Example:
+
+```bash
+./build/aistore pull \
+  --version-id <64-char-hex-version-id> \
+  --output ./restored.bin \
+  --storage-node-id node-1
+```
+
+Interrupted pulls leave a resumable partial file beside the destination:
+
+`<output>.aistore.<version_id>.part`
+
+Rerunning the same command resumes verified prefix bytes and continues downloading remaining chunks.
 
 ## Technology
 

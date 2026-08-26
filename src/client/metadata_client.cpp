@@ -10,7 +10,10 @@
 #include <utility>
 
 #include "aistore/client/client_error.hpp"
+#include "aistore/metadata/object.hpp"
+#include "aistore/metadata/object_layout.hpp"
 #include "aistore/metadata/object_layout_descriptor.hpp"
+#include "aistore/metadata/restore_plan.hpp"
 #include "aistore/metadata/storage_location.hpp"
 
 namespace aistore::client {
@@ -64,6 +67,34 @@ constexpr std::uint64_t kPostgresBigintMax = static_cast<std::uint64_t>(std::num
     }
 
     if (number == 0U || number > kPostgresBigintMax) {
+        return std::nullopt;
+    }
+
+    return number;
+}
+
+[[nodiscard]] std::optional<std::uint64_t> extract_nonnegative_uint64(const boost::json::value& value) {
+    if (value.is_double()) {
+        return std::nullopt;
+    }
+
+    std::uint64_t number = 0;
+
+    if (value.is_uint64()) {
+        number = value.as_uint64();
+    } else if (value.is_int64()) {
+        const std::int64_t signed_number = value.as_int64();
+
+        if (signed_number < 0) {
+            return std::nullopt;
+        }
+
+        number = static_cast<std::uint64_t>(signed_number);
+    } else {
+        return std::nullopt;
+    }
+
+    if (number > kPostgresBigintMax) {
         return std::nullopt;
     }
 
@@ -393,6 +424,159 @@ aistore::metadata::FinalizeUploadResult MetadataClient::finalize_upload(
         .object_id = object_id,
         .layout_id = layout_id,
     };
+}
+
+aistore::metadata::RestorePlan MetadataClient::get_restore_plan(std::string_view version_id,
+                                                                std::string_view source_node_id) const {
+    if (!is_valid_chunk_id(version_id)) {
+        throw std::invalid_argument("version_id must be 64 lowercase hex characters");
+    }
+
+    if (!is_valid_node_id(source_node_id)) {
+        throw std::invalid_argument("source_node_id is invalid");
+    }
+
+    const std::string target = std::string{"/v1/artifact-versions/"} + std::string{version_id} + "/restore-plan/" +
+                               std::string{source_node_id};
+    const aistore::http::HttpClientResponse response = http_client_.request(beast_http::verb::get, target);
+
+    if (status_code_of(response) != 200U) {
+        throw_remote_api_error(response);
+    }
+
+    boost::system::error_code parse_error;
+    const boost::json::value parsed = boost::json::parse(response.body(), parse_error);
+
+    if (parse_error || !parsed.is_object()) {
+        throw RemoteProtocolError{"restore plan response is not a JSON object"};
+    }
+
+    const boost::json::object& object = parsed.as_object();
+
+    if (object.size() != 9U || !object.contains("version_id") || !object.contains("artifact_id") ||
+        !object.contains("source_node_id") || !object.contains("object_id") || !object.contains("total_size_bytes") ||
+        !object.contains("layout_id") || !object.contains("chunking_strategy") || !object.contains("chunk_count") ||
+        !object.contains("chunks") || !object.at("version_id").is_string() || !object.at("artifact_id").is_string() ||
+        !object.at("source_node_id").is_string() || !object.at("object_id").is_string() ||
+        !object.at("layout_id").is_string() || !object.at("chunking_strategy").is_string() ||
+        !object.at("chunks").is_array()) {
+        throw RemoteProtocolError{"restore plan response has unexpected fields"};
+    }
+
+    const std::string response_version_id{object.at("version_id").as_string()};
+    const std::string response_source_node_id{object.at("source_node_id").as_string()};
+
+    if (response_version_id != version_id) {
+        throw RemoteProtocolError{"restore plan response version_id does not match request"};
+    }
+
+    if (response_source_node_id != source_node_id) {
+        throw RemoteProtocolError{"restore plan response source_node_id does not match request"};
+    }
+
+    const std::string object_id{object.at("object_id").as_string()};
+    const std::string layout_id{object.at("layout_id").as_string()};
+
+    if (!is_valid_chunk_id(object_id) || !is_valid_chunk_id(layout_id)) {
+        throw RemoteProtocolError{"restore plan response contains an invalid content ID"};
+    }
+
+    if (object.at("chunking_strategy").as_string() != "fixed-size") {
+        throw RemoteProtocolError{"restore plan chunking strategy is unsupported"};
+    }
+
+    const std::optional<std::uint64_t> total_size_bytes = extract_nonnegative_uint64(object.at("total_size_bytes"));
+
+    if (!total_size_bytes.has_value()) {
+        throw RemoteProtocolError{"restore plan total_size_bytes is invalid"};
+    }
+
+    const std::optional<std::uint64_t> chunk_count = extract_nonnegative_uint64(object.at("chunk_count"));
+
+    if (!chunk_count.has_value()) {
+        throw RemoteProtocolError{"restore plan chunk_count is invalid"};
+    }
+
+    const boost::json::array& chunks_array = object.at("chunks").as_array();
+
+    if (*chunk_count != chunks_array.size()) {
+        throw RemoteProtocolError{"restore plan chunk_count does not match chunks array size"};
+    }
+
+    std::vector<aistore::metadata::ChunkRef> chunk_refs;
+    chunk_refs.reserve(chunks_array.size());
+
+    for (const boost::json::value& chunk_value : chunks_array) {
+        if (!chunk_value.is_object()) {
+            throw RemoteProtocolError{"restore plan chunk entry is not an object"};
+        }
+
+        const boost::json::object& chunk_object = chunk_value.as_object();
+
+        if (chunk_object.size() != 3U || !chunk_object.contains("chunk_id") || !chunk_object.contains("offset") ||
+            !chunk_object.contains("size_bytes") || !chunk_object.at("chunk_id").is_string()) {
+            throw RemoteProtocolError{"restore plan chunk entry has unexpected fields"};
+        }
+
+        const std::string chunk_id{chunk_object.at("chunk_id").as_string()};
+
+        if (!is_valid_chunk_id(chunk_id)) {
+            throw RemoteProtocolError{"restore plan chunk_id is invalid"};
+        }
+
+        const std::optional<std::uint64_t> offset = extract_nonnegative_uint64(chunk_object.at("offset"));
+
+        if (!offset.has_value()) {
+            throw RemoteProtocolError{"restore plan chunk offset is invalid"};
+        }
+
+        std::optional<std::uint64_t> size_bytes = extract_positive_uint64(chunk_object.at("size_bytes"));
+
+        if (!size_bytes.has_value()) {
+            throw RemoteProtocolError{"restore plan chunk size_bytes is invalid"};
+        }
+
+        chunk_refs.push_back(aistore::metadata::ChunkRef{
+            .chunk_id = chunk_id,
+            .offset = *offset,
+            .size = *size_bytes,
+        });
+    }
+
+    aistore::metadata::UuidV7 artifact_id{std::string{object.at("artifact_id").as_string()}};
+
+    try {
+        aistore::metadata::Object layout_object{object_id, *total_size_bytes};
+        aistore::metadata::ObjectLayout layout{std::move(chunk_refs)};
+        aistore::metadata::ObjectLayoutDescriptor descriptor{
+            std::move(layout_object),
+            aistore::metadata::ChunkingStrategy::FixedSize,
+            std::move(layout),
+        };
+
+        if (descriptor.object_id() != object_id) {
+            throw RemoteProtocolError{"restore plan reconstructed object_id does not match response"};
+        }
+
+        if (descriptor.layout_id() != layout_id) {
+            throw RemoteProtocolError{"restore plan reconstructed layout_id does not match response"};
+        }
+
+        if (descriptor.object().total_size() != *total_size_bytes) {
+            throw RemoteProtocolError{"restore plan reconstructed total size does not match response"};
+        }
+
+        return aistore::metadata::RestorePlan{
+            .artifact_id = artifact_id,
+            .version_id = response_version_id,
+            .source_node_id = response_source_node_id,
+            .layout_descriptor = std::move(descriptor),
+        };
+    } catch (const RemoteProtocolError&) {
+        throw;
+    } catch (const std::exception&) {
+        throw RemoteProtocolError{"restore plan response failed domain validation"};
+    }
 }
 
 ChunkNegotiationResult MetadataClient::negotiate_chunks(

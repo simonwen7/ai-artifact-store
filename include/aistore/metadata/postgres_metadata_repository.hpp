@@ -13,6 +13,7 @@
 #include "aistore/metadata/manifest_model.hpp"
 #include "aistore/metadata/object.hpp"
 #include "aistore/metadata/object_layout_descriptor.hpp"
+#include "aistore/metadata/restore_plan.hpp"
 #include "aistore/metadata/run_model.hpp"
 #include "aistore/metadata/storage_location.hpp"
 #include "aistore/metadata/upload_session.hpp"
@@ -83,6 +84,8 @@ class PostgresMetadataRepository {
 
     [[nodiscard]] FinalizeUploadResult finalize_upload(const UuidV7& session_id,
                                                        const ObjectLayoutDescriptor& descriptor);
+
+    [[nodiscard]] RestorePlan resolve_restore_plan(std::string_view version_id, std::string_view source_node_id);
 
    private:
     class Impl;

@@ -1,14 +1,16 @@
 #include "aistore/client/storage_node_client.hpp"
 
+#include <array>
 #include <boost/json.hpp>
+#include <cstddef>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <utility>
 
 #include "aistore/client/client_error.hpp"
-
-namespace aistore::client {
+#include "aistore/hashing/sha256.hpp"
 
 namespace {
 
@@ -31,7 +33,8 @@ namespace beast_http = aistore::http::beast_http;
 }
 
 [[noreturn]] void throw_remote_api_error(const aistore::http::HttpClientResponse& response) {
-    throw RemoteApiError{status_code_of(response), extract_error_code(response.body()), response.body()};
+    throw aistore::client::RemoteApiError{status_code_of(response), extract_error_code(response.body()),
+                                          response.body()};
 }
 
 [[nodiscard]] bool is_valid_chunk_id(std::string_view chunk_id) {
@@ -51,11 +54,30 @@ namespace beast_http = aistore::http::beast_http;
     return true;
 }
 
+[[nodiscard]] std::string digest_to_hex(const aistore::hashing::Sha256::Digest& digest) {
+    constexpr std::array<char, 16> kHexDigits{
+        '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f',
+    };
+
+    std::string result;
+    result.reserve(digest.size() * 2U);
+
+    for (const std::byte byte : digest) {
+        const auto value = std::to_integer<unsigned int>(byte);
+        result.push_back(kHexDigits[(value >> 4U) & 0x0FU]);
+        result.push_back(kHexDigits[value & 0x0FU]);
+    }
+
+    return result;
+}
+
 [[nodiscard]] std::string chunk_target(std::string_view chunk_id) {
     return std::string{"/v1/chunks/"} + std::string{chunk_id};
 }
 
 }  // namespace
+
+namespace aistore::client {
 
 StorageNodeClient::StorageNodeClient(http::HttpClientConfig config) : http_client_{std::move(config)} {}
 
@@ -120,6 +142,18 @@ std::optional<std::vector<std::byte>> StorageNodeClient::get_chunk(std::string_v
 
     if (response[beast_http::field::content_type] != "application/octet-stream") {
         throw RemoteProtocolError{"chunk response Content-Type must be application/octet-stream"};
+    }
+
+    const std::span<const std::byte> body_bytes{
+        reinterpret_cast<const std::byte*>(response.body().data()),
+        response.body().size(),
+    };
+
+    aistore::hashing::Sha256 hasher;
+    hasher.update(body_bytes);
+
+    if (digest_to_hex(hasher.finalize()) != chunk_id) {
+        throw RemoteProtocolError{"chunk response digest does not match requested chunk_id"};
     }
 
     std::vector<std::byte> bytes;

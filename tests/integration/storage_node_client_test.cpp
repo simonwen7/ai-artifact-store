@@ -27,14 +27,19 @@
 namespace {
 
 using aistore::client::RemoteApiError;
+using aistore::client::RemoteProtocolError;
 using aistore::client::StorageNodeClient;
 using aistore::http::HttpClientConfig;
 using aistore::http::HttpEndpoint;
 using aistore::http::HttpRequest;
+using aistore::http::HttpResponse;
 using aistore::http::HttpServer;
 using aistore::http::HttpServerConfig;
+using aistore::http::RequestHandler;
 using aistore::service::StorageNodeService;
 using aistore::storage::LocalChunkStore;
+
+namespace beast_http = aistore::http::beast_http;
 
 constexpr std::uint64_t kMaxBodyBytes = 8ULL * 1024ULL * 1024ULL;
 
@@ -75,6 +80,9 @@ class TemporaryDirectory {
 class RunningHttpServer {
    public:
     explicit RunningHttpServer(StorageNodeService& service)
+        : RunningHttpServer([&service](const HttpRequest& request) { return service.handle_request(request); }) {}
+
+    explicit RunningHttpServer(RequestHandler handler)
         : server_(
               HttpServerConfig{
                   .bind_address = "127.0.0.1",
@@ -82,7 +90,7 @@ class RunningHttpServer {
                   .worker_threads = 2,
                   .max_request_body_bytes = kMaxBodyBytes,
               },
-              [&service](const HttpRequest& request) { return service.handle_request(request); }),
+              std::move(handler)),
           worker_([this] { server_.run(); }) {}
 
     ~RunningHttpServer() {
@@ -217,6 +225,26 @@ TEST(StorageNodeClientTest, HashMismatchProducesRemoteApiError) {
         EXPECT_EQ(error.status_code(), 422U);
         EXPECT_EQ(error.error_code(), "chunk_hash_mismatch");
     }
+}
+
+TEST(StorageNodeClientTest, GetChunkRejectsSuccessfulBodyWhoseHashDoesNotMatchChunkId) {
+    RunningHttpServer server{[](const HttpRequest& request) {
+        HttpResponse response{beast_http::status::ok, request.version()};
+        response.set(beast_http::field::content_type, "application/octet-stream");
+        response.body() = "wrong-bytes-not-matching-requested-chunk-id";
+        response.prepare_payload();
+        return response;
+    }};
+
+    StorageNodeClient client{HttpClientConfig{
+        .endpoint =
+            HttpEndpoint{
+                .address = "127.0.0.1",
+                .port = server.port(),
+            },
+    }};
+
+    EXPECT_THROW((void)client.get_chunk(kAbcChunkId), RemoteProtocolError);
 }
 
 TEST(StorageNodeClientTest, InvalidChunkIdIsRejectedBeforeNetwork) {
