@@ -29,6 +29,7 @@
 #include "aistore/metadata/chunking.hpp"
 #include "aistore/metadata/object.hpp"
 #include "aistore/metadata/object_layout.hpp"
+#include "aistore/metadata/placement.hpp"
 #include "aistore/metadata/storage_location.hpp"
 #include "aistore/metadata/upload_session.hpp"
 
@@ -120,6 +121,8 @@ struct UploadTask {
     aistore::metadata::ChunkMetadata chunk;
     std::vector<std::byte> bytes;
     aistore::client::ChunkAvailability availability;
+    std::vector<std::string> available_node_ids;
+    std::vector<std::string> desired_node_ids;
 };
 
 struct StagedChunk {
@@ -213,43 +216,55 @@ void record_failure(SharedWorkerState& state, const std::exception_ptr& exceptio
 }
 
 void process_upload_task(const UploadTask& task, aistore::client::MetadataClient& metadata_client,
-                         aistore::client::StorageNodeClient& storage_client, std::string_view storage_node_id,
-                         SharedWorkerState& state) {
-    using aistore::client::ChunkAvailability;
+                         aistore::client::StorageNodeClientPool& storage_pool, SharedWorkerState& state) {
     using aistore::metadata::StorageLocation;
     using aistore::metadata::StorageLocationState;
 
-    const auto register_available = [&] {
+    const auto register_available = [&](std::string_view node_id) {
         metadata_client.register_storage_location(StorageLocation{
             .chunk_id = task.chunk.chunk_id,
-            .node_id = std::string{storage_node_id},
+            .node_id = std::string{node_id},
             .storage_path = logical_storage_path(task.chunk.chunk_id),
             .state = StorageLocationState::Available,
         });
     };
 
-    if (task.availability == ChunkAvailability::AvailableOnTarget) {
-        if (storage_client.has_chunk(task.chunk.chunk_id)) {
-            state.verified_target_chunks.fetch_add(1U, std::memory_order_relaxed);
-            return;
+    const auto node_is_available_in_negotiation = [&](std::string_view node_id) {
+        for (const std::string& available_node_id : task.available_node_ids) {
+            if (available_node_id == node_id) {
+                return true;
+            }
+        }
+
+        return false;
+    };
+
+    for (const std::string& desired_node_id : task.desired_node_ids) {
+        aistore::client::StorageNodeClient& storage_client = storage_pool.client_for(desired_node_id);
+
+        if (node_is_available_in_negotiation(desired_node_id)) {
+            if (storage_client.has_chunk(task.chunk.chunk_id)) {
+                state.verified_target_chunks.fetch_add(1U, std::memory_order_relaxed);
+                continue;
+            }
+
+            storage_client.put_chunk(task.chunk.chunk_id, task.bytes);
+            state.put_requests.fetch_add(1U, std::memory_order_relaxed);
+            state.repaired_target_chunks.fetch_add(1U, std::memory_order_relaxed);
+            state.bytes_sent_to_storage.fetch_add(task.bytes.size(), std::memory_order_relaxed);
+            register_available(desired_node_id);
+            continue;
         }
 
         storage_client.put_chunk(task.chunk.chunk_id, task.bytes);
         state.put_requests.fetch_add(1U, std::memory_order_relaxed);
-        state.repaired_target_chunks.fetch_add(1U, std::memory_order_relaxed);
         state.bytes_sent_to_storage.fetch_add(task.bytes.size(), std::memory_order_relaxed);
-        register_available();
-        return;
+        register_available(desired_node_id);
     }
-
-    storage_client.put_chunk(task.chunk.chunk_id, task.bytes);
-    state.put_requests.fetch_add(1U, std::memory_order_relaxed);
-    state.bytes_sent_to_storage.fetch_add(task.bytes.size(), std::memory_order_relaxed);
-    register_available();
 }
 
 void worker_loop(SharedWorkerState& state, aistore::client::MetadataClient& metadata_client,
-                 aistore::client::StorageNodeClient& storage_client, const std::string& storage_node_id) {
+                 aistore::client::StorageNodeClientPool& storage_pool) {
     while (true) {
         std::optional<UploadTask> task = state.queue.pop();
 
@@ -258,7 +273,7 @@ void worker_loop(SharedWorkerState& state, aistore::client::MetadataClient& meta
         }
 
         try {
-            process_upload_task(*task, metadata_client, storage_client, storage_node_id, state);
+            process_upload_task(*task, metadata_client, storage_pool, state);
         } catch (...) {
             record_failure(state, std::current_exception());
             state.queue.cancel();
@@ -296,9 +311,8 @@ struct ChunkFeedCallbacks {
 
 [[nodiscard]] PreparedPush execute_push_data_plane(
     const PushRequest& request, const aistore::metadata::UploadSession& session,
-    aistore::client::MetadataClient& metadata_client, aistore::client::StorageNodeClient& storage_client,
-    const std::string& storage_node_id, const ChunkFeedCallbacks& chunk_feed,
-    aistore::metadata::ChunkingStrategy chunking_strategy,
+    aistore::client::MetadataClient& metadata_client, aistore::client::StorageNodeClientPool& storage_pool,
+    const ChunkFeedCallbacks& chunk_feed, aistore::metadata::ChunkingStrategy chunking_strategy,
     const std::optional<aistore::metadata::FastCdcParameters>& fastcdc_parameters) {
     std::ifstream input{request.source_path, std::ios::binary};
 
@@ -334,7 +348,7 @@ struct ChunkFeedCallbacks {
             metadata_client.negotiate_chunks(request.session_id, metadata_batch);
 
         if (negotiation.session_id != request.session_id || negotiation.target_node_id != session.target_node_id() ||
-            negotiation.target_node_id != storage_node_id || negotiation.chunks.size() != batch.size()) {
+            negotiation.chunks.size() != batch.size()) {
             throw aistore::client::RemoteProtocolError{"negotiation response does not match staged batch"};
         }
 
@@ -347,10 +361,21 @@ struct ChunkFeedCallbacks {
                 throw aistore::client::RemoteProtocolError{"negotiation chunk metadata mismatch"};
             }
 
+            const std::vector<std::string> desired_node_ids = aistore::metadata::select_replica_nodes(
+                staged.metadata.chunk_id, session.placement_node_ids(), session.replication_factor());
+
+            for (const std::string& desired_node_id : desired_node_ids) {
+                if (!storage_pool.contains(desired_node_id)) {
+                    throw std::runtime_error("upload session desired replica node is not available in storage pool");
+                }
+            }
+
             UploadTask task{
                 .chunk = staged.metadata,
                 .bytes = std::move(batch[index].bytes),
                 .availability = negotiated.availability,
+                .available_node_ids = negotiated.available_node_ids,
+                .desired_node_ids = desired_node_ids,
             };
 
             if (!shared.queue.push(std::move(task))) {
@@ -403,8 +428,7 @@ struct ChunkFeedCallbacks {
 
         try {
             for (std::size_t index = 0; index < PushEngine::kWorkerCount; ++index) {
-                workers.emplace_back(worker_loop, std::ref(shared), std::ref(metadata_client), std::ref(storage_client),
-                                     std::cref(storage_node_id));
+                workers.emplace_back(worker_loop, std::ref(shared), std::ref(metadata_client), std::ref(storage_pool));
             }
 
             std::vector<std::byte> read_buffer(PushEngine::kReadBufferSize);
@@ -571,13 +595,8 @@ struct ChunkFeedCallbacks {
 
 }  // namespace
 
-PushEngine::PushEngine(client::MetadataClient& metadata_client, client::StorageNodeClient& storage_client,
-                       std::string storage_node_id)
-    : metadata_client_{metadata_client}, storage_client_{storage_client}, storage_node_id_{std::move(storage_node_id)} {
-    if (!is_valid_node_id(storage_node_id_)) {
-        throw std::invalid_argument("storage node ID is invalid");
-    }
-}
+PushEngine::PushEngine(client::MetadataClient& metadata_client, client::StorageNodeClientPool& storage_pool)
+    : metadata_client_{metadata_client}, storage_pool_{storage_pool} {}
 
 PreparedPush PushEngine::push(const PushRequest& request) const {
     const std::optional<aistore::metadata::UploadSession> session =
@@ -591,8 +610,8 @@ PreparedPush PushEngine::push(const PushRequest& request) const {
         throw std::runtime_error("upload session must be open");
     }
 
-    if (session->target_node_id() != storage_node_id_) {
-        throw std::invalid_argument("upload session target node does not match storage client node");
+    if (!storage_pool_.contains(session->target_node_id())) {
+        throw std::invalid_argument("upload session target node is not available in storage pool");
     }
 
     switch (session->chunking_strategy()) {
@@ -601,7 +620,7 @@ PreparedPush PushEngine::push(const PushRequest& request) const {
             aistore::chunking::FixedSizeChunker chunker{chunk_size};
 
             return execute_push_data_plane(
-                request, *session, metadata_client_, storage_client_, storage_node_id_,
+                request, *session, metadata_client_, storage_pool_,
                 ChunkFeedCallbacks{
                     .update = [&chunker](std::span<const std::byte> data,
                                          const ChunkConsumer& consumer) { chunker.update(data, consumer); },
@@ -619,7 +638,7 @@ PreparedPush PushEngine::push(const PushRequest& request) const {
             };
 
             return execute_push_data_plane(
-                request, *session, metadata_client_, storage_client_, storage_node_id_,
+                request, *session, metadata_client_, storage_pool_,
                 ChunkFeedCallbacks{
                     .update = [&chunker](std::span<const std::byte> data,
                                          const ChunkConsumer& consumer) { chunker.update(data, consumer); },
@@ -644,10 +663,6 @@ PreparedPush PushEngine::prepare_committed_retry(const PushRequest& request,
 
     if (!committed_session.finalized_version_id().has_value()) {
         throw std::invalid_argument("committed retry requires a finalized version ID");
-    }
-
-    if (committed_session.target_node_id() != storage_node_id_) {
-        throw std::invalid_argument("committed retry target node does not match storage client node");
     }
 
     switch (committed_session.chunking_strategy()) {

@@ -155,7 +155,7 @@ boost::json::object parse_json_object(const HttpResponse& response) {
 TEST(HttpServiceHealthTest, StorageNodeHealthOverHttp) {
     TemporaryDirectory temporary_directory;
     LocalChunkStore chunk_store{temporary_directory.path()};
-    StorageNodeService service{chunk_store};
+    StorageNodeService service{chunk_store, "node-A"};
     RunningHttpServer server{service};
 
     const HttpResponse response = http_exchange(server.port(), beast_http::verb::get, "/health");
@@ -166,8 +166,23 @@ TEST(HttpServiceHealthTest, StorageNodeHealthOverHttp) {
 
     const boost::json::object body = parse_json_object(response);
 
+    ASSERT_EQ(body.size(), 2U);
     ASSERT_TRUE(body.contains("status"));
+    ASSERT_TRUE(body.contains("node_id"));
     EXPECT_EQ(body.at("status").as_string(), "ok");
+    EXPECT_EQ(body.at("node_id").as_string(), "node-A");
+}
+
+TEST(HttpServiceHealthTest, HealthReportsStorageNodeIdentity) {
+    TemporaryDirectory temporary_directory;
+    LocalChunkStore chunk_store{temporary_directory.path()};
+    StorageNodeService service{chunk_store, "node-B"};
+    RunningHttpServer server{service};
+
+    const HttpResponse response = http_exchange(server.port(), beast_http::verb::get, "/health");
+    const boost::json::object body = parse_json_object(response);
+
+    EXPECT_EQ(body.at("node_id").as_string(), "node-B");
 }
 
 TEST(HttpServiceHealthTest, MetadataServiceHealthOverHttp) {

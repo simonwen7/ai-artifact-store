@@ -349,4 +349,56 @@ bool StorageNodeClient::delete_chunk(std::string_view chunk_id) const {
     return parse_delete_chunk_response(chunk_id, response.body());
 }
 
+std::string StorageNodeClient::probe_node_id() const {
+    const aistore::http::HttpClientResponse response = http_client_.request(beast_http::verb::get, "/health");
+
+    if (status_code_of(response) != 200U) {
+        throw_remote_api_error(response);
+    }
+
+    if (response[beast_http::field::content_type] != "application/json") {
+        throw RemoteProtocolError{"health response Content-Type must be application/json"};
+    }
+
+    boost::system::error_code parse_error;
+    const boost::json::value parsed = boost::json::parse(response.body(), parse_error);
+
+    if (parse_error || !parsed.is_object()) {
+        throw RemoteProtocolError{"health response is not a JSON object"};
+    }
+
+    const boost::json::object& object = parsed.as_object();
+
+    if (!json_object_has_exact_keys(object, {"status", "node_id"})) {
+        throw RemoteProtocolError{"health response has unexpected fields"};
+    }
+
+    if (!object.at("status").is_string() || object.at("status").as_string() != "ok") {
+        throw RemoteProtocolError{"health response status must be ok"};
+    }
+
+    if (!object.at("node_id").is_string()) {
+        throw RemoteProtocolError{"health response node_id is invalid"};
+    }
+
+    const std::string node_id{object.at("node_id").as_string()};
+
+    if (node_id.empty() || node_id.size() > 128U) {
+        throw RemoteProtocolError{"health response node_id is invalid"};
+    }
+
+    for (const char character : node_id) {
+        const bool is_upper = character >= 'A' && character <= 'Z';
+        const bool is_lower = character >= 'a' && character <= 'z';
+        const bool is_digit = character >= '0' && character <= '9';
+        const bool is_allowed_punct = character == '-' || character == '_' || character == '.';
+
+        if (!is_upper && !is_lower && !is_digit && !is_allowed_punct) {
+            throw RemoteProtocolError{"health response node_id is invalid"};
+        }
+    }
+
+    return node_id;
+}
+
 }  // namespace aistore::client

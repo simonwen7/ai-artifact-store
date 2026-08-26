@@ -195,6 +195,24 @@ class GcEngineFixture : public ::testing::Test {
         unique_tag_ = UuidV7::generate().str();
 
         repository_.emplace(test_database_connection_string());
+        {
+            pqxx::connection connection{test_database_connection_string()};
+            pqxx::work transaction{connection};
+            transaction
+                .exec(
+                    "DELETE FROM upload_session_finalizations WHERE session_id IN "
+                    "(SELECT session_id FROM upload_sessions WHERE state = 'open')")
+                .no_rows();
+            transaction
+                .exec(
+                    "DELETE FROM upload_session_metadata WHERE session_id IN "
+                    "(SELECT session_id FROM upload_sessions WHERE state = 'open')")
+                .no_rows();
+            transaction.exec("DELETE FROM upload_sessions WHERE state = 'open'").no_rows();
+            transaction.exec("DELETE FROM replication_runs").no_rows();
+            transaction.exec("DELETE FROM gc_runs").no_rows();
+            transaction.commit();
+        }
         repository_->create_artifact(
             Artifact{artifact_id_, std::string{"m7gc-artifact-"} + artifact_id_.str(), "m7gc-project"});
 

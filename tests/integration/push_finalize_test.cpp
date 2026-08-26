@@ -16,13 +16,14 @@
 
 #include "aistore/client/client_error.hpp"
 #include "aistore/client/metadata_client.hpp"
-#include "aistore/client/storage_node_client.hpp"
+#include "aistore/client/storage_node_client_pool.hpp"
 #include "aistore/http/http_client.hpp"
 #include "aistore/http/http_server.hpp"
 #include "aistore/metadata/artifact_model.hpp"
 #include "aistore/metadata/finalize_upload.hpp"
 #include "aistore/metadata/postgres_metadata_repository.hpp"
 #include "aistore/metadata/storage_location.hpp"
+#include "aistore/metadata/storage_node.hpp"
 #include "aistore/metadata/upload_session.hpp"
 #include "aistore/push/push_engine.hpp"
 #include "aistore/service/metadata_service.hpp"
@@ -34,6 +35,7 @@ namespace {
 using aistore::client::MetadataClient;
 using aistore::client::RemoteApiError;
 using aistore::client::StorageNodeClient;
+using aistore::client::StorageNodeClientPool;
 using aistore::http::HttpClientConfig;
 using aistore::http::HttpEndpoint;
 using aistore::http::HttpRequest;
@@ -118,6 +120,24 @@ class PushFinalizeTest : public ::testing::Test {
         artifact_id_ = UuidV7::generate();
         session_id_ = UuidV7::generate();
         repository_.emplace(test_database_connection_string());
+        {
+            pqxx::connection connection{test_database_connection_string()};
+            pqxx::work transaction{connection};
+            transaction
+                .exec(
+                    "DELETE FROM upload_session_finalizations WHERE session_id IN "
+                    "(SELECT session_id FROM upload_sessions WHERE state = 'open')")
+                .no_rows();
+            transaction
+                .exec(
+                    "DELETE FROM upload_session_metadata WHERE session_id IN "
+                    "(SELECT session_id FROM upload_sessions WHERE state = 'open')")
+                .no_rows();
+            transaction.exec("DELETE FROM upload_sessions WHERE state = 'open'").no_rows();
+            transaction.exec("DELETE FROM replication_runs").no_rows();
+            transaction.exec("DELETE FROM gc_runs").no_rows();
+            transaction.commit();
+        }
         repository_->create_artifact(Artifact{artifact_id_, "m4s5-push-" + marker_, "m4s5"});
         metadata_service_.emplace(*repository_);
         metadata_server_.emplace(
@@ -132,12 +152,16 @@ class PushFinalizeTest : public ::testing::Test {
         storage_client_.emplace(HttpClientConfig{
             .endpoint = HttpEndpoint{.address = "127.0.0.1", .port = storage_server_->port()},
         });
+        storage_pool_.emplace(std::vector<std::pair<std::string, StorageNodeClient>>{
+            {std::string{kTargetNode}, *storage_client_},
+        });
         source_root_.emplace();
-        engine_.emplace(*metadata_client_, *storage_client_, std::string{kTargetNode});
+        engine_.emplace(*metadata_client_, *storage_pool_);
     }
 
     void TearDown() override {
         engine_.reset();
+        storage_pool_.reset();
         storage_client_.reset();
         storage_server_.reset();
         storage_service_.reset();
@@ -175,6 +199,12 @@ class PushFinalizeTest : public ::testing::Test {
     }
 
     void create_session() {
+        metadata_client_->register_storage_node(aistore::metadata::StorageNode{
+            .node_id = std::string{kTargetNode},
+            .address = "127.0.0.1",
+            .port = 8081,
+            .state = aistore::metadata::StorageNodeState::Active,
+        });
         (void)metadata_client_->create_upload_session(UploadSession{session_id_,
                                                                     artifact_id_,
                                                                     std::string{kTargetNode},
@@ -210,6 +240,7 @@ class PushFinalizeTest : public ::testing::Test {
     std::optional<StorageNodeService> storage_service_;
     std::optional<RunningHttpServer> storage_server_;
     std::optional<StorageNodeClient> storage_client_;
+    std::optional<StorageNodeClientPool> storage_pool_;
     std::optional<TemporaryDirectory> source_root_;
     std::optional<PushEngine> engine_;
 };
@@ -260,7 +291,7 @@ TEST_F(PushFinalizeTest, FailedFinalizeLeavesSessionOpenAndPushDataDurable) {
         FAIL() << "expected RemoteApiError";
     } catch (const RemoteApiError& error) {
         EXPECT_EQ(error.status_code(), 409U);
-        EXPECT_EQ(error.error_code(), "chunk_not_available_on_target");
+        EXPECT_EQ(error.error_code(), "chunk_under_replicated");
     }
 
     const auto session = repository_->get_upload_session(session_id_);

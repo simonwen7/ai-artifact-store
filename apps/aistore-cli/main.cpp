@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <boost/asio/ip/address.hpp>
 #include <boost/json.hpp>
 #include <boost/system/error_code.hpp>
@@ -7,6 +8,7 @@
 #include <iostream>
 #include <map>
 #include <optional>
+#include <ranges>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -16,15 +18,18 @@
 #include "aistore/client/client_error.hpp"
 #include "aistore/client/metadata_client.hpp"
 #include "aistore/client/storage_node_client.hpp"
+#include "aistore/client/storage_node_client_pool.hpp"
 #include "aistore/gc/gc_engine.hpp"
 #include "aistore/http/http_client.hpp"
 #include "aistore/metadata/chunking.hpp"
 #include "aistore/metadata/finalize_upload.hpp"
 #include "aistore/metadata/gc.hpp"
+#include "aistore/metadata/storage_node.hpp"
 #include "aistore/metadata/upload_session.hpp"
 #include "aistore/metadata/uuid_v7.hpp"
 #include "aistore/pull/pull_engine.hpp"
 #include "aistore/push/push_engine.hpp"
+#include "aistore/replication/repair_engine.hpp"
 
 namespace {
 
@@ -53,15 +58,21 @@ void print_top_level_usage(std::ostream& out) {
            "  aistore push [options]\n"
            "  aistore pull [options]\n"
            "  aistore gc [options]\n"
+           "  aistore node <subcommand> [options]\n"
+           "  aistore repair [options]\n"
            "\n"
            "Commands:\n"
            "  push\n"
            "  pull\n"
            "  gc\n"
+           "  node\n"
+           "  repair\n"
            "\n"
            "Run `aistore push --help` for push options.\n"
            "Run `aistore pull --help` for pull options.\n"
-           "Run `aistore gc --help` for gc options.\n";
+           "Run `aistore gc --help` for gc options.\n"
+           "Run `aistore node --help` for node options.\n"
+           "Run `aistore repair --help` for repair options.\n";
 }
 
 void print_push_usage(std::ostream& out) {
@@ -71,10 +82,10 @@ void print_push_usage(std::ostream& out) {
            "Required:\n"
            "  --file <path>\n"
            "  --artifact-id <uuidv7>\n"
-           "  --storage-node-id <node-id>\n"
            "\n"
            "Optional:\n"
            "  --session-id <uuidv7>\n"
+           "  --replication-factor <1..8>\n"
            "  --chunking-strategy <fixed-size|fastcdc>\n"
            "  --chunk-size <bytes>\n"
            "  --min-chunk-size <bytes>\n"
@@ -84,12 +95,10 @@ void print_push_usage(std::ostream& out) {
            "  --metadata <KEY=VALUE>\n"
            "  --metadata-address <numeric-ip>\n"
            "  --metadata-port <port>\n"
-           "  --storage-address <numeric-ip>\n"
-           "  --storage-port <port>\n"
            "\n"
            "Defaults:\n"
            "  metadata 127.0.0.1:8080\n"
-           "  storage  127.0.0.1:8081\n"
+           "  replication-factor 1\n"
            "  chunking-strategy fixed-size\n"
            "  chunk-size 4194304\n"
            "  min-chunk-size 2097152\n"
@@ -104,18 +113,14 @@ void print_pull_usage(std::ostream& out) {
            "Required:\n"
            "  --version-id <64-lowercase-hex>\n"
            "  --output <path>\n"
-           "  --storage-node-id <node-id>\n"
            "\n"
            "Optional:\n"
            "  --overwrite\n"
            "  --metadata-address <numeric-ip>\n"
            "  --metadata-port <port>\n"
-           "  --storage-address <numeric-ip>\n"
-           "  --storage-port <port>\n"
            "\n"
            "Defaults:\n"
-           "  metadata 127.0.0.1:8080\n"
-           "  storage  127.0.0.1:8081\n";
+           "  metadata 127.0.0.1:8080\n";
 }
 
 void print_gc_usage(std::ostream& out) {
@@ -130,12 +135,9 @@ void print_gc_usage(std::ostream& out) {
            "  --dry-run\n"
            "  --metadata-address <numeric-ip>\n"
            "  --metadata-port <port>\n"
-           "  --storage-address <numeric-ip>\n"
-           "  --storage-port <port>\n"
            "\n"
            "Defaults:\n"
-           "  metadata 127.0.0.1:8080\n"
-           "  storage  127.0.0.1:8081\n";
+           "  metadata 127.0.0.1:8080\n";
 }
 
 [[nodiscard]] bool is_regular_file_path(const std::filesystem::path& path) {
@@ -252,8 +254,8 @@ void validate_version_id(std::string_view version_id) {
 struct PushOptions {
     std::filesystem::path file_path;
     aistore::metadata::UuidV7 artifact_id;
-    std::string storage_node_id;
     aistore::metadata::UuidV7 session_id;
+    std::uint8_t replication_factor = 1;
     aistore::metadata::ChunkingStrategy chunking_strategy = aistore::metadata::ChunkingStrategy::FixedSize;
     std::uint64_t chunk_size_bytes = 4194304ULL;
     std::uint64_t min_chunk_size_bytes = 2097152ULL;
@@ -263,8 +265,6 @@ struct PushOptions {
     aistore::metadata::UploadSession::ImmutableMetadata immutable_metadata;
     std::string metadata_address = "127.0.0.1";
     std::uint16_t metadata_port = 8080;
-    std::string storage_address = "127.0.0.1";
-    std::uint16_t storage_port = 8081;
 };
 
 [[nodiscard]] aistore::metadata::ChunkingStrategy parse_chunking_strategy(std::string_view text) {
@@ -283,7 +283,7 @@ struct PushOptions {
     std::optional<aistore::metadata::UuidV7> artifact_id;
     std::optional<aistore::metadata::UuidV7> session_id;
     std::filesystem::path file_path;
-    std::string storage_node_id;
+    std::uint8_t replication_factor = 1;
     aistore::metadata::ChunkingStrategy chunking_strategy = aistore::metadata::ChunkingStrategy::FixedSize;
     std::uint64_t chunk_size_bytes = 4194304ULL;
     std::uint64_t min_chunk_size_bytes = 2097152ULL;
@@ -293,13 +293,11 @@ struct PushOptions {
     aistore::metadata::UploadSession::ImmutableMetadata immutable_metadata;
     std::string metadata_address = "127.0.0.1";
     std::uint16_t metadata_port = 8080;
-    std::string storage_address = "127.0.0.1";
-    std::uint16_t storage_port = 8081;
 
     bool has_file = false;
     bool has_artifact_id = false;
-    bool has_storage_node_id = false;
     bool has_session_id = false;
+    bool has_replication_factor = false;
     bool has_chunking_strategy = false;
     bool has_chunk_size = false;
     bool has_min_chunk_size = false;
@@ -308,8 +306,6 @@ struct PushOptions {
     bool has_parent_version = false;
     bool has_metadata_address = false;
     bool has_metadata_port = false;
-    bool has_storage_address = false;
-    bool has_storage_port = false;
 
     for (int index = 2; index < argc; ++index) {
         const std::string_view arg{argv[index]};
@@ -342,10 +338,15 @@ struct PushOptions {
             continue;
         }
 
-        if (arg == "--storage-node-id") {
-            require_unset(has_storage_node_id, "--storage-node-id");
-            has_storage_node_id = true;
-            storage_node_id = std::string{next_arg(argc, argv, index, "--storage-node-id")};
+        if (arg == "--replication-factor") {
+            require_unset(has_replication_factor, "--replication-factor");
+            has_replication_factor = true;
+            const std::uint64_t value =
+                parse_strict_u64(next_arg(argc, argv, index, "--replication-factor"), "--replication-factor");
+            if (value < 1ULL || value > 8ULL) {
+                throw CliUsageError{"--replication-factor must be in range 1..8"};
+            }
+            replication_factor = static_cast<std::uint8_t>(value);
             continue;
         }
 
@@ -431,20 +432,6 @@ struct PushOptions {
             continue;
         }
 
-        if (arg == "--storage-address") {
-            require_unset(has_storage_address, "--storage-address");
-            has_storage_address = true;
-            storage_address = std::string{next_arg(argc, argv, index, "--storage-address")};
-            continue;
-        }
-
-        if (arg == "--storage-port") {
-            require_unset(has_storage_port, "--storage-port");
-            has_storage_port = true;
-            storage_port = parse_port(next_arg(argc, argv, index, "--storage-port"), "--storage-port");
-            continue;
-        }
-
         throw CliUsageError{std::string{"unknown option "} + std::string{arg}};
     }
 
@@ -454,9 +441,6 @@ struct PushOptions {
     if (!has_artifact_id || !artifact_id.has_value()) {
         throw CliUsageError{"--artifact-id is required"};
     }
-    if (!has_storage_node_id) {
-        throw CliUsageError{"--storage-node-id is required"};
-    }
 
     if (file_path.empty()) {
         throw CliUsageError{"--file must be nonempty"};
@@ -465,7 +449,7 @@ struct PushOptions {
         throw CliUsageError{"--file must exist and resolve to a regular file"};
     }
 
-    validate_storage_node_id(storage_node_id);
+    validate_numeric_ip(metadata_address, "--metadata-address");
 
     const bool has_fastcdc_flag = has_min_chunk_size || has_avg_chunk_size || has_max_chunk_size;
 
@@ -496,9 +480,6 @@ struct PushOptions {
         }
     }
 
-    validate_numeric_ip(metadata_address, "--metadata-address");
-    validate_numeric_ip(storage_address, "--storage-address");
-
     if (!session_id.has_value()) {
         session_id = aistore::metadata::UuidV7::generate();
     }
@@ -506,8 +487,8 @@ struct PushOptions {
     return PushOptions{
         .file_path = std::move(file_path),
         .artifact_id = std::move(*artifact_id),
-        .storage_node_id = std::move(storage_node_id),
         .session_id = std::move(*session_id),
+        .replication_factor = replication_factor,
         .chunking_strategy = chunking_strategy,
         .chunk_size_bytes = chunk_size_bytes,
         .min_chunk_size_bytes = min_chunk_size_bytes,
@@ -517,40 +498,29 @@ struct PushOptions {
         .immutable_metadata = std::move(immutable_metadata),
         .metadata_address = std::move(metadata_address),
         .metadata_port = metadata_port,
-        .storage_address = std::move(storage_address),
-        .storage_port = storage_port,
     };
 }
 
 struct PullOptions {
     std::string version_id;
     std::filesystem::path output_path;
-    std::string storage_node_id;
     bool overwrite = false;
     std::string metadata_address = "127.0.0.1";
     std::uint16_t metadata_port = 8080;
-    std::string storage_address = "127.0.0.1";
-    std::uint16_t storage_port = 8081;
 };
 
 [[nodiscard]] PullOptions parse_pull_options(int argc, char** argv) {
     std::string version_id;
     std::filesystem::path output_path;
-    std::string storage_node_id;
     bool overwrite = false;
     std::string metadata_address = "127.0.0.1";
     std::uint16_t metadata_port = 8080;
-    std::string storage_address = "127.0.0.1";
-    std::uint16_t storage_port = 8081;
 
     bool has_version_id = false;
     bool has_output = false;
-    bool has_storage_node_id = false;
     bool has_overwrite = false;
     bool has_metadata_address = false;
     bool has_metadata_port = false;
-    bool has_storage_address = false;
-    bool has_storage_port = false;
 
     for (int index = 2; index < argc; ++index) {
         const std::string_view arg{argv[index]};
@@ -578,13 +548,6 @@ struct PullOptions {
             continue;
         }
 
-        if (arg == "--storage-node-id") {
-            require_unset(has_storage_node_id, "--storage-node-id");
-            has_storage_node_id = true;
-            storage_node_id = std::string{next_arg(argc, argv, index, "--storage-node-id")};
-            continue;
-        }
-
         if (arg == "--overwrite") {
             require_unset(has_overwrite, "--overwrite");
             has_overwrite = true;
@@ -606,20 +569,6 @@ struct PullOptions {
             continue;
         }
 
-        if (arg == "--storage-address") {
-            require_unset(has_storage_address, "--storage-address");
-            has_storage_address = true;
-            storage_address = std::string{next_arg(argc, argv, index, "--storage-address")};
-            continue;
-        }
-
-        if (arg == "--storage-port") {
-            require_unset(has_storage_port, "--storage-port");
-            has_storage_port = true;
-            storage_port = parse_port(next_arg(argc, argv, index, "--storage-port"), "--storage-port");
-            continue;
-        }
-
         throw CliUsageError{std::string{"unknown option "} + std::string{arg}};
     }
 
@@ -629,9 +578,6 @@ struct PullOptions {
     if (!has_output) {
         throw CliUsageError{"--output is required"};
     }
-    if (!has_storage_node_id) {
-        throw CliUsageError{"--storage-node-id is required"};
-    }
 
     validate_version_id(version_id);
 
@@ -639,19 +585,14 @@ struct PullOptions {
         throw CliUsageError{"--output must be nonempty"};
     }
 
-    validate_storage_node_id(storage_node_id);
     validate_numeric_ip(metadata_address, "--metadata-address");
-    validate_numeric_ip(storage_address, "--storage-address");
 
     return PullOptions{
         .version_id = std::move(version_id),
         .output_path = std::move(output_path),
-        .storage_node_id = std::move(storage_node_id),
         .overwrite = overwrite,
         .metadata_address = std::move(metadata_address),
         .metadata_port = metadata_port,
-        .storage_address = std::move(storage_address),
-        .storage_port = storage_port,
     };
 }
 
@@ -661,8 +602,6 @@ struct GcOptions {
     bool dry_run = false;
     std::string metadata_address = "127.0.0.1";
     std::uint16_t metadata_port = 8080;
-    std::string storage_address = "127.0.0.1";
-    std::uint16_t storage_port = 8081;
 };
 
 [[nodiscard]] GcOptions parse_gc_options(int argc, char** argv) {
@@ -671,16 +610,12 @@ struct GcOptions {
     bool dry_run = false;
     std::string metadata_address = "127.0.0.1";
     std::uint16_t metadata_port = 8080;
-    std::string storage_address = "127.0.0.1";
-    std::uint16_t storage_port = 8081;
 
     bool has_storage_node_id = false;
     bool has_gc_run_id = false;
     bool has_dry_run = false;
     bool has_metadata_address = false;
     bool has_metadata_port = false;
-    bool has_storage_address = false;
-    bool has_storage_port = false;
 
     for (int index = 2; index < argc; ++index) {
         const std::string_view arg{argv[index]};
@@ -734,20 +669,6 @@ struct GcOptions {
             continue;
         }
 
-        if (arg == "--storage-address") {
-            require_unset(has_storage_address, "--storage-address");
-            has_storage_address = true;
-            storage_address = std::string{next_arg(argc, argv, index, "--storage-address")};
-            continue;
-        }
-
-        if (arg == "--storage-port") {
-            require_unset(has_storage_port, "--storage-port");
-            has_storage_port = true;
-            storage_port = parse_port(next_arg(argc, argv, index, "--storage-port"), "--storage-port");
-            continue;
-        }
-
         throw CliUsageError{std::string{"unknown option "} + std::string{arg}};
     }
 
@@ -757,7 +678,6 @@ struct GcOptions {
 
     validate_storage_node_id(storage_node_id);
     validate_numeric_ip(metadata_address, "--metadata-address");
-    validate_numeric_ip(storage_address, "--storage-address");
 
     if (!gc_run_id.has_value()) {
         gc_run_id = aistore::metadata::UuidV7::generate();
@@ -769,14 +689,14 @@ struct GcOptions {
         .dry_run = dry_run,
         .metadata_address = std::move(metadata_address),
         .metadata_port = metadata_port,
-        .storage_address = std::move(storage_address),
-        .storage_port = storage_port,
     };
 }
 
 [[nodiscard]] bool creation_identity_matches(const aistore::metadata::UploadSession& requested,
                                              const aistore::metadata::UploadSession& existing) {
     if (existing.artifact_id() != requested.artifact_id() || existing.target_node_id() != requested.target_node_id() ||
+        existing.replication_factor() != requested.replication_factor() ||
+        existing.placement_node_ids() != requested.placement_node_ids() ||
         existing.chunking_strategy() != requested.chunking_strategy() ||
         existing.parent_version_id() != requested.parent_version_id() ||
         existing.immutable_metadata() != requested.immutable_metadata()) {
@@ -790,12 +710,32 @@ struct GcOptions {
     return existing.fastcdc_parameters() == requested.fastcdc_parameters();
 }
 
-[[nodiscard]] aistore::metadata::UploadSession build_push_session(const PushOptions& options) {
+[[nodiscard]] std::vector<std::string> collect_active_node_ids(
+    const std::vector<aistore::metadata::StorageNode>& nodes) {
+    std::vector<std::string> active_node_ids;
+
+    for (const aistore::metadata::StorageNode& node : nodes) {
+        if (node.state == aistore::metadata::StorageNodeState::Active) {
+            active_node_ids.push_back(node.node_id);
+        }
+    }
+
+    std::ranges::sort(active_node_ids);
+    return active_node_ids;
+}
+
+[[nodiscard]] aistore::metadata::UploadSession build_push_session(const PushOptions& options,
+                                                                  std::vector<std::string> placement_node_ids) {
+    if (placement_node_ids.empty()) {
+        throw std::runtime_error("push requires at least one placement node");
+    }
+
     if (options.chunking_strategy == aistore::metadata::ChunkingStrategy::FixedSize) {
         return aistore::metadata::UploadSession{
             options.session_id,
             options.artifact_id,
-            options.storage_node_id,
+            options.replication_factor,
+            std::move(placement_node_ids),
             aistore::metadata::ChunkingStrategy::FixedSize,
             options.chunk_size_bytes,
             options.parent_version_id,
@@ -808,7 +748,8 @@ struct GcOptions {
     return aistore::metadata::UploadSession{
         options.session_id,
         options.artifact_id,
-        options.storage_node_id,
+        options.replication_factor,
+        std::move(placement_node_ids),
         aistore::metadata::FastCdcParameters{
             .min_chunk_size_bytes = options.min_chunk_size_bytes,
             .avg_chunk_size_bytes = options.avg_chunk_size_bytes,
@@ -819,6 +760,34 @@ struct GcOptions {
         aistore::metadata::UploadSessionState::Open,
         std::nullopt,
     };
+}
+
+[[nodiscard]] aistore::client::StorageNodeClientPool build_pool_for_nodes(
+    const std::vector<aistore::metadata::StorageNode>& nodes, const std::vector<std::string>& node_ids) {
+    std::vector<std::pair<std::string, aistore::client::StorageNodeClient>> clients;
+
+    for (const std::string& node_id : node_ids) {
+        const auto iterator = std::ranges::find_if(
+            nodes, [&](const aistore::metadata::StorageNode& node) { return node.node_id == node_id; });
+
+        if (iterator == nodes.end()) {
+            throw std::runtime_error("required storage node is not registered: " + node_id);
+        }
+
+        if (iterator->state == aistore::metadata::StorageNodeState::Disabled) {
+            throw std::runtime_error("required storage node is disabled: " + node_id);
+        }
+
+        clients.emplace_back(node_id, aistore::client::StorageNodeClient{aistore::http::HttpClientConfig{
+                                          .endpoint =
+                                              aistore::http::HttpEndpoint{
+                                                  .address = iterator->address,
+                                                  .port = iterator->port,
+                                              },
+                                      }});
+    }
+
+    return aistore::client::StorageNodeClientPool{std::move(clients)};
 }
 
 void emit_success_json(const std::string& target_node_id, const aistore::metadata::UuidV7& artifact_id,
@@ -909,17 +878,34 @@ void emit_gc_success_json(std::string_view storage_node_id, const aistore::metad
                 },
         }};
 
-        aistore::client::StorageNodeClient storage_client{aistore::http::HttpClientConfig{
-            .endpoint =
-                aistore::http::HttpEndpoint{
-                    .address = options.storage_address,
-                    .port = options.storage_port,
-                },
-        }};
+        const std::vector<aistore::metadata::StorageNode> registry_nodes = metadata_client.list_storage_nodes();
+        std::vector<std::string> placement_node_ids;
 
-        aistore::push::PushEngine push_engine{metadata_client, storage_client, options.storage_node_id};
+        const std::optional<aistore::metadata::UploadSession> existing_session =
+            metadata_client.get_upload_session(session_id);
 
-        const aistore::metadata::UploadSession session = build_push_session(options);
+        if (existing_session.has_value()) {
+            placement_node_ids = existing_session->placement_node_ids();
+
+            if (existing_session->replication_factor() != options.replication_factor) {
+                throw std::runtime_error("existing upload session replication factor does not match request");
+            }
+        } else {
+            placement_node_ids = collect_active_node_ids(registry_nodes);
+
+            if (placement_node_ids.size() > 64U) {
+                throw std::runtime_error("too many active storage nodes for upload session placement snapshot");
+            }
+
+            if (placement_node_ids.size() < options.replication_factor) {
+                throw std::runtime_error("not enough active storage nodes for requested replication factor");
+            }
+        }
+
+        aistore::client::StorageNodeClientPool storage_pool = build_pool_for_nodes(registry_nodes, placement_node_ids);
+        aistore::push::PushEngine push_engine{metadata_client, storage_pool};
+
+        const aistore::metadata::UploadSession session = build_push_session(options, placement_node_ids);
 
         std::optional<aistore::push::PreparedPush> prepared;
 
@@ -957,7 +943,7 @@ void emit_gc_success_json(std::string_view storage_node_id, const aistore::metad
         const aistore::metadata::FinalizeUploadResult finalize_result =
             metadata_client.finalize_upload(prepared->session_id, prepared->layout_descriptor);
 
-        emit_success_json(options.storage_node_id, artifact_id, *prepared, finalize_result);
+        emit_success_json(session.target_node_id(), artifact_id, *prepared, finalize_result);
         return 0;
     } catch (const aistore::client::RemoteApiError& error) {
         std::cerr << "aistore push error:\n"
@@ -988,15 +974,30 @@ void emit_gc_success_json(std::string_view storage_node_id, const aistore::metad
                 },
         }};
 
-        aistore::client::StorageNodeClient storage_client{aistore::http::HttpClientConfig{
-            .endpoint =
-                aistore::http::HttpEndpoint{
-                    .address = options.storage_address,
-                    .port = options.storage_port,
-                },
-        }};
+        const aistore::metadata::MultiNodeRestorePlan plan =
+            metadata_client.get_multi_node_restore_plan(options.version_id);
 
-        aistore::pull::PullEngine pull_engine{metadata_client, storage_client, options.storage_node_id};
+        std::vector<std::string> node_ids;
+        std::vector<aistore::metadata::StorageNode> endpoint_nodes;
+
+        for (const aistore::metadata::RestoreChunkSources& chunk : plan.chunks) {
+            for (const aistore::metadata::RestoreNodeEndpoint& source : chunk.sources) {
+                if (std::ranges::find(node_ids, source.node_id) == node_ids.end()) {
+                    node_ids.push_back(source.node_id);
+                    endpoint_nodes.push_back(aistore::metadata::StorageNode{
+                        .node_id = source.node_id,
+                        .address = source.address,
+                        .port = source.port,
+                        .state = aistore::metadata::StorageNodeState::Active,
+                    });
+                }
+            }
+        }
+
+        aistore::client::StorageNodeClientPool storage_pool =
+            aistore::client::StorageNodeClientPool::from_registry_nodes(endpoint_nodes,
+                                                                        aistore::http::HttpClientConfig{});
+        aistore::pull::PullEngine pull_engine{metadata_client, storage_pool};
 
         const aistore::pull::PullResult result = pull_engine.pull(aistore::pull::PullRequest{
             .version_id = options.version_id,
@@ -1024,11 +1025,18 @@ void emit_gc_success_json(std::string_view storage_node_id, const aistore::metad
                 },
         }};
 
+        const std::optional<aistore::metadata::StorageNode> target_node =
+            metadata_client.get_storage_node(options.storage_node_id);
+
+        if (!target_node.has_value()) {
+            throw std::runtime_error("storage node is not registered: " + options.storage_node_id);
+        }
+
         aistore::client::StorageNodeClient storage_client{aistore::http::HttpClientConfig{
             .endpoint =
                 aistore::http::HttpEndpoint{
-                    .address = options.storage_address,
-                    .port = options.storage_port,
+                    .address = target_node->address,
+                    .port = target_node->port,
                 },
         }};
 
@@ -1050,6 +1058,348 @@ void emit_gc_success_json(std::string_view storage_node_id, const aistore::metad
     } catch (const std::exception& error) {
         std::cerr << "aistore gc error: " << error.what() << '\n';
         std::cerr << "gc_run_id=" << gc_run_id.str() << '\n' << "resume with --gc-run-id " << gc_run_id.str() << '\n';
+        return 1;
+    }
+}
+
+void print_node_usage(std::ostream& out) {
+    out << "Usage:\n"
+           "  aistore node register [options]\n"
+           "  aistore node list [options]\n"
+           "  aistore node set-state [options]\n";
+}
+
+void print_repair_usage(std::ostream& out) {
+    out << "Usage:\n"
+           "  aistore repair [options]\n"
+           "\n"
+           "Required:\n"
+           "  --version-id <64-lowercase-hex>\n"
+           "  --replication-factor <1..8>\n"
+           "\n"
+           "Optional:\n"
+           "  --repair-run-id <uuidv7>\n"
+           "  --metadata-address <numeric-ip>\n"
+           "  --metadata-port <port>\n";
+}
+
+[[nodiscard]] int run_node(int argc, char** argv) {
+    if (argc <= 2) {
+        throw CliUsageError{"node subcommand is required"};
+    }
+
+    const std::string_view subcommand{argv[2]};
+    if (subcommand == "--help" || subcommand == "help") {
+        print_node_usage(std::cout);
+        return 0;
+    }
+
+    std::string metadata_address = "127.0.0.1";
+    std::uint16_t metadata_port = 8080;
+
+    aistore::client::MetadataClient metadata_client{aistore::http::HttpClientConfig{
+        .endpoint =
+            aistore::http::HttpEndpoint{
+                .address = metadata_address,
+                .port = metadata_port,
+            },
+    }};
+
+    if (subcommand == "list") {
+        for (int index = 3; index < argc; ++index) {
+            const std::string_view arg{argv[index]};
+            if (arg == "--help") {
+                print_node_usage(std::cout);
+                return 0;
+            }
+            if (arg == "--metadata-address") {
+                metadata_address = std::string{next_arg(argc, argv, index, "--metadata-address")};
+                continue;
+            }
+            if (arg == "--metadata-port") {
+                metadata_port = parse_port(next_arg(argc, argv, index, "--metadata-port"), "--metadata-port");
+                continue;
+            }
+            throw CliUsageError{std::string{"unknown option "} + std::string{arg}};
+        }
+
+        validate_numeric_ip(metadata_address, "--metadata-address");
+        metadata_client = aistore::client::MetadataClient{aistore::http::HttpClientConfig{
+            .endpoint = {.address = metadata_address, .port = metadata_port},
+        }};
+
+        const std::vector<aistore::metadata::StorageNode> nodes = metadata_client.list_storage_nodes();
+        boost::json::array node_array;
+        for (const aistore::metadata::StorageNode& node : nodes) {
+            node_array.push_back(boost::json::object{
+                {"node_id", node.node_id},
+                {"address", node.address},
+                {"port", node.port},
+                {"state", aistore::metadata::storage_node_state_to_string(node.state)},
+            });
+        }
+        std::cout << boost::json::serialize(boost::json::object{{"nodes", std::move(node_array)}}) << '\n';
+        return 0;
+    }
+
+    if (subcommand == "register") {
+        std::string node_id;
+        std::string storage_address;
+        std::uint16_t storage_port = 8081;
+        aistore::metadata::StorageNodeState state = aistore::metadata::StorageNodeState::Active;
+
+        for (int index = 3; index < argc; ++index) {
+            const std::string_view arg{argv[index]};
+            if (arg == "--help") {
+                print_node_usage(std::cout);
+                return 0;
+            }
+            if (arg == "--storage-node-id") {
+                node_id = std::string{next_arg(argc, argv, index, "--storage-node-id")};
+                continue;
+            }
+            if (arg == "--storage-address") {
+                storage_address = std::string{next_arg(argc, argv, index, "--storage-address")};
+                continue;
+            }
+            if (arg == "--storage-port") {
+                storage_port = parse_port(next_arg(argc, argv, index, "--storage-port"), "--storage-port");
+                continue;
+            }
+            if (arg == "--state") {
+                const std::string state_text{next_arg(argc, argv, index, "--state")};
+                state = aistore::metadata::storage_node_state_from_string(state_text);
+                continue;
+            }
+            if (arg == "--metadata-address") {
+                metadata_address = std::string{next_arg(argc, argv, index, "--metadata-address")};
+                continue;
+            }
+            if (arg == "--metadata-port") {
+                metadata_port = parse_port(next_arg(argc, argv, index, "--metadata-port"), "--metadata-port");
+                continue;
+            }
+            throw CliUsageError{std::string{"unknown option "} + std::string{arg}};
+        }
+
+        if (node_id.empty() || storage_address.empty()) {
+            throw CliUsageError{"--storage-node-id and --storage-address are required"};
+        }
+
+        validate_storage_node_id(node_id);
+        validate_numeric_ip(storage_address, "--storage-address");
+        validate_numeric_ip(metadata_address, "--metadata-address");
+
+        aistore::client::StorageNodeClient probe_client{aistore::http::HttpClientConfig{
+            .endpoint = {.address = storage_address, .port = storage_port},
+        }};
+
+        if (probe_client.probe_node_id() != node_id) {
+            throw std::runtime_error("storage node probe identity mismatch");
+        }
+
+        metadata_client = aistore::client::MetadataClient{aistore::http::HttpClientConfig{
+            .endpoint = {.address = metadata_address, .port = metadata_port},
+        }};
+        metadata_client.register_storage_node(aistore::metadata::StorageNode{
+            .node_id = node_id,
+            .address = storage_address,
+            .port = storage_port,
+            .state = state,
+        });
+        return 0;
+    }
+
+    if (subcommand == "set-state") {
+        std::string node_id;
+        aistore::metadata::StorageNodeState state = aistore::metadata::StorageNodeState::Active;
+
+        for (int index = 3; index < argc; ++index) {
+            const std::string_view arg{argv[index]};
+            if (arg == "--help") {
+                print_node_usage(std::cout);
+                return 0;
+            }
+            if (arg == "--storage-node-id") {
+                node_id = std::string{next_arg(argc, argv, index, "--storage-node-id")};
+                continue;
+            }
+            if (arg == "--state") {
+                state = aistore::metadata::storage_node_state_from_string(
+                    std::string{next_arg(argc, argv, index, "--state")});
+                continue;
+            }
+            if (arg == "--metadata-address") {
+                metadata_address = std::string{next_arg(argc, argv, index, "--metadata-address")};
+                continue;
+            }
+            if (arg == "--metadata-port") {
+                metadata_port = parse_port(next_arg(argc, argv, index, "--metadata-port"), "--metadata-port");
+                continue;
+            }
+            throw CliUsageError{std::string{"unknown option "} + std::string{arg}};
+        }
+
+        if (node_id.empty()) {
+            throw CliUsageError{"--storage-node-id and --state are required"};
+        }
+
+        validate_storage_node_id(node_id);
+        validate_numeric_ip(metadata_address, "--metadata-address");
+        metadata_client = aistore::client::MetadataClient{aistore::http::HttpClientConfig{
+            .endpoint = {.address = metadata_address, .port = metadata_port},
+        }};
+
+        const std::optional<aistore::metadata::StorageNode> existing = metadata_client.get_storage_node(node_id);
+        if (!existing.has_value()) {
+            throw std::runtime_error("storage node is not registered");
+        }
+
+        metadata_client.register_storage_node(aistore::metadata::StorageNode{
+            .node_id = existing->node_id,
+            .address = existing->address,
+            .port = existing->port,
+            .state = state,
+        });
+        return 0;
+    }
+
+    throw CliUsageError{std::string{"unknown node subcommand "} + std::string{subcommand}};
+}
+
+[[nodiscard]] int run_repair(int argc, char** argv) {
+    std::string version_id;
+    std::uint8_t replication_factor = 1;
+    std::optional<aistore::metadata::UuidV7> repair_run_id;
+    std::string metadata_address = "127.0.0.1";
+    std::uint16_t metadata_port = 8080;
+
+    for (int index = 2; index < argc; ++index) {
+        const std::string_view arg{argv[index]};
+        if (arg == "--help") {
+            print_repair_usage(std::cout);
+            return 0;
+        }
+        if (arg == "--version-id") {
+            version_id = std::string{next_arg(argc, argv, index, "--version-id")};
+            continue;
+        }
+        if (arg == "--replication-factor") {
+            const std::uint64_t value =
+                parse_strict_u64(next_arg(argc, argv, index, "--replication-factor"), "--replication-factor");
+            if (value < 1ULL || value > 8ULL) {
+                throw CliUsageError{"--replication-factor must be in range 1..8"};
+            }
+            replication_factor = static_cast<std::uint8_t>(value);
+            continue;
+        }
+        if (arg == "--repair-run-id") {
+            repair_run_id.emplace(std::string{next_arg(argc, argv, index, "--repair-run-id")});
+            continue;
+        }
+        if (arg == "--metadata-address") {
+            metadata_address = std::string{next_arg(argc, argv, index, "--metadata-address")};
+            continue;
+        }
+        if (arg == "--metadata-port") {
+            metadata_port = parse_port(next_arg(argc, argv, index, "--metadata-port"), "--metadata-port");
+            continue;
+        }
+        throw CliUsageError{std::string{"unknown option "} + std::string{arg}};
+    }
+
+    if (version_id.empty()) {
+        throw CliUsageError{"--version-id is required"};
+    }
+
+    validate_version_id(version_id);
+    validate_numeric_ip(metadata_address, "--metadata-address");
+
+    if (!repair_run_id.has_value()) {
+        repair_run_id = aistore::metadata::UuidV7::generate();
+    }
+
+    try {
+        aistore::client::MetadataClient metadata_client{aistore::http::HttpClientConfig{
+            .endpoint = {.address = metadata_address, .port = metadata_port},
+        }};
+
+        const aistore::metadata::ReplicationRun started =
+            metadata_client.start_replication_run(*repair_run_id, version_id, replication_factor);
+
+        if (started.state == aistore::metadata::ReplicationRunState::Completed) {
+            boost::json::object body;
+            body["status"] = "replication_repaired";
+            body["repair_run_id"] = started.run_id.str();
+            body["version_id"] = started.version_id;
+            body["layout_id"] = started.layout_id;
+            body["replication_factor"] = started.replication_factor;
+            body["chunks_scanned"] = started.stats.chunks_scanned;
+            body["chunks_under_replicated"] = started.stats.chunks_under_replicated;
+            body["replicas_verified"] = started.stats.replicas_verified;
+            body["replicas_written"] = started.stats.replicas_written;
+            body["bytes_copied"] = started.stats.bytes_copied;
+            body["source_failovers"] = started.stats.source_failovers;
+            std::cout << boost::json::serialize(body) << '\n';
+            return 0;
+        }
+
+        const aistore::metadata::ReplicationPlan plan = metadata_client.get_replication_plan(*repair_run_id);
+        std::vector<aistore::metadata::StorageNode> endpoint_nodes;
+
+        for (const aistore::metadata::ReplicationChunkPlan& chunk : plan.chunks) {
+            for (const aistore::metadata::ReplicationNodeEndpoint& endpoint : chunk.source_nodes) {
+                if (std::ranges::none_of(endpoint_nodes, [&](const aistore::metadata::StorageNode& node) {
+                        return node.node_id == endpoint.node_id;
+                    })) {
+                    endpoint_nodes.push_back(aistore::metadata::StorageNode{
+                        .node_id = endpoint.node_id,
+                        .address = endpoint.address,
+                        .port = endpoint.port,
+                    });
+                }
+            }
+            for (const aistore::metadata::ReplicationNodeEndpoint& endpoint : chunk.target_nodes) {
+                if (std::ranges::none_of(endpoint_nodes, [&](const aistore::metadata::StorageNode& node) {
+                        return node.node_id == endpoint.node_id;
+                    })) {
+                    endpoint_nodes.push_back(aistore::metadata::StorageNode{
+                        .node_id = endpoint.node_id,
+                        .address = endpoint.address,
+                        .port = endpoint.port,
+                    });
+                }
+            }
+        }
+
+        aistore::client::StorageNodeClientPool storage_pool =
+            aistore::client::StorageNodeClientPool::from_registry_nodes(endpoint_nodes,
+                                                                        aistore::http::HttpClientConfig{});
+
+        aistore::replication::RepairEngine repair_engine{metadata_client, storage_pool};
+        const aistore::replication::RepairResult result = repair_engine.repair(aistore::replication::RepairRequest{
+            .run_id = *repair_run_id,
+            .version_id = version_id,
+            .replication_factor = replication_factor,
+        });
+
+        boost::json::object body;
+        body["status"] = "replication_repaired";
+        body["repair_run_id"] = result.run_id.str();
+        body["version_id"] = result.version_id;
+        body["layout_id"] = result.layout_id;
+        body["replication_factor"] = result.replication_factor;
+        body["chunks_scanned"] = result.stats.chunks_scanned;
+        body["chunks_under_replicated"] = result.stats.chunks_under_replicated;
+        body["replicas_verified"] = result.stats.replicas_verified;
+        body["replicas_written"] = result.stats.replicas_written;
+        body["bytes_copied"] = result.stats.bytes_copied;
+        body["source_failovers"] = result.stats.source_failovers;
+        std::cout << boost::json::serialize(body) << '\n';
+        return 0;
+    } catch (const std::exception& error) {
+        std::cerr << "aistore repair error: " << error.what() << '\n'
+                  << "resume with --repair-run-id " << repair_run_id->str() << '\n';
         return 1;
     }
 }
@@ -1100,6 +1450,26 @@ int main(int argc, char** argv) {
             } catch (const CliUsageError& error) {
                 std::cerr << "aistore: " << error.what() << '\n';
                 print_gc_usage(std::cerr);
+                return 2;
+            }
+        }
+
+        if (command == "node") {
+            try {
+                return run_node(argc, argv);
+            } catch (const CliUsageError& error) {
+                std::cerr << "aistore: " << error.what() << '\n';
+                print_node_usage(std::cerr);
+                return 2;
+            }
+        }
+
+        if (command == "repair") {
+            try {
+                return run_repair(argc, argv);
+            } catch (const CliUsageError& error) {
+                std::cerr << "aistore: " << error.what() << '\n';
+                print_repair_usage(std::cerr);
                 return 2;
             }
         }

@@ -12,9 +12,33 @@ STORAGE_BIN="$3"
 
 DB_URL="${AISTORE_TEST_DB_URL:-dbname=ai_artifact_store_test}"
 
+reset_registry_state() {
+  psql "${DB_URL}" -v ON_ERROR_STOP=1 <<'SQL' >/dev/null
+DELETE FROM upload_session_finalizations WHERE session_id IN (SELECT session_id FROM upload_sessions WHERE state = 'open');
+DELETE FROM upload_session_metadata WHERE session_id IN (SELECT session_id FROM upload_sessions WHERE state = 'open');
+DELETE FROM upload_sessions WHERE state = 'open';
+DELETE FROM replication_runs;
+DELETE FROM gc_runs;
+DELETE FROM storage_nodes;
+SQL
+}
+reset_registry_state
+
 ARTIFACT_ID="018f1f7e-7b3c-7000-8000-000000000031"
 SESSION_ID="018f1f7e-7b3c-7000-8000-000000000032"
 NODE_ID="m6-fastcdc-node"
+
+# Clear fixture-owned metadata so committed retries / location reuse cannot leak across runs.
+psql "${DB_URL}" -v ON_ERROR_STOP=1 <<SQL >/dev/null
+DELETE FROM upload_session_finalizations WHERE session_id = '${SESSION_ID}'::uuid;
+DELETE FROM upload_session_metadata WHERE session_id = '${SESSION_ID}'::uuid;
+DELETE FROM upload_sessions WHERE session_id = '${SESSION_ID}'::uuid;
+DELETE FROM artifact_version_metadata WHERE version_id IN (
+  SELECT version_id FROM artifact_versions WHERE artifact_id = '${ARTIFACT_ID}'::uuid
+);
+DELETE FROM artifact_versions WHERE artifact_id = '${ARTIFACT_ID}'::uuid;
+DELETE FROM storage_locations WHERE node_id = '${NODE_ID}';
+SQL
 
 WORK_DIR="$(mktemp -d)"
 STORAGE_ROOT="$(mktemp -d)"
@@ -154,16 +178,20 @@ METADATA_PID=$!
 
 wait_for_health "http://127.0.0.1:8080/health" "metadata-service"
 
-AISTORE_STORAGE_ROOT="${STORAGE_ROOT}" "${STORAGE_BIN}" &
+AISTORE_STORAGE_NODE_ID="${NODE_ID}" AISTORE_STORAGE_ROOT="${STORAGE_ROOT}" "${STORAGE_BIN}" &
 STORAGE_PID=$!
 
 wait_for_health "http://127.0.0.1:8081/health" "storage-node"
+
+"${AISTORE_BIN}" node register \
+  --storage-node-id "${NODE_ID}" \
+  --storage-address 127.0.0.1 \
+  --storage-port 8081
 
 set +e
 "${AISTORE_BIN}" push \
   --file "${SOURCE_FILE}" \
   --artifact-id "${ARTIFACT_ID}" \
-  --storage-node-id "${NODE_ID}" \
   --session-id "${SESSION_ID}" \
   --chunking-strategy fastcdc \
   --min-chunk-size 512 \
@@ -298,7 +326,6 @@ set +e
 "${AISTORE_BIN}" push \
   --file "${SOURCE_FILE}" \
   --artifact-id "${ARTIFACT_ID}" \
-  --storage-node-id "${NODE_ID}" \
   --session-id "${SESSION_ID}" \
   --chunking-strategy fastcdc \
   --min-chunk-size 512 \
@@ -346,7 +373,6 @@ set +e
 "${AISTORE_BIN}" pull \
   --version-id "${PHASE1_VERSION_ID}" \
   --output "${RESTORED_FILE}" \
-  --storage-node-id "${NODE_ID}" \
   >"${STDOUT_FILE}" 2>"${STDERR_FILE}"
 PULL_STATUS=$?
 set -e

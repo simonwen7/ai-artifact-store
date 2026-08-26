@@ -14,9 +14,11 @@
 #include "aistore/metadata/manifest_model.hpp"
 #include "aistore/metadata/object.hpp"
 #include "aistore/metadata/object_layout_descriptor.hpp"
+#include "aistore/metadata/replication.hpp"
 #include "aistore/metadata/restore_plan.hpp"
 #include "aistore/metadata/run_model.hpp"
 #include "aistore/metadata/storage_location.hpp"
+#include "aistore/metadata/storage_node.hpp"
 #include "aistore/metadata/upload_session.hpp"
 
 namespace aistore::metadata {
@@ -87,6 +89,23 @@ class PostgresMetadataRepository {
                                                        const ObjectLayoutDescriptor& descriptor);
 
     [[nodiscard]] RestorePlan resolve_restore_plan(std::string_view version_id, std::string_view source_node_id);
+
+    [[nodiscard]] MultiNodeRestorePlan resolve_multi_node_restore_plan(std::string_view version_id);
+
+    void register_storage_node(const StorageNode& node);
+
+    [[nodiscard]] std::optional<StorageNode> get_storage_node(std::string_view node_id);
+
+    [[nodiscard]] std::vector<StorageNode> list_storage_nodes();
+
+    [[nodiscard]] ReplicationRun start_replication_run(const UuidV7& run_id, std::string_view version_id,
+                                                       std::uint8_t replication_factor);
+
+    [[nodiscard]] std::optional<ReplicationRun> get_replication_run(const UuidV7& run_id);
+
+    [[nodiscard]] ReplicationPlan get_replication_plan(const UuidV7& run_id);
+
+    [[nodiscard]] ReplicationRun complete_replication_run(const UuidV7& run_id, const ReplicationStats& stats);
 
     [[nodiscard]] GcRun start_gc_run(const GcRun& requested_run);
 

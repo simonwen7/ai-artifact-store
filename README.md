@@ -10,44 +10,56 @@ The project uses AI/ML workloads as the design context, while storage systems en
 
 ## Current Status
 
-**Milestone 7 — Garbage Collection**
+**Milestone 8 — Multi-Node Placement / Replication**
 
-The local content-addressed core, metadata model, push path, pull/restore path, FastCDC chunking dispatch, and production garbage collection are in place through M7:
+The local content-addressed core, metadata model, push path, pull/restore path, FastCDC chunking, garbage collection, and multi-node replication are in place through M8:
 
 - content-addressed local CAS
 - Object / immutable layout model
 - ArtifactVersion identity
 - metadata + storage services
 - production HTTP clients
-- persistent UploadSession
-- bounded one-pass push
-- atomic finalize
+- persistent UploadSession with replication-factor and placement snapshots
+- bounded one-pass multi-replica push
+- atomic finalize requiring every desired replica Available
 - resumable Open-session push
-- production `aistore push`
-- RestorePlan resolution for committed versions
-- bounded pull with 4 download workers / window backpressure
+- production `aistore push` (registry-driven placement, no `--storage-node-id`)
+- automatic multi-node RestorePlan resolution with per-chunk source fallback
+- bounded pull with replica failover across registered Active/Draining nodes
 - resumable partial restore via `.aistore.<version_id>.part`
 - atomic publish (hard-link or rename)
-- production `aistore pull`
+- production `aistore pull` (no `--storage-node-id`)
 - FastCDC content-defined chunking in PushEngine
 - FixedSize chunking still supported
 - strategy-specific UploadSession identity and committed retry
-- pull without chunking flags (layout-driven restore)
-- production `aistore gc` with dry-run and resumable GC runs
+- production `aistore gc` with registry-resolved storage endpoints
 - physical CAS inventory and idempotent chunk deletion before metadata sweep
-- conservative Push-vs-GC mutual exclusion
+- conservative Push/GC/Replication mutual exclusion
+- storage node registry (`aistore node register|list|set-state`)
+- deterministic per-chunk Rendezvous placement (`select_replica_nodes`, SHA-256)
+- replication runs and resumable `aistore repair` for under-replicated committed versions
+
+Storage-node process identity:
+
+- `AISTORE_STORAGE_ROOT` (required)
+- `AISTORE_STORAGE_NODE_ID` (default `node-1`)
+- `AISTORE_STORAGE_PORT` (default `8081`)
+
+Node states: Active (placement/pull/repair), Draining (pull/repair only), Disabled (excluded from automatic pull/repair; GC may still target explicitly).
+
+Not implemented in M8: heartbeat/failure detector, capacity-aware placement, rack/zone topology, automatic background rebalance.
 
 Fixed-size chunking remains the default and is fully supported. FastCDC improves deduplication when similar content shifts inside large artifacts because chunk boundaries follow content rather than fixed offsets.
 
 Object IDs remain whole-object SHA-256 hashes and are independent of chunking strategy.
 
-Pull does not require chunking flags; restore uses the committed layout descriptor.
+Pull does not require chunking flags or a source node flag; restore uses the committed layout descriptor and registered replica locations.
 
 FastCDC CLI defaults: min 2 MiB, avg 4 MiB, max 8 MiB.
 
-M7 preserves every ArtifactVersion as a semantic GC root. GC does not implement version retention, TTL, or semantic deletion policy.
+M7/M8 preserve every ArtifactVersion as a semantic GC root. GC does not implement version retention, TTL, or semantic deletion policy.
 
-GC refuses to start while any Open UploadSession exists. While a GcRun is Open, new UploadSessions are rejected; Pull and read-only restore APIs remain available.
+GC refuses to start while any Open UploadSession or Open ReplicationRun exists. While a GcRun is Open, new UploadSessions are rejected; Pull and read-only restore APIs remain available.
 
 Physical collectible chunks are removed from the configured storage node before metadata orphan sweep on apply runs.
 
@@ -67,23 +79,34 @@ Default local endpoints:
 Example:
 
 ```bash
+./build/aistore node register --storage-node-id node-1 --storage-address 127.0.0.1 --storage-port 8081
+
+./build/aistore push \
+  --file ./artifact.bin \
+  --artifact-id <uuidv7>
+```
+
+Defaults: `--chunking-strategy fixed-size`, `--chunk-size 4194304`, `--replication-factor 1`.
+
+Active storage nodes are discovered from the metadata registry; `--storage-node-id` is not required for push. The session snapshots sorted Active node IDs and uses deterministic Rendezvous placement per chunk. Finalize requires every desired replica Available.
+
+```bash
 ./build/aistore push \
   --file ./artifact.bin \
   --artifact-id <uuidv7> \
-  --storage-node-id node-1
+  --replication-factor 2
 ```
-
-Defaults: `--chunking-strategy fixed-size`, `--chunk-size 4194304`.
 
 ### Push (FastCDC)
 
 Example:
 
 ```bash
+./build/aistore node register --storage-node-id node-1 --storage-address 127.0.0.1 --storage-port 8081
+
 ./build/aistore push \
   --file ./artifact.bin \
   --artifact-id <uuidv7> \
-  --storage-node-id node-1 \
   --chunking-strategy fastcdc \
   --min-chunk-size 2097152 \
   --avg-chunk-size 4194304 \
@@ -101,13 +124,12 @@ For the latter, the CLI locally rescans the source, reconstructs the descriptor,
 
 ### Pull
 
-`aistore pull` restores a committed ArtifactVersion from a configured source storage node.
+`aistore pull` restores a committed ArtifactVersion using automatic multi-node restore planning.
 
 Required flags:
 
 - `--version-id` — committed ArtifactVersion to restore
 - `--output` — destination file path (parent directory must exist)
-- `--storage-node-id` — source node that holds Available chunk locations
 
 Optional flags:
 
@@ -118,8 +140,7 @@ Example:
 ```bash
 ./build/aistore pull \
   --version-id <64-char-hex-version-id> \
-  --output ./restored.bin \
-  --storage-node-id node-1
+  --output ./restored.bin
 ```
 
 Interrupted pulls leave a resumable partial file beside the destination:
@@ -130,11 +151,11 @@ Rerunning the same command resumes verified prefix bytes and continues downloadi
 
 ### Garbage Collection
 
-`aistore gc` runs garbage collection against a configured storage node. It inventories physical CAS chunks, classifies reachability through metadata, deletes collectible physical bytes (apply mode), and sweeps orphaned metadata representations.
+`aistore gc` runs garbage collection against a registered storage node. It inventories physical CAS chunks, classifies reachability through metadata, deletes collectible physical bytes (apply mode), and sweeps orphaned metadata representations.
 
 Required flags:
 
-- `--storage-node-id` — storage node to inventory and collect from
+- `--storage-node-id` — registered storage node to inventory and collect from
 
 Optional flags:
 
@@ -146,6 +167,8 @@ If `--gc-run-id` is omitted, a new UUIDv7 run ID is generated locally before sta
 Example:
 
 ```bash
+./build/aistore node register --storage-node-id node-1 --storage-address 127.0.0.1 --storage-port 8081
+
 ./build/aistore gc \
   --storage-node-id node-1
 ```
@@ -172,6 +195,29 @@ GC refuses to start while any Open UploadSession exists. While a GcRun is Open, 
 
 Apply mode removes collectible physical chunks before metadata sweep.
 
+### Storage Node Registry
+
+```bash
+./build/aistore node register \
+  --storage-node-id node-1 \
+  --storage-address 127.0.0.1 \
+  --storage-port 8081
+
+./build/aistore node list
+
+./build/aistore node set-state --storage-node-id node-1 --state disabled
+```
+
+### Repair
+
+`aistore repair` copies missing replicas for a committed version using a resumable replication run.
+
+```bash
+./build/aistore repair \
+  --version-id <64-char-hex-version-id> \
+  --replication-factor 2
+```
+
 ## Technology
 
 - C++20
@@ -195,10 +241,12 @@ Additional dependencies are introduced only when required by a milestone.
 - Parallel data transfer
 - Content-defined chunking
 - Garbage collection (M7)
-- Multi-node storage and replication
+- Multi-node storage and replication (M8)
 - AI-workload-aware lifecycle policies
 
-Replication, multi-node placement, version retention/TTL, and AI lifecycle policies are planned and not claimed as implemented.
+Replication placement beyond M8 (capacity-aware / rack-aware / background rebalance), version retention/TTL, and AI lifecycle policies are planned and not claimed as implemented.
+
+Heartbeat-derived node health and automatic state transitions are not implemented.
 
 ## Development Philosophy
 

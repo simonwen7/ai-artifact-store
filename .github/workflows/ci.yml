@@ -123,6 +123,13 @@ jobs:
             -v ON_ERROR_STOP=1 \
             -f migrations/008_garbage_collection.sql
 
+          psql \
+            -h localhost \
+            -U postgres \
+            -d ai_artifact_store_test \
+            -v ON_ERROR_STOP=1 \
+            -f migrations/009_multi_node_replication.sql
+
       - name: Configure
         run: |
           cmake \
@@ -144,6 +151,8 @@ jobs:
           ./build-ci/aistore push --help
           ./build-ci/aistore pull --help
           ./build-ci/aistore gc --help
+          ./build-ci/aistore node --help
+          ./build-ci/aistore repair --help
 
       - name: Verify service binaries
         run: |

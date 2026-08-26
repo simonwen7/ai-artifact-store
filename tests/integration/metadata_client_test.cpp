@@ -26,14 +26,25 @@
 #include "aistore/metadata/finalize_upload.hpp"
 #include "aistore/metadata/gc.hpp"
 #include "aistore/metadata/object_layout_descriptor.hpp"
+#include "aistore/metadata/placement.hpp"
 #include "aistore/metadata/postgres_metadata_repository.hpp"
-#include "aistore/metadata/restore_plan.hpp"
+#include "aistore/metadata/replication.hpp"
 #include "aistore/metadata/storage_location.hpp"
+#include "aistore/metadata/storage_node.hpp"
 #include "aistore/metadata/upload_session.hpp"
 #include "aistore/metadata/uuid_v7.hpp"
 #include "aistore/service/metadata_service.hpp"
 
 namespace {
+
+void ensure_active_node(aistore::metadata::PostgresMetadataRepository& repository, const std::string& node_id) {
+    repository.register_storage_node(aistore::metadata::StorageNode{
+        .node_id = node_id,
+        .address = "127.0.0.1",
+        .port = 8081,
+        .state = aistore::metadata::StorageNodeState::Active,
+    });
+}
 
 using aistore::client::ChunkAvailability;
 using aistore::client::MetadataClient;
@@ -56,13 +67,20 @@ using aistore::metadata::GcPhysicalStats;
 using aistore::metadata::GcRun;
 using aistore::metadata::GcRunMode;
 using aistore::metadata::GcRunState;
+using aistore::metadata::MultiNodeRestorePlan;
 using aistore::metadata::Object;
 using aistore::metadata::ObjectLayout;
 using aistore::metadata::ObjectLayoutDescriptor;
 using aistore::metadata::PostgresMetadataRepository;
+using aistore::metadata::ReplicationRun;
+using aistore::metadata::ReplicationRunState;
+using aistore::metadata::ReplicationStats;
 using aistore::metadata::RestorePlan;
+using aistore::metadata::select_replica_nodes;
 using aistore::metadata::StorageLocation;
 using aistore::metadata::StorageLocationState;
+using aistore::metadata::StorageNode;
+using aistore::metadata::StorageNodeState;
 using aistore::metadata::UploadSession;
 using aistore::metadata::UploadSessionState;
 using aistore::metadata::UuidV7;
@@ -149,7 +167,19 @@ class MetadataClientFixture : public ::testing::Test {
         {
             pqxx::connection connection{test_database_connection_string()};
             pqxx::work transaction{connection};
-            transaction.exec("DELETE FROM gc_runs WHERE target_node_id LIKE 'm4gc-%'").no_rows();
+            transaction
+                .exec(
+                    "DELETE FROM upload_session_finalizations WHERE session_id IN "
+                    "(SELECT session_id FROM upload_sessions WHERE state = 'open')")
+                .no_rows();
+            transaction
+                .exec(
+                    "DELETE FROM upload_session_metadata WHERE session_id IN "
+                    "(SELECT session_id FROM upload_sessions WHERE state = 'open')")
+                .no_rows();
+            transaction.exec("DELETE FROM upload_sessions WHERE state = 'open'").no_rows();
+            transaction.exec("DELETE FROM gc_runs").no_rows();
+            transaction.exec("DELETE FROM replication_runs").no_rows();
             transaction.commit();
         }
         repository_->create_artifact(
@@ -184,6 +214,8 @@ class MetadataClientFixture : public ::testing::Test {
             transaction.exec("DELETE FROM gc_runs WHERE run_id = $1::uuid", pqxx::params{gc_run_id.str()}).no_rows();
         }
 
+        transaction.exec("DELETE FROM replication_runs").no_rows();
+
         transaction
             .exec(
                 "DELETE FROM upload_sessions "
@@ -210,8 +242,13 @@ class MetadataClientFixture : public ::testing::Test {
             transaction.exec("DELETE FROM objects WHERE object_id = $1", pqxx::params{object_id}).no_rows();
         }
 
-        transaction.exec("DELETE FROM storage_locations WHERE node_id LIKE 'm4s3-%' OR node_id LIKE 'm4gc-%'")
+        transaction.exec("DELETE FROM replication_runs WHERE run_id IS NOT NULL").no_rows();
+        transaction
+            .exec(
+                "DELETE FROM storage_locations WHERE node_id LIKE 'm4s3-%' OR node_id LIKE 'm4gc-%' OR "
+                "node_id LIKE 'm8-client-%'")
             .no_rows();
+        transaction.exec("DELETE FROM storage_nodes").no_rows();
 
         for (const std::string& chunk_id : owned_chunk_ids_) {
             transaction
@@ -238,7 +275,8 @@ class MetadataClientFixture : public ::testing::Test {
         transaction.commit();
     }
 
-    [[nodiscard]] UploadSession make_open_session(std::string_view target_node = "m4s3-target") const {
+    [[nodiscard]] UploadSession make_open_session(std::string_view target_node = "m4s3-target") {
+        ensure_active_node(*repository_, std::string{target_node});
         return UploadSession{session_id_,
                              artifact_id_,
                              std::string{target_node},
@@ -256,6 +294,7 @@ class MetadataClientFixture : public ::testing::Test {
 
     [[nodiscard]] ArtifactVersion create_committed_version(const ObjectLayoutDescriptor& descriptor,
                                                            std::string_view source_node = "m4s3-target") {
+        ensure_active_node(*repository_, std::string{source_node});
         repository_->register_object(descriptor.object());
         repository_->register_object_layout(descriptor);
         for (const ChunkRef& chunk : descriptor.layout().chunks()) {
@@ -288,7 +327,8 @@ class MetadataClientFixture : public ::testing::Test {
                                       ObjectLayout{{ChunkRef{.chunk_id = chunk_id, .offset = 0, .size = 4}}}};
     }
 
-    [[nodiscard]] UploadSession make_fastcdc_open_session(std::string_view target_node = "m4s3-target") const {
+    [[nodiscard]] UploadSession make_fastcdc_open_session(std::string_view target_node = "m4s3-target") {
+        ensure_active_node(*repository_, std::string{target_node});
         return UploadSession{
             session_id_,
             artifact_id_,
@@ -373,6 +413,7 @@ TEST_F(MetadataClientFixture, ConflictingCreateProducesRemoteApiError) {
 
 TEST(MetadataClientStandaloneTest, MissingArtifactProducesRemoteApiError) {
     PostgresMetadataRepository repository{test_database_connection_string()};
+    ensure_active_node(repository, "m4s3-target");
     MetadataService service{repository};
     RunningHttpServer server{[&](const HttpRequest& request) { return service.handle_request(request); }};
     MetadataClient client{HttpClientConfig{
@@ -625,7 +666,7 @@ TEST_F(MetadataClientFixture, FinalizeRemoteFailureProducesRemoteApiError) {
         FAIL() << "expected RemoteApiError";
     } catch (const RemoteApiError& error) {
         EXPECT_EQ(error.status_code(), 409U);
-        EXPECT_EQ(error.error_code(), "chunk_not_available_on_target");
+        EXPECT_EQ(error.error_code(), "chunk_under_replicated");
         EXPECT_NE(error.response_body().find(chunk.chunk_id), std::string::npos);
     }
 }
@@ -918,6 +959,190 @@ TEST(MetadataClientStandaloneTest, GcMalformedSuccessfulResponseIsRejected) {
     }};
 
     EXPECT_THROW((void)client.start_gc_run(gc_run_id, "m4gc-target", false), RemoteProtocolError);
+}
+
+TEST_F(MetadataClientFixture, StorageNodeRegistryRoundTrip) {
+    client_->register_storage_node(StorageNode{
+        .node_id = "m8-client-node-a",
+        .address = "127.0.0.1",
+        .port = 9201,
+        .state = StorageNodeState::Active,
+    });
+
+    const auto loaded = client_->get_storage_node("m8-client-node-a");
+    ASSERT_TRUE(loaded.has_value());
+    EXPECT_EQ(loaded->node_id, "m8-client-node-a");
+    EXPECT_EQ(loaded->port, 9201U);
+
+    const std::vector<StorageNode> nodes = client_->list_storage_nodes();
+    ASSERT_FALSE(nodes.empty());
+}
+
+TEST_F(MetadataClientFixture, MultiNodeUploadSessionRoundTrip) {
+    for (const char* node_id : {"m8-client-a", "m8-client-b", "m8-client-c"}) {
+        client_->register_storage_node(StorageNode{
+            .node_id = node_id,
+            .address = "127.0.0.1",
+            .port = 9210,
+            .state = StorageNodeState::Active,
+        });
+    }
+    const std::vector<std::string> placement{"m8-client-a", "m8-client-b", "m8-client-c"};
+    const UploadSession session{session_id_,
+                                artifact_id_,
+                                2U,
+                                placement,
+                                ChunkingStrategy::FixedSize,
+                                kChunkSizeBytes,
+                                std::nullopt,
+                                UploadSession::ImmutableMetadata{{"source", "m8-client"}},
+                                UploadSessionState::Open,
+                                std::nullopt};
+
+    const UploadSession created = client_->create_upload_session(session);
+    EXPECT_EQ(created.replication_factor(), 2U);
+    EXPECT_EQ(created.placement_node_ids(), placement);
+
+    const auto loaded = client_->get_upload_session(session_id_);
+    ASSERT_TRUE(loaded.has_value());
+    EXPECT_EQ(loaded->placement_node_ids(), placement);
+}
+
+TEST_F(MetadataClientFixture, ParsesStrictAutomaticRestorePlan) {
+    client_->register_storage_node(StorageNode{
+        .node_id = "m8-client-restore-a",
+        .address = "127.0.0.1",
+        .port = 9202,
+        .state = StorageNodeState::Active,
+    });
+    client_->register_storage_node(StorageNode{
+        .node_id = "m8-client-restore-b",
+        .address = "127.0.0.2",
+        .port = 9203,
+        .state = StorageNodeState::Active,
+    });
+
+    const std::string shared_chunk = sha256_hex("m8-client-restore-shared");
+    const std::string second_chunk = sha256_hex("m8-client-restore-second");
+    const std::string object_id = sha256_hex("m8-client-restore-object");
+    const ObjectLayoutDescriptor descriptor{
+        Object{object_id, 6},
+        ChunkingStrategy::FixedSize,
+        ObjectLayout{{
+            ChunkRef{.chunk_id = shared_chunk, .offset = 0, .size = 3},
+            ChunkRef{.chunk_id = second_chunk, .offset = 3, .size = 3},
+        }},
+    };
+
+    repository_->register_chunks({
+        ChunkMetadata{.chunk_id = shared_chunk, .size_bytes = 3},
+        ChunkMetadata{.chunk_id = second_chunk, .size_bytes = 3},
+    });
+    repository_->register_object(descriptor.object());
+    repository_->register_object_layout(descriptor);
+    repository_->register_storage_location(StorageLocation{
+        .chunk_id = shared_chunk,
+        .node_id = "m8-client-restore-a",
+        .storage_path = "/v1/chunks/" + shared_chunk,
+        .state = StorageLocationState::Available,
+    });
+    repository_->register_storage_location(StorageLocation{
+        .chunk_id = second_chunk,
+        .node_id = "m8-client-restore-b",
+        .storage_path = "/v1/chunks/" + second_chunk,
+        .state = StorageLocationState::Available,
+    });
+    owned_object_ids_.push_back(descriptor.object_id());
+
+    ArtifactVersion version{
+        artifact_id_,
+        descriptor.object_id(),
+        std::nullopt,
+        ArtifactVersion::ImmutableMetadata{{"marker", "m8-client-restore"}},
+        VersionState::Committed,
+    };
+    repository_->create_version(version);
+
+    const MultiNodeRestorePlan plan = client_->get_multi_node_restore_plan(version.version_id());
+    EXPECT_EQ(plan.version_id, version.version_id());
+    EXPECT_EQ(plan.chunks.size(), 2U);
+    EXPECT_FALSE(plan.chunks.front().sources.empty());
+}
+
+TEST_F(MetadataClientFixture, ReplicationLifecycleAndPlanRoundTrip) {
+    client_->register_storage_node(StorageNode{
+        .node_id = "m8-client-repl-a",
+        .address = "127.0.0.1",
+        .port = 9204,
+        .state = StorageNodeState::Active,
+    });
+    client_->register_storage_node(StorageNode{
+        .node_id = "m8-client-repl-b",
+        .address = "127.0.0.2",
+        .port = 9205,
+        .state = StorageNodeState::Active,
+    });
+    client_->register_storage_node(StorageNode{
+        .node_id = "m8-client-repl-c",
+        .address = "127.0.0.3",
+        .port = 9206,
+        .state = StorageNodeState::Active,
+    });
+
+    const std::string shared_chunk = sha256_hex("m8-client-repl-shared");
+    const std::string second_chunk = sha256_hex("m8-client-repl-second");
+    const std::string object_id = sha256_hex("m8-client-repl-object");
+    const ObjectLayoutDescriptor descriptor{
+        Object{object_id, 6},
+        ChunkingStrategy::FixedSize,
+        ObjectLayout{{
+            ChunkRef{.chunk_id = shared_chunk, .offset = 0, .size = 4},
+            ChunkRef{.chunk_id = second_chunk, .offset = 4, .size = 2},
+        }},
+    };
+
+    repository_->register_object(descriptor.object());
+    repository_->register_object_layout(descriptor);
+    owned_object_ids_.push_back(descriptor.object_id());
+
+    const std::vector<std::string> placement{"m8-client-repl-a", "m8-client-repl-b", "m8-client-repl-c"};
+    for (const ChunkRef& chunk : descriptor.layout().chunks()) {
+        repository_->register_chunks({ChunkMetadata{.chunk_id = chunk.chunk_id, .size_bytes = chunk.size}});
+        const std::vector<std::string> desired = select_replica_nodes(chunk.chunk_id, placement, 2U);
+        for (const std::string& node_id : desired) {
+            repository_->register_storage_location(StorageLocation{
+                .chunk_id = chunk.chunk_id,
+                .node_id = node_id,
+                .storage_path = "/v1/chunks/" + chunk.chunk_id,
+                .state = StorageLocationState::Available,
+            });
+        }
+    }
+
+    ArtifactVersion version{
+        artifact_id_,
+        descriptor.object_id(),
+        std::nullopt,
+        ArtifactVersion::ImmutableMetadata{{"marker", "m8-client-repl"}},
+        VersionState::Committed,
+    };
+    repository_->create_version(version);
+
+    const UuidV7 run_id = UuidV7::generate();
+
+    const ReplicationRun started = client_->start_replication_run(run_id, version.version_id(), 2U);
+    EXPECT_EQ(started.run_id, run_id);
+    EXPECT_EQ(started.state, ReplicationRunState::Open);
+
+    (void)client_->get_replication_plan(run_id);
+
+    const ReplicationStats stats{
+        .chunks_scanned = 2,
+        .replicas_verified = 2,
+        .replicas_written = 2,
+    };
+    const ReplicationRun completed = client_->complete_replication_run(run_id, stats);
+    EXPECT_EQ(completed.state, ReplicationRunState::Completed);
 }
 
 }  // namespace

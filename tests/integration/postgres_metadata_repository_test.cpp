@@ -15,7 +15,10 @@
 
 #include "aistore/metadata/finalize_upload.hpp"
 #include "aistore/metadata/gc.hpp"
+#include "aistore/metadata/placement.hpp"
+#include "aistore/metadata/replication.hpp"
 #include "aistore/metadata/restore_plan.hpp"
+#include "aistore/metadata/storage_node.hpp"
 
 namespace {
 
@@ -38,11 +41,18 @@ using aistore::metadata::Object;
 using aistore::metadata::ObjectLayout;
 using aistore::metadata::ObjectLayoutDescriptor;
 using aistore::metadata::PostgresMetadataRepository;
+using aistore::metadata::ReplicationError;
+using aistore::metadata::ReplicationErrorKind;
+using aistore::metadata::ReplicationRunState;
+using aistore::metadata::ReplicationStats;
 using aistore::metadata::RestorePlan;
 using aistore::metadata::RestorePlanError;
 using aistore::metadata::RestorePlanErrorKind;
+using aistore::metadata::select_replica_nodes;
 using aistore::metadata::StorageLocation;
 using aistore::metadata::StorageLocationState;
+using aistore::metadata::StorageNode;
+using aistore::metadata::StorageNodeState;
 using aistore::metadata::UploadSession;
 using aistore::metadata::UploadSessionState;
 using aistore::metadata::UuidV7;
@@ -69,6 +79,46 @@ std::string test_database_connection_string() {
     }
 
     return "dbname=ai_artifact_store_test";
+}
+
+void ensure_replication_migration_applied() {
+    pqxx::connection connection{
+        test_database_connection_string(),
+    };
+
+    {
+        pqxx::nontransaction check{connection};
+
+        const bool migration_applied = check.query_value<bool>(
+            "SELECT EXISTS ("
+            "    SELECT 1 "
+            "    FROM schema_migrations "
+            "    WHERE version = 9 "
+            "      AND name = 'multi_node_replication'"
+            ")");
+
+        if (migration_applied) {
+            return;
+        }
+    }
+
+    const std::filesystem::path migration_path =
+        std::filesystem::path{__FILE__}.parent_path().parent_path().parent_path() / "migrations" /
+        "009_multi_node_replication.sql";
+
+    std::ifstream migration_file{migration_path};
+
+    if (!migration_file.is_open()) {
+        throw std::runtime_error("failed to open migration 009 for replication tests");
+    }
+
+    std::string migration_sql{
+        std::istreambuf_iterator<char>{migration_file},
+        std::istreambuf_iterator<char>{},
+    };
+
+    pqxx::nontransaction apply{connection};
+    apply.exec(migration_sql);
 }
 
 void ensure_gc_migration_applied() {
@@ -113,6 +163,7 @@ void ensure_gc_migration_applied() {
 
 void reset_metadata_data() {
     ensure_gc_migration_applied();
+    ensure_replication_migration_applied();
 
     pqxx::connection connection{
         test_database_connection_string(),
@@ -132,12 +183,16 @@ void reset_metadata_data() {
             "    storage_locations, "
             "    upload_session_finalizations, "
             "    upload_session_metadata, "
+            "    upload_session_nodes, "
             "    upload_sessions, "
+            "    replication_run_nodes, "
+            "    replication_runs, "
             "    gc_runs, "
             "    artifact_versions, "
             "    object_layout_chunks, "
             "    object_layouts, "
             "    artifacts, "
+            "    storage_nodes, "
             "    objects, "
             "    chunks "
             "RESTART IDENTITY")
@@ -258,6 +313,76 @@ void register_finalize_chunks(PostgresMetadataRepository& repository, const Obje
             .state = state,
         });
     }
+}
+
+void register_storage_node(PostgresMetadataRepository& repository, std::string node_id, std::string address,
+                           std::uint16_t port, StorageNodeState state = StorageNodeState::Active) {
+    repository.register_storage_node(StorageNode{
+        .node_id = std::move(node_id),
+        .address = std::move(address),
+        .port = port,
+        .state = state,
+    });
+}
+
+void ensure_active_placement_nodes(PostgresMetadataRepository& repository, const UploadSession& session) {
+    for (const std::string& node_id : session.placement_node_ids()) {
+        register_storage_node(repository, node_id, "127.0.0.1", 8081, StorageNodeState::Active);
+    }
+}
+
+void create_verified_upload_session(PostgresMetadataRepository& repository, const UploadSession& session) {
+    ensure_active_placement_nodes(repository, session);
+    repository.create_upload_session(session);
+}
+
+UploadSession make_multi_node_finalize_session(const UuidV7& session_id, const UuidV7& artifact_id,
+                                               std::uint8_t replication_factor,
+                                               std::vector<std::string> placement_node_ids, std::string marker) {
+    return UploadSession{
+        session_id,
+        artifact_id,
+        replication_factor,
+        std::move(placement_node_ids),
+        ChunkingStrategy::FixedSize,
+        4,
+        std::nullopt,
+        UploadSession::ImmutableMetadata{{"marker", std::move(marker)}},
+        UploadSessionState::Open,
+        std::nullopt,
+    };
+}
+
+void register_chunk_on_node(PostgresMetadataRepository& repository, const ChunkRef& chunk, std::string_view node_id,
+                            StorageLocationState state) {
+    repository.register_chunks({ChunkMetadata{.chunk_id = chunk.chunk_id, .size_bytes = chunk.size}});
+    repository.register_storage_location(StorageLocation{
+        .chunk_id = chunk.chunk_id,
+        .node_id = std::string{node_id},
+        .storage_path = std::string{"/m8/"} + chunk.chunk_id + std::string{node_id},
+        .state = state,
+    });
+}
+
+ArtifactVersion register_replication_version(PostgresMetadataRepository& repository, const UuidV7& artifact_id,
+                                             const ObjectLayoutDescriptor& descriptor, std::string marker) {
+    repository.register_object(descriptor.object());
+    repository.register_object_layout(descriptor);
+
+    for (const std::string& node_id : {"m8-node-a", "m8-node-b", "m8-node-c"}) {
+        register_finalize_chunks(repository, descriptor, node_id, StorageLocationState::Available);
+    }
+
+    ArtifactVersion version{
+        artifact_id,
+        descriptor.object_id(),
+        std::nullopt,
+        ArtifactVersion::ImmutableMetadata{{"marker", marker}},
+        VersionState::Committed,
+    };
+    repository.create_version(version);
+
+    return version;
 }
 
 TEST(PostgresMetadataRepositoryTest, CreatesAndReadsArtifact) {
@@ -1893,7 +2018,7 @@ TEST(PostgresMetadataRepositoryTest, CreatesAndReadsUploadSession) {
         std::nullopt,
     };
 
-    repository.create_upload_session(session);
+    create_verified_upload_session(repository, session);
 
     const auto restored = repository.get_upload_session(session_id);
 
@@ -1943,8 +2068,8 @@ TEST(PostgresMetadataRepositoryTest, UploadSessionCreationIsIdempotent) {
         std::nullopt,
     };
 
-    repository.create_upload_session(session);
-    repository.create_upload_session(session);
+    create_verified_upload_session(repository, session);
+    create_verified_upload_session(repository, session);
 
     const auto restored = repository.get_upload_session(session_id);
 
@@ -2009,7 +2134,7 @@ TEST(PostgresMetadataRepositoryTest, ReusedSessionIdWithDifferentPayloadIsReject
         std::nullopt,
     };
 
-    repository.create_upload_session(original);
+    create_verified_upload_session(repository, original);
 
     const UploadSession conflicting{
         session_id,
@@ -2025,7 +2150,7 @@ TEST(PostgresMetadataRepositoryTest, ReusedSessionIdWithDifferentPayloadIsReject
         std::nullopt,
     };
 
-    EXPECT_THROW(repository.create_upload_session(conflicting), std::runtime_error);
+    EXPECT_THROW(create_verified_upload_session(repository, conflicting), std::runtime_error);
 
     const auto restored = repository.get_upload_session(session_id);
 
@@ -2051,19 +2176,19 @@ TEST(PostgresMetadataRepositoryTest, AbortsOpenUploadSessionIdempotently) {
 
     constexpr std::uint64_t kFourMiB = 4ULL * 1024ULL * 1024ULL;
 
-    repository.create_upload_session(UploadSession{
-        session_id,
-        artifact_id,
-        "node-a",
-        ChunkingStrategy::FixedSize,
-        kFourMiB,
-        std::nullopt,
-        UploadSession::ImmutableMetadata{
-            {"framework", "pytorch"},
-        },
-        UploadSessionState::Open,
-        std::nullopt,
-    });
+    create_verified_upload_session(repository, UploadSession{
+                                                   session_id,
+                                                   artifact_id,
+                                                   "node-a",
+                                                   ChunkingStrategy::FixedSize,
+                                                   kFourMiB,
+                                                   std::nullopt,
+                                                   UploadSession::ImmutableMetadata{
+                                                       {"framework", "pytorch"},
+                                                   },
+                                                   UploadSessionState::Open,
+                                                   std::nullopt,
+                                               });
 
     repository.abort_upload_session(session_id);
 
@@ -2092,17 +2217,18 @@ TEST(PostgresMetadataRepositoryTest, DatabaseRejectsUploadSessionForMissingArtif
 
     constexpr std::uint64_t kFourMiB = 4ULL * 1024ULL * 1024ULL;
 
-    EXPECT_THROW(repository.create_upload_session(UploadSession{
-                     UuidV7::generate(),
-                     UuidV7::generate(),
-                     "node-a",
-                     ChunkingStrategy::FixedSize,
-                     kFourMiB,
-                     std::nullopt,
-                     UploadSession::ImmutableMetadata{},
-                     UploadSessionState::Open,
-                     std::nullopt,
-                 }),
+    EXPECT_THROW(create_verified_upload_session(repository,
+                                                UploadSession{
+                                                    UuidV7::generate(),
+                                                    UuidV7::generate(),
+                                                    "node-a",
+                                                    ChunkingStrategy::FixedSize,
+                                                    kFourMiB,
+                                                    std::nullopt,
+                                                    UploadSession::ImmutableMetadata{},
+                                                    UploadSessionState::Open,
+                                                    std::nullopt,
+                                                }),
                  pqxx::foreign_key_violation);
 }
 
@@ -2144,17 +2270,18 @@ TEST(PostgresMetadataRepositoryTest, DatabaseRejectsUploadSessionParentVersionFr
 
     constexpr std::uint64_t kFourMiB = 4ULL * 1024ULL * 1024ULL;
 
-    EXPECT_THROW(repository.create_upload_session(UploadSession{
-                     UuidV7::generate(),
-                     artifact_a,
-                     "node-a",
-                     ChunkingStrategy::FixedSize,
-                     kFourMiB,
-                     version_b.version_id(),
-                     UploadSession::ImmutableMetadata{},
-                     UploadSessionState::Open,
-                     std::nullopt,
-                 }),
+    EXPECT_THROW(create_verified_upload_session(repository,
+                                                UploadSession{
+                                                    UuidV7::generate(),
+                                                    artifact_a,
+                                                    "node-a",
+                                                    ChunkingStrategy::FixedSize,
+                                                    kFourMiB,
+                                                    version_b.version_id(),
+                                                    UploadSession::ImmutableMetadata{},
+                                                    UploadSessionState::Open,
+                                                    std::nullopt,
+                                                }),
                  pqxx::foreign_key_violation);
 }
 
@@ -2167,7 +2294,8 @@ TEST(PostgresMetadataRepositoryTest, FinalizesUploadAtomically) {
     const auto descriptor = make_finalize_descriptor('2', '3', '4');
 
     repository.create_artifact(Artifact{artifact_id, "finalize-" + marker.str(), "m4s5"});
-    repository.create_upload_session(make_finalize_session(session_id, artifact_id, "m4s5-target", marker.str()));
+    create_verified_upload_session(repository,
+                                   make_finalize_session(session_id, artifact_id, "m4s5-target", marker.str()));
     register_finalize_chunks(repository, descriptor, "m4s5-target", StorageLocationState::Available);
 
     const auto result = repository.finalize_upload(session_id, descriptor);
@@ -2197,7 +2325,8 @@ TEST(PostgresMetadataRepositoryTest, FinalizeUploadIsIdempotent) {
     const auto descriptor = make_finalize_descriptor('5', '6', '7');
 
     repository.create_artifact(Artifact{artifact_id, "idempotent-" + marker.str(), "m4s5"});
-    repository.create_upload_session(make_finalize_session(session_id, artifact_id, "m4s5-target", marker.str()));
+    create_verified_upload_session(repository,
+                                   make_finalize_session(session_id, artifact_id, "m4s5-target", marker.str()));
     register_finalize_chunks(repository, descriptor, "m4s5-target", StorageLocationState::Available);
 
     const auto first = repository.finalize_upload(session_id, descriptor);
@@ -2229,7 +2358,8 @@ TEST(PostgresMetadataRepositoryTest, CommittedSessionDifferentLayoutConflicts) {
     const auto different = make_finalize_descriptor('8', 'b', 'c');
 
     repository.create_artifact(Artifact{artifact_id, "layout-conflict-" + marker.str(), "m4s5"});
-    repository.create_upload_session(make_finalize_session(session_id, artifact_id, "m4s5-target", marker.str()));
+    create_verified_upload_session(repository,
+                                   make_finalize_session(session_id, artifact_id, "m4s5-target", marker.str()));
     register_finalize_chunks(repository, first, "m4s5-target", StorageLocationState::Available);
     register_finalize_chunks(repository, different, "m4s5-target", StorageLocationState::Available);
     (void)repository.finalize_upload(session_id, first);
@@ -2251,7 +2381,8 @@ TEST(PostgresMetadataRepositoryTest, AbortedSessionCannotFinalize) {
     const auto descriptor = make_finalize_descriptor('d', 'e', 'f');
 
     repository.create_artifact(Artifact{artifact_id, "aborted-" + marker.str(), "m4s5"});
-    repository.create_upload_session(make_finalize_session(session_id, artifact_id, "m4s5-target", marker.str()));
+    create_verified_upload_session(repository,
+                                   make_finalize_session(session_id, artifact_id, "m4s5-target", marker.str()));
     repository.abort_upload_session(session_id);
 
     try {
@@ -2271,14 +2402,15 @@ TEST(PostgresMetadataRepositoryTest, FinalizeRequiresAvailableLocationOnTarget) 
     const auto descriptor = make_finalize_descriptor('1', '2', '3');
 
     repository.create_artifact(Artifact{artifact_id, "missing-target-" + marker.str(), "m4s5"});
-    repository.create_upload_session(make_finalize_session(session_id, artifact_id, "m4s5-target", marker.str()));
+    create_verified_upload_session(repository,
+                                   make_finalize_session(session_id, artifact_id, "m4s5-target", marker.str()));
     register_finalize_chunks(repository, descriptor, "m4s5-target", StorageLocationState::Missing);
 
     try {
         (void)repository.finalize_upload(session_id, descriptor);
         FAIL() << "expected FinalizeUploadError";
     } catch (const FinalizeUploadError& error) {
-        EXPECT_EQ(error.kind(), FinalizeUploadErrorKind::ChunkNotAvailableOnTarget);
+        EXPECT_EQ(error.kind(), FinalizeUploadErrorKind::ChunkUnderReplicated);
         ASSERT_TRUE(error.chunk_id().has_value());
     }
 }
@@ -2292,14 +2424,15 @@ TEST(PostgresMetadataRepositoryTest, AvailableElsewhereDoesNotSatisfyFinalize) {
     const auto descriptor = make_finalize_descriptor('4', '5', '6');
 
     repository.create_artifact(Artifact{artifact_id, "elsewhere-" + marker.str(), "m4s5"});
-    repository.create_upload_session(make_finalize_session(session_id, artifact_id, "m4s5-target", marker.str()));
+    create_verified_upload_session(repository,
+                                   make_finalize_session(session_id, artifact_id, "m4s5-target", marker.str()));
     register_finalize_chunks(repository, descriptor, "m4s5-other", StorageLocationState::Available);
 
     try {
         (void)repository.finalize_upload(session_id, descriptor);
         FAIL() << "expected FinalizeUploadError";
     } catch (const FinalizeUploadError& error) {
-        EXPECT_EQ(error.kind(), FinalizeUploadErrorKind::ChunkNotAvailableOnTarget);
+        EXPECT_EQ(error.kind(), FinalizeUploadErrorKind::ChunkUnderReplicated);
     }
 }
 
@@ -2318,7 +2451,7 @@ TEST(PostgresMetadataRepositoryTest, LateVersionConflictRollsBackObjectAndLayout
         artifact_id, conflicting_object.object_id(), std::nullopt, {}, VersionState::Committed};
 
     repository.create_artifact(Artifact{artifact_id, "late-conflict-" + marker.str(), "m4s5"});
-    repository.create_upload_session(session);
+    create_verified_upload_session(repository, session);
     register_finalize_chunks(repository, descriptor, "m4s5-target", StorageLocationState::Available);
     repository.register_object(conflicting_object);
 
@@ -2373,7 +2506,8 @@ TEST(PostgresMetadataRepositoryTest, FinalizesEmptyObject) {
     };
 
     repository.create_artifact(Artifact{artifact_id, "empty-" + marker.str(), "m4s5"});
-    repository.create_upload_session(make_finalize_session(session_id, artifact_id, "m4s5-target", marker.str()));
+    create_verified_upload_session(repository,
+                                   make_finalize_session(session_id, artifact_id, "m4s5-target", marker.str()));
 
     const auto result = repository.finalize_upload(session_id, descriptor);
     EXPECT_EQ(result.object_id, descriptor.object_id());
@@ -2391,9 +2525,10 @@ TEST(PostgresMetadataRepositoryTest, DifferentSessionsReuseIdenticalArtifactVers
     const auto descriptor = make_finalize_descriptor('c', 'd', 'e');
 
     repository.create_artifact(Artifact{artifact_id, "version-reuse-" + marker.str(), "m4s5"});
-    repository.create_upload_session(make_finalize_session(first_session_id, artifact_id, "m4s5-target", marker.str()));
-    repository.create_upload_session(
-        make_finalize_session(second_session_id, artifact_id, "m4s5-target", marker.str()));
+    create_verified_upload_session(repository,
+                                   make_finalize_session(first_session_id, artifact_id, "m4s5-target", marker.str()));
+    create_verified_upload_session(repository,
+                                   make_finalize_session(second_session_id, artifact_id, "m4s5-target", marker.str()));
     register_finalize_chunks(repository, descriptor, "m4s5-target", StorageLocationState::Available);
 
     const auto first = repository.finalize_upload(first_session_id, descriptor);
@@ -2691,7 +2826,7 @@ TEST(PostgresMetadataRepositoryTest, CreatesAndLoadsFastCdcUploadSession) {
         std::nullopt,
     };
 
-    repository.create_upload_session(session);
+    create_verified_upload_session(repository, session);
 
     const auto restored = repository.get_upload_session(session_id);
 
@@ -2731,7 +2866,7 @@ TEST(PostgresMetadataRepositoryTest, RejectsUploadSessionConflictWhenFastCdcPara
         std::nullopt,
     };
 
-    repository.create_upload_session(original);
+    create_verified_upload_session(repository, original);
 
     const UploadSession conflicting{
         session_id,
@@ -2746,7 +2881,7 @@ TEST(PostgresMetadataRepositoryTest, RejectsUploadSessionConflictWhenFastCdcPara
         std::nullopt,
     };
 
-    EXPECT_THROW(repository.create_upload_session(conflicting), std::runtime_error);
+    EXPECT_THROW(create_verified_upload_session(repository, conflicting), std::runtime_error);
 }
 
 TEST(PostgresMetadataRepositoryTest, FinalizesFastCdcUpload) {
@@ -2758,8 +2893,9 @@ TEST(PostgresMetadataRepositoryTest, FinalizesFastCdcUpload) {
     const auto descriptor = make_fastcdc_finalize_descriptor('f', kTestFastCdcParameters, 'c', 'd');
 
     repository.create_artifact(Artifact{artifact_id, "fastcdc-finalize-" + marker.str(), "m6-fastcdc"});
-    repository.create_upload_session(make_fastcdc_finalize_session(session_id, artifact_id, "m6-fastcdc-target",
-                                                                   marker.str(), kTestFastCdcParameters));
+    create_verified_upload_session(
+        repository, make_fastcdc_finalize_session(session_id, artifact_id, "m6-fastcdc-target", marker.str(),
+                                                  kTestFastCdcParameters));
     register_finalize_chunks(repository, descriptor, "m6-fastcdc-target", StorageLocationState::Available);
 
     const auto result = repository.finalize_upload(session_id, descriptor);
@@ -2782,8 +2918,9 @@ TEST(PostgresMetadataRepositoryTest, FinalizeRejectsFastCdcDescriptorThatDoesNot
     const auto descriptor = make_fastcdc_finalize_descriptor('e', kAlternateFastCdcParameters, '1', '2');
 
     repository.create_artifact(Artifact{artifact_id, "fastcdc-mismatch-" + marker.str(), "m6-fastcdc"});
-    repository.create_upload_session(make_fastcdc_finalize_session(session_id, artifact_id, "m6-fastcdc-target",
-                                                                   marker.str(), kTestFastCdcParameters));
+    create_verified_upload_session(
+        repository, make_fastcdc_finalize_session(session_id, artifact_id, "m6-fastcdc-target", marker.str(),
+                                                  kTestFastCdcParameters));
     register_finalize_chunks(repository, descriptor, "m6-fastcdc-target", StorageLocationState::Available);
 
     EXPECT_THROW((void)repository.finalize_upload(session_id, descriptor), std::invalid_argument);
@@ -2857,17 +2994,17 @@ TEST(PostgresMetadataRepositoryTest, StartsGcOnlyWhenNoOpenUploadSessions) {
     const UuidV7 gc_run_id = UuidV7::generate();
 
     repository.create_artifact(Artifact{artifact_id, "gc-open-session-" + session_id.str(), "gc-tests"});
-    repository.create_upload_session(UploadSession{
-        session_id,
-        artifact_id,
-        "gc-node-a",
-        ChunkingStrategy::FixedSize,
-        4,
-        std::nullopt,
-        UploadSession::ImmutableMetadata{},
-        UploadSessionState::Open,
-        std::nullopt,
-    });
+    create_verified_upload_session(repository, UploadSession{
+                                                   session_id,
+                                                   artifact_id,
+                                                   "gc-node-a",
+                                                   ChunkingStrategy::FixedSize,
+                                                   4,
+                                                   std::nullopt,
+                                                   UploadSession::ImmutableMetadata{},
+                                                   UploadSessionState::Open,
+                                                   std::nullopt,
+                                               });
 
     try {
         (void)repository.start_gc_run(make_open_gc_run(gc_run_id, "gc-node-a"));
@@ -2895,17 +3032,17 @@ TEST(PostgresMetadataRepositoryTest, CreateUploadSessionIsRejectedDuringOpenGc) 
     repository.create_artifact(Artifact{artifact_id, "gc-in-progress-" + session_id.str(), "gc-tests"});
 
     try {
-        repository.create_upload_session(UploadSession{
-            session_id,
-            artifact_id,
-            "gc-node-a",
-            ChunkingStrategy::FixedSize,
-            4,
-            std::nullopt,
-            UploadSession::ImmutableMetadata{},
-            UploadSessionState::Open,
-            std::nullopt,
-        });
+        create_verified_upload_session(repository, UploadSession{
+                                                       session_id,
+                                                       artifact_id,
+                                                       "gc-node-a",
+                                                       ChunkingStrategy::FixedSize,
+                                                       4,
+                                                       std::nullopt,
+                                                       UploadSession::ImmutableMetadata{},
+                                                       UploadSessionState::Open,
+                                                       std::nullopt,
+                                                   });
         FAIL() << "expected GcError";
     } catch (const GcError& error) {
         EXPECT_EQ(error.kind(), GcErrorKind::GcInProgress);
@@ -3066,6 +3203,295 @@ TEST(PostgresMetadataRepositoryTest, CompletedGcRetryReturnsStoredResult) {
     EXPECT_EQ(second.state, GcRunState::Completed);
     EXPECT_EQ(first.physical_stats, second.physical_stats);
     EXPECT_EQ(first.metadata_stats, second.metadata_stats);
+}
+
+TEST(PostgresMetadataRepositoryTest, RegistersUpdatesAndListsStorageNodes) {
+    reset_metadata_data();
+    PostgresMetadataRepository repository{test_database_connection_string()};
+
+    repository.register_storage_node(StorageNode{
+        .node_id = "m8-node-a",
+        .address = "127.0.0.1",
+        .port = 9101,
+        .state = StorageNodeState::Active,
+    });
+    repository.register_storage_node(StorageNode{
+        .node_id = "m8-node-b",
+        .address = "127.0.0.2",
+        .port = 9102,
+        .state = StorageNodeState::Draining,
+    });
+
+    const auto first = repository.get_storage_node("m8-node-a");
+    ASSERT_TRUE(first.has_value());
+    EXPECT_EQ(first->address, "127.0.0.1");
+    EXPECT_EQ(first->port, 9101U);
+    EXPECT_EQ(first->state, StorageNodeState::Active);
+
+    repository.register_storage_node(StorageNode{
+        .node_id = "m8-node-a",
+        .address = "127.0.0.9",
+        .port = 9199,
+        .state = StorageNodeState::Disabled,
+    });
+
+    const auto updated = repository.get_storage_node("m8-node-a");
+    ASSERT_TRUE(updated.has_value());
+    EXPECT_EQ(updated->address, "127.0.0.9");
+    EXPECT_EQ(updated->port, 9199U);
+    EXPECT_EQ(updated->state, StorageNodeState::Disabled);
+
+    const std::vector<StorageNode> nodes = repository.list_storage_nodes();
+    ASSERT_EQ(nodes.size(), 2U);
+    EXPECT_EQ(nodes[0].node_id, "m8-node-a");
+    EXPECT_EQ(nodes[1].node_id, "m8-node-b");
+}
+
+TEST(PostgresMetadataRepositoryTest, PersistsMultiNodeUploadSessionSnapshot) {
+    reset_metadata_data();
+    PostgresMetadataRepository repository{test_database_connection_string()};
+    const UuidV7 artifact_id = UuidV7::generate();
+    const UuidV7 session_id = UuidV7::generate();
+
+    repository.create_artifact(Artifact{artifact_id, "multi-node-session", "m8s5"});
+
+    const UploadSession unknown_session = make_multi_node_finalize_session(
+        UuidV7::generate(), artifact_id, 1U, std::vector<std::string>{"m8-unknown-node"}, "unknown");
+    EXPECT_THROW(repository.create_upload_session(unknown_session), std::invalid_argument);
+
+    register_storage_node(repository, "m8-node-drain", "127.0.0.1", 9201, StorageNodeState::Draining);
+    const UploadSession draining_session = make_multi_node_finalize_session(
+        UuidV7::generate(), artifact_id, 1U, std::vector<std::string>{"m8-node-drain"}, "drain");
+    EXPECT_THROW(repository.create_upload_session(draining_session), std::invalid_argument);
+
+    register_storage_node(repository, "m8-node-disabled", "127.0.0.1", 9202, StorageNodeState::Disabled);
+    const UploadSession disabled_session = make_multi_node_finalize_session(
+        UuidV7::generate(), artifact_id, 1U, std::vector<std::string>{"m8-node-disabled"}, "disabled");
+    EXPECT_THROW(repository.create_upload_session(disabled_session), std::invalid_argument);
+
+    const UploadSession session = make_multi_node_finalize_session(
+        session_id, artifact_id, 3U, std::vector<std::string>{"m8-node-a", "m8-node-b", "m8-node-c"}, "snapshot");
+
+    create_verified_upload_session(repository, session);
+
+    const auto restored = repository.get_upload_session(session_id);
+    ASSERT_TRUE(restored.has_value());
+    EXPECT_EQ(restored->replication_factor(), 3U);
+    EXPECT_EQ(restored->placement_node_ids(), (std::vector<std::string>{"m8-node-a", "m8-node-b", "m8-node-c"}));
+    EXPECT_EQ(restored->target_node_id(), "m8-node-a");
+
+    register_storage_node(repository, "m8-node-a", "127.0.0.1", 8081, StorageNodeState::Disabled);
+    register_storage_node(repository, "m8-node-b", "127.0.0.1", 8081, StorageNodeState::Draining);
+    create_verified_upload_session(repository, session);
+    const auto resumed = repository.get_upload_session(session_id);
+    ASSERT_TRUE(resumed.has_value());
+    EXPECT_EQ(resumed->placement_node_ids(), (std::vector<std::string>{"m8-node-a", "m8-node-b", "m8-node-c"}));
+    EXPECT_EQ(resumed->replication_factor(), 3U);
+}
+
+TEST(PostgresMetadataRepositoryTest, FinalizeRequiresEveryDesiredReplica) {
+    reset_metadata_data();
+    PostgresMetadataRepository repository{test_database_connection_string()};
+    const UuidV7 marker = UuidV7::generate();
+    const UuidV7 artifact_id = UuidV7::generate();
+    const UuidV7 session_id = UuidV7::generate();
+    const auto descriptor = make_finalize_descriptor('a', 'b', 'c');
+    const std::vector<std::string> placement{"m8-node-a", "m8-node-b", "m8-node-c"};
+
+    repository.create_artifact(Artifact{artifact_id, "desired-replica-" + marker.str(), "m8s5"});
+    create_verified_upload_session(
+        repository, make_multi_node_finalize_session(session_id, artifact_id, 2U, placement, marker.str()));
+
+    for (const ChunkRef& chunk : descriptor.layout().chunks()) {
+        const std::vector<std::string> desired = select_replica_nodes(chunk.chunk_id, placement, 2U);
+        ASSERT_EQ(desired.size(), 2U);
+        register_chunk_on_node(repository, chunk, desired.front(), StorageLocationState::Available);
+    }
+
+    try {
+        (void)repository.finalize_upload(session_id, descriptor);
+        FAIL() << "expected FinalizeUploadError";
+    } catch (const FinalizeUploadError& error) {
+        EXPECT_EQ(error.kind(), FinalizeUploadErrorKind::ChunkUnderReplicated);
+        ASSERT_TRUE(error.chunk_id().has_value());
+    }
+}
+
+TEST(PostgresMetadataRepositoryTest, FinalizeIgnoresExtraNonDesiredReplica) {
+    reset_metadata_data();
+    PostgresMetadataRepository repository{test_database_connection_string()};
+    const UuidV7 marker = UuidV7::generate();
+    const UuidV7 artifact_id = UuidV7::generate();
+    const UuidV7 session_id = UuidV7::generate();
+    const auto descriptor = make_finalize_descriptor('d', 'e', 'f');
+    const std::vector<std::string> placement{"m8-node-a", "m8-node-b", "m8-node-c"};
+
+    repository.create_artifact(Artifact{artifact_id, "extra-replica-" + marker.str(), "m8s5"});
+    create_verified_upload_session(
+        repository, make_multi_node_finalize_session(session_id, artifact_id, 2U, placement, marker.str()));
+
+    for (const ChunkRef& chunk : descriptor.layout().chunks()) {
+        const std::vector<std::string> desired = select_replica_nodes(chunk.chunk_id, placement, 2U);
+        register_chunk_on_node(repository, chunk, desired.front(), StorageLocationState::Available);
+        register_chunk_on_node(repository, chunk, "m8-node-extra", StorageLocationState::Available);
+    }
+
+    try {
+        (void)repository.finalize_upload(session_id, descriptor);
+        FAIL() << "expected FinalizeUploadError";
+    } catch (const FinalizeUploadError& error) {
+        EXPECT_EQ(error.kind(), FinalizeUploadErrorKind::ChunkUnderReplicated);
+    }
+}
+
+TEST(PostgresMetadataRepositoryTest, StartsReplicationRunWithDeterministicSnapshot) {
+    reset_metadata_data();
+    PostgresMetadataRepository repository{test_database_connection_string()};
+    const UuidV7 marker = UuidV7::generate();
+    const UuidV7 artifact_id = UuidV7::generate();
+    const UuidV7 run_id = UuidV7::generate();
+    const auto descriptor = make_finalize_descriptor('1', '2', '3');
+
+    register_storage_node(repository, "m8-node-a", "127.0.0.1", 9101);
+    register_storage_node(repository, "m8-node-b", "127.0.0.2", 9102);
+    register_storage_node(repository, "m8-node-c", "127.0.0.3", 9103);
+
+    repository.create_artifact(Artifact{artifact_id, "replication-start-" + marker.str(), "m8s5"});
+    const ArtifactVersion version = register_replication_version(repository, artifact_id, descriptor, marker.str());
+
+    const auto run = repository.start_replication_run(run_id, version.version_id(), 2U);
+
+    EXPECT_EQ(run.run_id, run_id);
+    EXPECT_EQ(run.version_id, version.version_id());
+    EXPECT_EQ(run.layout_id, descriptor.layout_id());
+    EXPECT_EQ(run.replication_factor, 2U);
+    EXPECT_EQ(run.state, ReplicationRunState::Open);
+    EXPECT_EQ(run.placement_node_ids, (std::vector<std::string>{"m8-node-a", "m8-node-b", "m8-node-c"}));
+}
+
+TEST(PostgresMetadataRepositoryTest, ReplicationRunRetryIsIdempotent) {
+    reset_metadata_data();
+    PostgresMetadataRepository repository{test_database_connection_string()};
+    const UuidV7 marker = UuidV7::generate();
+    const UuidV7 artifact_id = UuidV7::generate();
+    const UuidV7 run_id = UuidV7::generate();
+    const auto descriptor = make_finalize_descriptor('4', '5', '6');
+
+    register_storage_node(repository, "m8-node-a", "127.0.0.1", 9101);
+    register_storage_node(repository, "m8-node-b", "127.0.0.2", 9102);
+    register_storage_node(repository, "m8-node-c", "127.0.0.3", 9103);
+
+    repository.create_artifact(Artifact{artifact_id, "replication-retry-" + marker.str(), "m8s5"});
+    const ArtifactVersion version = register_replication_version(repository, artifact_id, descriptor, marker.str());
+
+    const auto first = repository.start_replication_run(run_id, version.version_id(), 2U);
+    const auto second = repository.start_replication_run(run_id, version.version_id(), 2U);
+
+    EXPECT_EQ(first.run_id, second.run_id);
+    EXPECT_EQ(first.version_id, second.version_id);
+    EXPECT_EQ(first.layout_id, second.layout_id);
+    EXPECT_EQ(first.replication_factor, second.replication_factor);
+    EXPECT_EQ(first.placement_node_ids, second.placement_node_ids);
+    EXPECT_EQ(first.state, second.state);
+}
+
+TEST(PostgresMetadataRepositoryTest, CompletesReplicationOnlyAfterDesiredLocationsExist) {
+    reset_metadata_data();
+    PostgresMetadataRepository repository{test_database_connection_string()};
+    const UuidV7 marker = UuidV7::generate();
+    const UuidV7 artifact_id = UuidV7::generate();
+    const UuidV7 run_id = UuidV7::generate();
+    const auto descriptor = make_finalize_descriptor('7', '8', '9');
+    const std::vector<std::string> placement{"m8-node-a", "m8-node-b", "m8-node-c"};
+
+    register_storage_node(repository, "m8-node-a", "127.0.0.1", 9101);
+    register_storage_node(repository, "m8-node-b", "127.0.0.2", 9102);
+    register_storage_node(repository, "m8-node-c", "127.0.0.3", 9103);
+
+    repository.create_artifact(Artifact{artifact_id, "replication-complete-" + marker.str(), "m8s5"});
+    repository.register_object(descriptor.object());
+    repository.register_object_layout(descriptor);
+
+    for (const ChunkRef& chunk : descriptor.layout().chunks()) {
+        const std::vector<std::string> desired = select_replica_nodes(chunk.chunk_id, placement, 2U);
+        register_chunk_on_node(repository, chunk, desired.front(), StorageLocationState::Available);
+    }
+
+    const ArtifactVersion version{
+        artifact_id,
+        descriptor.object_id(),
+        std::nullopt,
+        ArtifactVersion::ImmutableMetadata{{"marker", marker.str()}},
+        VersionState::Committed,
+    };
+    repository.create_version(version);
+
+    (void)repository.start_replication_run(run_id, version.version_id(), 2U);
+
+    try {
+        (void)repository.complete_replication_run(run_id, ReplicationStats{});
+        FAIL() << "expected ReplicationError";
+    } catch (const ReplicationError& error) {
+        EXPECT_EQ(error.kind(), ReplicationErrorKind::UnderReplicated);
+    }
+
+    for (const ChunkRef& chunk : descriptor.layout().chunks()) {
+        const std::vector<std::string> desired = select_replica_nodes(chunk.chunk_id, placement, 2U);
+        for (const std::string& node_id : desired) {
+            register_chunk_on_node(repository, chunk, node_id, StorageLocationState::Available);
+        }
+    }
+
+    const ReplicationStats stats{
+        .chunks_scanned = 2,
+        .replicas_verified = 4,
+    };
+    const auto completed = repository.complete_replication_run(run_id, stats);
+
+    EXPECT_EQ(completed.state, ReplicationRunState::Completed);
+    EXPECT_EQ(completed.stats.chunks_scanned, 2U);
+    EXPECT_EQ(completed.stats.replicas_verified, 4U);
+}
+
+TEST(PostgresMetadataRepositoryTest, GcAndReplicationRunsAreMutuallyExclusive) {
+    reset_metadata_data();
+    PostgresMetadataRepository repository{test_database_connection_string()};
+    const UuidV7 marker = UuidV7::generate();
+    const UuidV7 artifact_id = UuidV7::generate();
+    const UuidV7 replication_run_id = UuidV7::generate();
+    const UuidV7 gc_run_id = UuidV7::generate();
+    const auto descriptor = make_finalize_descriptor('1', '2', '3');
+
+    register_storage_node(repository, "m8-node-a", "127.0.0.1", 9101);
+    register_storage_node(repository, "m8-node-b", "127.0.0.2", 9102);
+    register_storage_node(repository, "m8-node-c", "127.0.0.3", 9103);
+
+    repository.create_artifact(Artifact{artifact_id, "gc-replication-" + marker.str(), "m8s5"});
+    const ArtifactVersion version = register_replication_version(repository, artifact_id, descriptor, marker.str());
+    (void)repository.start_replication_run(replication_run_id, version.version_id(), 2U);
+
+    try {
+        (void)repository.start_gc_run(make_open_gc_run(gc_run_id, "m8-node-a"));
+        FAIL() << "expected GcError";
+    } catch (const GcError& error) {
+        EXPECT_EQ(error.kind(), GcErrorKind::ReplicationInProgress);
+    }
+
+    reset_metadata_data();
+    register_storage_node(repository, "m8-node-a", "127.0.0.1", 9101);
+    register_storage_node(repository, "m8-node-b", "127.0.0.2", 9102);
+    register_storage_node(repository, "m8-node-c", "127.0.0.3", 9103);
+    repository.create_artifact(Artifact{artifact_id, "gc-replication-" + marker.str(), "m8s5"});
+    const ArtifactVersion version_after_reset =
+        register_replication_version(repository, artifact_id, descriptor, marker.str());
+    (void)repository.start_gc_run(make_open_gc_run(gc_run_id, "m8-node-a"));
+
+    try {
+        (void)repository.start_replication_run(replication_run_id, version_after_reset.version_id(), 2U);
+        FAIL() << "expected ReplicationError";
+    } catch (const ReplicationError& error) {
+        EXPECT_EQ(error.kind(), ReplicationErrorKind::GcInProgress);
+    }
 }
 
 }  // namespace

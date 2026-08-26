@@ -7,7 +7,7 @@
 #include <string>
 
 #include "aistore/client/metadata_client.hpp"
-#include "aistore/client/storage_node_client.hpp"
+#include "aistore/client/storage_node_client_pool.hpp"
 #include "aistore/metadata/object_layout_descriptor.hpp"
 #include "aistore/metadata/upload_session.hpp"
 #include "aistore/metadata/uuid_v7.hpp"
@@ -47,8 +47,7 @@ class PushEngine {
 
     static constexpr std::uint64_t kMaxM4ChunkSize = 8ULL * 1024ULL * 1024ULL;
 
-    PushEngine(client::MetadataClient& metadata_client, client::StorageNodeClient& storage_client,
-               std::string storage_node_id);
+    PushEngine(client::MetadataClient& metadata_client, client::StorageNodeClientPool& storage_pool);
 
     [[nodiscard]] PreparedPush push(const PushRequest& request) const;
 
@@ -57,8 +56,7 @@ class PushEngine {
 
    private:
     client::MetadataClient& metadata_client_;
-    client::StorageNodeClient& storage_client_;
-    std::string storage_node_id_;
+    client::StorageNodeClientPool& storage_pool_;
 };
 
 }  // namespace aistore::push

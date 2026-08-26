@@ -324,4 +324,43 @@ TEST(StorageNodeClientTest, RejectsMalformedInventorySuccessfulResponse) {
     EXPECT_THROW((void)client.list_chunks(std::nullopt, 128), RemoteProtocolError);
 }
 
+TEST(StorageNodeClientTest, ProbeNodeIdParsesStrictHealthResponse) {
+    RunningHttpServer server{[](const HttpRequest& request) {
+        if (request.target() == "/health") {
+            HttpResponse response{beast_http::status::ok, request.version()};
+            response.set(beast_http::field::content_type, "application/json");
+            response.body() = R"({"status":"ok","node_id":"node-A"})";
+            response.prepare_payload();
+            return response;
+        }
+
+        HttpResponse response{beast_http::status::not_found, request.version()};
+        response.body() = R"({"error":"not_found"})";
+        response.prepare_payload();
+        return response;
+    }};
+
+    StorageNodeClient client{HttpClientConfig{
+        .endpoint = HttpEndpoint{.address = "127.0.0.1", .port = server.port()},
+    }};
+
+    EXPECT_EQ(client.probe_node_id(), "node-A");
+}
+
+TEST(StorageNodeClientTest, ProbeNodeIdRejectsMalformedOrMismatchedContract) {
+    RunningHttpServer server{[](const HttpRequest& request) {
+        HttpResponse response{beast_http::status::ok, request.version()};
+        response.set(beast_http::field::content_type, "application/json");
+        response.body() = R"({"status":"ok"})";
+        response.prepare_payload();
+        return response;
+    }};
+
+    StorageNodeClient client{HttpClientConfig{
+        .endpoint = HttpEndpoint{.address = "127.0.0.1", .port = server.port()},
+    }};
+
+    EXPECT_THROW((void)client.probe_node_id(), RemoteProtocolError);
+}
+
 }  // namespace

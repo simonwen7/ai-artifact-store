@@ -15,8 +15,9 @@
 #include "aistore/metadata/object.hpp"
 #include "aistore/metadata/object_layout.hpp"
 #include "aistore/metadata/object_layout_descriptor.hpp"
+#include "aistore/metadata/replication.hpp"
 #include "aistore/metadata/restore_plan.hpp"
-#include "aistore/metadata/storage_location.hpp"
+#include "aistore/metadata/storage_node.hpp"
 
 namespace aistore::client {
 
@@ -271,8 +272,9 @@ constexpr std::uint64_t kPostgresBigintMax = static_cast<std::uint64_t>(std::num
 
     const boost::json::object& object = parsed.as_object();
 
-    if (object.size() != 9U || !object.contains("session_id") || !object.contains("artifact_id") ||
-        !object.contains("target_node_id") || !object.contains("chunking_strategy") ||
+    if (object.size() != 11U || !object.contains("session_id") || !object.contains("artifact_id") ||
+        !object.contains("target_node_id") || !object.contains("replication_factor") ||
+        !object.contains("placement_node_ids") || !object.contains("chunking_strategy") ||
         !object.contains("chunking_parameters") || !object.contains("parent_version_id") ||
         !object.contains("immutable_metadata") || !object.contains("state") ||
         !object.contains("finalized_version_id")) {
@@ -280,10 +282,30 @@ constexpr std::uint64_t kPostgresBigintMax = static_cast<std::uint64_t>(std::num
     }
 
     if (!object.at("session_id").is_string() || !object.at("artifact_id").is_string() ||
-        !object.at("target_node_id").is_string() || !object.at("chunking_strategy").is_string() ||
-        !object.at("chunking_parameters").is_object() || !object.at("immutable_metadata").is_object() ||
-        !object.at("state").is_string()) {
+        !object.at("target_node_id").is_string() || !object.at("placement_node_ids").is_array() ||
+        !object.at("chunking_strategy").is_string() || !object.at("chunking_parameters").is_object() ||
+        !object.at("immutable_metadata").is_object() || !object.at("state").is_string()) {
         throw RemoteProtocolError{"upload session response field types are invalid"};
+    }
+
+    const std::optional<std::uint64_t> optional_replication_factor =
+        extract_positive_uint64(object.at("replication_factor"));
+
+    if (!optional_replication_factor.has_value() || *optional_replication_factor > 8U) {
+        throw RemoteProtocolError{"upload session replication_factor is invalid"};
+    }
+
+    const auto replication_factor = static_cast<std::uint8_t>(*optional_replication_factor);
+
+    std::vector<std::string> placement_node_ids;
+    placement_node_ids.reserve(object.at("placement_node_ids").as_array().size());
+
+    for (const boost::json::value& node_value : object.at("placement_node_ids").as_array()) {
+        if (!node_value.is_string()) {
+            throw RemoteProtocolError{"upload session placement_node_ids must be strings"};
+        }
+
+        placement_node_ids.emplace_back(node_value.as_string());
     }
 
     const std::string chunking_strategy{object.at("chunking_strategy").as_string()};
@@ -341,7 +363,8 @@ constexpr std::uint64_t kPostgresBigintMax = static_cast<std::uint64_t>(std::num
                 return aistore::metadata::UploadSession{
                     std::move(session_id),
                     std::move(artifact_id),
-                    std::string{object.at("target_node_id").as_string()},
+                    replication_factor,
+                    std::move(placement_node_ids),
                     aistore::metadata::ChunkingStrategy::FixedSize,
                     *chunk_size_bytes,
                     std::move(parent_version_id),
@@ -365,7 +388,8 @@ constexpr std::uint64_t kPostgresBigintMax = static_cast<std::uint64_t>(std::num
             return aistore::metadata::UploadSession{
                 std::move(session_id),
                 std::move(artifact_id),
-                std::string{object.at("target_node_id").as_string()},
+                replication_factor,
+                std::move(placement_node_ids),
                 *fastcdc_parameters,
                 std::move(parent_version_id),
                 std::move(immutable_metadata),
@@ -387,10 +411,19 @@ constexpr std::uint64_t kPostgresBigintMax = static_cast<std::uint64_t>(std::num
         metadata_object[key] = value;
     }
 
+    boost::json::array placement_array;
+    placement_array.reserve(session.placement_node_ids().size());
+
+    for (const std::string& node_id : session.placement_node_ids()) {
+        placement_array.push_back(boost::json::value(node_id));
+    }
+
     boost::json::object body{
         {"session_id", session.session_id().str()},
         {"artifact_id", session.artifact_id().str()},
         {"target_node_id", session.target_node_id()},
+        {"replication_factor", static_cast<std::uint64_t>(session.replication_factor())},
+        {"placement_node_ids", std::move(placement_array)},
         {"chunking_strategy", aistore::metadata::chunking_strategy_to_string(session.chunking_strategy())},
         {"chunking_parameters", chunking_parameters_to_json(session)},
         {"immutable_metadata", std::move(metadata_object)},
@@ -1208,6 +1241,563 @@ aistore::metadata::GcRun MetadataClient::complete_gc_run(
 
     if (run.state != aistore::metadata::GcRunState::Completed) {
         throw RemoteProtocolError{"GC run response state is not completed"};
+    }
+
+    return run;
+}
+
+[[nodiscard]] aistore::metadata::StorageNode parse_storage_node_json(const boost::json::object& object) {
+    if (!json_object_has_exact_keys(object, {"node_id", "address", "port", "state"})) {
+        throw RemoteProtocolError{"storage node response has unexpected fields"};
+    }
+
+    if (!object.at("node_id").is_string() || !object.at("address").is_string() || !object.at("state").is_string()) {
+        throw RemoteProtocolError{"storage node response field types are invalid"};
+    }
+
+    const std::optional<std::uint64_t> port = extract_positive_uint64(object.at("port"));
+
+    if (!port.has_value() || *port > 65535U) {
+        throw RemoteProtocolError{"storage node port is invalid"};
+    }
+
+    try {
+        return aistore::metadata::StorageNode{
+            .node_id = std::string{object.at("node_id").as_string()},
+            .address = std::string{object.at("address").as_string()},
+            .port = static_cast<std::uint16_t>(*port),
+            .state = aistore::metadata::storage_node_state_from_string(std::string{object.at("state").as_string()}),
+        };
+    } catch (const std::exception&) {
+        throw RemoteProtocolError{"storage node response failed domain validation"};
+    }
+}
+
+[[nodiscard]] aistore::metadata::ReplicationRunState replication_run_state_from_string_strict(std::string_view state) {
+    if (state == "open") {
+        return aistore::metadata::ReplicationRunState::Open;
+    }
+
+    if (state == "completed") {
+        return aistore::metadata::ReplicationRunState::Completed;
+    }
+
+    throw RemoteProtocolError{"replication run state is invalid"};
+}
+
+[[nodiscard]] aistore::metadata::ReplicationRun parse_replication_run_json(const std::string& body) {
+    boost::system::error_code parse_error;
+    const boost::json::value parsed = boost::json::parse(body, parse_error);
+
+    if (parse_error || !parsed.is_object()) {
+        throw RemoteProtocolError{"replication run response is not a JSON object"};
+    }
+
+    const boost::json::object& object = parsed.as_object();
+
+    if (!json_object_has_exact_keys(
+            object, {"replication_run_id", "version_id", "layout_id", "replication_factor", "placement_node_ids",
+                     "state", "chunks_scanned", "chunks_under_replicated", "replicas_verified", "replicas_written",
+                     "bytes_copied", "source_failovers"})) {
+        throw RemoteProtocolError{"replication run response has unexpected fields"};
+    }
+
+    if (!object.at("replication_run_id").is_string() || !object.at("version_id").is_string() ||
+        !object.at("layout_id").is_string() || !object.at("placement_node_ids").is_array() ||
+        !object.at("state").is_string()) {
+        throw RemoteProtocolError{"replication run response field types are invalid"};
+    }
+
+    const std::optional<std::uint64_t> optional_replication_factor =
+        extract_positive_uint64(object.at("replication_factor"));
+
+    if (!optional_replication_factor.has_value() || *optional_replication_factor > 8U) {
+        throw RemoteProtocolError{"replication run replication_factor is invalid"};
+    }
+
+    const auto replication_factor = static_cast<std::uint8_t>(*optional_replication_factor);
+
+    std::vector<std::string> placement_node_ids;
+    for (const boost::json::value& node_value : object.at("placement_node_ids").as_array()) {
+        if (!node_value.is_string()) {
+            throw RemoteProtocolError{"replication run placement_node_ids must be strings"};
+        }
+
+        placement_node_ids.emplace_back(node_value.as_string());
+    }
+
+    const auto extract_stat = [&](std::string_view key) -> std::uint64_t {
+        const std::optional<std::uint64_t> value = extract_nonnegative_uint64(object.at(key));
+
+        if (!value.has_value()) {
+            throw RemoteProtocolError{"replication run stats are invalid"};
+        }
+
+        return *value;
+    };
+
+    return aistore::metadata::ReplicationRun{
+        .run_id = aistore::metadata::UuidV7{std::string{object.at("replication_run_id").as_string()}},
+        .version_id = std::string{object.at("version_id").as_string()},
+        .layout_id = std::string{object.at("layout_id").as_string()},
+        .replication_factor = replication_factor,
+        .placement_node_ids = std::move(placement_node_ids),
+        .state = replication_run_state_from_string_strict(std::string{object.at("state").as_string()}),
+        .stats =
+            aistore::metadata::ReplicationStats{
+                .chunks_scanned = extract_stat("chunks_scanned"),
+                .chunks_under_replicated = extract_stat("chunks_under_replicated"),
+                .replicas_verified = extract_stat("replicas_verified"),
+                .replicas_written = extract_stat("replicas_written"),
+                .bytes_copied = extract_stat("bytes_copied"),
+                .source_failovers = extract_stat("source_failovers"),
+            },
+    };
+}
+
+[[nodiscard]] aistore::metadata::ReplicationNodeEndpoint parse_replication_node_endpoint(
+    const boost::json::object& object) {
+    if (!json_object_has_exact_keys(object, {"node_id", "address", "port"})) {
+        throw RemoteProtocolError{"replication node endpoint has unexpected fields"};
+    }
+
+    if (!object.at("node_id").is_string() || !object.at("address").is_string()) {
+        throw RemoteProtocolError{"replication node endpoint field types are invalid"};
+    }
+
+    const std::optional<std::uint64_t> port = extract_positive_uint64(object.at("port"));
+
+    if (!port.has_value() || *port > 65535U) {
+        throw RemoteProtocolError{"replication node endpoint port is invalid"};
+    }
+
+    return aistore::metadata::ReplicationNodeEndpoint{
+        .node_id = std::string{object.at("node_id").as_string()},
+        .address = std::string{object.at("address").as_string()},
+        .port = static_cast<std::uint16_t>(*port),
+    };
+}
+
+[[nodiscard]] aistore::metadata::RestoreNodeEndpoint parse_restore_node_endpoint(const boost::json::object& object) {
+    if (!json_object_has_exact_keys(object, {"node_id", "address", "port"})) {
+        throw RemoteProtocolError{"restore source endpoint has unexpected fields"};
+    }
+
+    if (!object.at("node_id").is_string() || !object.at("address").is_string()) {
+        throw RemoteProtocolError{"restore source endpoint field types are invalid"};
+    }
+
+    const std::optional<std::uint64_t> port = extract_positive_uint64(object.at("port"));
+
+    if (!port.has_value() || *port > 65535U) {
+        throw RemoteProtocolError{"restore source endpoint port is invalid"};
+    }
+
+    return aistore::metadata::RestoreNodeEndpoint{
+        .node_id = std::string{object.at("node_id").as_string()},
+        .address = std::string{object.at("address").as_string()},
+        .port = static_cast<std::uint16_t>(*port),
+    };
+}
+
+aistore::metadata::MultiNodeRestorePlan MetadataClient::get_multi_node_restore_plan(std::string_view version_id) const {
+    if (!is_valid_chunk_id(version_id)) {
+        throw std::invalid_argument("version_id must be 64 lowercase hex characters");
+    }
+
+    const std::string target = std::string{"/v1/artifact-versions/"} + std::string{version_id} + "/restore-plan";
+    const aistore::http::HttpClientResponse response = http_client_.request(beast_http::verb::get, target);
+
+    if (status_code_of(response) != 200U) {
+        throw_remote_api_error(response);
+    }
+
+    boost::system::error_code parse_error;
+    const boost::json::value parsed = boost::json::parse(response.body(), parse_error);
+
+    if (parse_error || !parsed.is_object()) {
+        throw RemoteProtocolError{"multi-node restore plan response is not a JSON object"};
+    }
+
+    const boost::json::object& object = parsed.as_object();
+
+    if (object.size() != 9U || !object.contains("version_id") || !object.contains("artifact_id") ||
+        !object.contains("object_id") || !object.contains("total_size_bytes") || !object.contains("layout_id") ||
+        !object.contains("chunking_strategy") || !object.contains("chunking_parameters") ||
+        !object.contains("chunk_count") || !object.contains("chunks")) {
+        throw RemoteProtocolError{"multi-node restore plan response has unexpected fields"};
+    }
+
+    const std::string response_version_id{object.at("version_id").as_string()};
+
+    if (response_version_id != version_id) {
+        throw RemoteProtocolError{"multi-node restore plan version_id does not match request"};
+    }
+
+    const std::string object_id{object.at("object_id").as_string()};
+    const std::string layout_id{object.at("layout_id").as_string()};
+
+    if (!is_valid_chunk_id(object_id) || !is_valid_chunk_id(layout_id)) {
+        throw RemoteProtocolError{"multi-node restore plan contains an invalid content ID"};
+    }
+
+    const std::string chunking_strategy{object.at("chunking_strategy").as_string()};
+    const boost::json::object& chunking_parameters = object.at("chunking_parameters").as_object();
+    const std::optional<std::uint64_t> total_size_bytes = extract_nonnegative_uint64(object.at("total_size_bytes"));
+    const std::optional<std::uint64_t> chunk_count = extract_nonnegative_uint64(object.at("chunk_count"));
+
+    if (!total_size_bytes.has_value() || !chunk_count.has_value()) {
+        throw RemoteProtocolError{"multi-node restore plan size fields are invalid"};
+    }
+
+    const boost::json::array& chunks_array = object.at("chunks").as_array();
+
+    if (*chunk_count != chunks_array.size()) {
+        throw RemoteProtocolError{"multi-node restore plan chunk_count mismatch"};
+    }
+
+    std::vector<aistore::metadata::ChunkRef> chunk_refs;
+    std::vector<aistore::metadata::RestoreChunkSources> chunk_sources;
+    chunk_refs.reserve(chunks_array.size());
+    chunk_sources.reserve(chunks_array.size());
+
+    for (const boost::json::value& chunk_value : chunks_array) {
+        if (!chunk_value.is_object()) {
+            throw RemoteProtocolError{"multi-node restore plan chunk entry is not an object"};
+        }
+
+        const boost::json::object& chunk_object = chunk_value.as_object();
+
+        if (!json_object_has_exact_keys(chunk_object, {"chunk_id", "offset", "size_bytes", "sources"}) ||
+            !chunk_object.at("chunk_id").is_string() || !chunk_object.at("sources").is_array()) {
+            throw RemoteProtocolError{"multi-node restore plan chunk entry has unexpected fields"};
+        }
+
+        const std::string chunk_id{chunk_object.at("chunk_id").as_string()};
+
+        if (!is_valid_chunk_id(chunk_id)) {
+            throw RemoteProtocolError{"multi-node restore plan chunk_id is invalid"};
+        }
+
+        const std::optional<std::uint64_t> offset = extract_nonnegative_uint64(chunk_object.at("offset"));
+        const std::optional<std::uint64_t> size_bytes = extract_positive_uint64(chunk_object.at("size_bytes"));
+
+        if (!offset.has_value() || !size_bytes.has_value()) {
+            throw RemoteProtocolError{"multi-node restore plan chunk size fields are invalid"};
+        }
+
+        aistore::metadata::RestoreChunkSources sources{
+            .chunk_id = chunk_id,
+            .offset = *offset,
+            .size_bytes = *size_bytes,
+        };
+
+        for (const boost::json::value& source_value : chunk_object.at("sources").as_array()) {
+            if (!source_value.is_object()) {
+                throw RemoteProtocolError{"multi-node restore plan source entry is not an object"};
+            }
+
+            sources.sources.push_back(parse_restore_node_endpoint(source_value.as_object()));
+        }
+
+        chunk_refs.push_back(aistore::metadata::ChunkRef{
+            .chunk_id = chunk_id,
+            .offset = *offset,
+            .size = *size_bytes,
+        });
+        chunk_sources.push_back(std::move(sources));
+    }
+
+    aistore::metadata::UuidV7 artifact_id{std::string{object.at("artifact_id").as_string()}};
+
+    try {
+        aistore::metadata::Object layout_object{object_id, *total_size_bytes};
+        aistore::metadata::ObjectLayout layout{std::move(chunk_refs)};
+        aistore::metadata::ObjectLayoutDescriptor descriptor = [&]() {
+            if (chunking_strategy == "fixed-size") {
+                if (!chunking_parameters.empty()) {
+                    throw RemoteProtocolError{"multi-node restore plan chunking_parameters are invalid"};
+                }
+
+                return aistore::metadata::ObjectLayoutDescriptor{
+                    std::move(layout_object), aistore::metadata::ChunkingStrategy::FixedSize, std::move(layout)};
+            }
+
+            if (chunking_strategy != "fastcdc") {
+                throw RemoteProtocolError{"multi-node restore plan chunking strategy is unsupported"};
+            }
+
+            const std::optional<aistore::metadata::FastCdcParameters> fastcdc_parameters =
+                parse_fastcdc_parameters_json(chunking_parameters);
+
+            if (!fastcdc_parameters.has_value()) {
+                throw RemoteProtocolError{"multi-node restore plan chunking_parameters are invalid"};
+            }
+
+            return aistore::metadata::ObjectLayoutDescriptor{std::move(layout_object), *fastcdc_parameters,
+                                                             std::move(layout)};
+        }();
+
+        return aistore::metadata::MultiNodeRestorePlan{
+            .artifact_id = artifact_id,
+            .version_id = response_version_id,
+            .object_id = object_id,
+            .layout_id = layout_id,
+            .layout_descriptor = std::move(descriptor),
+            .chunks = std::move(chunk_sources),
+        };
+    } catch (const RemoteProtocolError&) {
+        throw;
+    } catch (const std::exception&) {
+        throw RemoteProtocolError{"multi-node restore plan failed domain validation"};
+    }
+}
+
+void MetadataClient::register_storage_node(const aistore::metadata::StorageNode& node) const {
+    aistore::metadata::validate_storage_node(node);
+
+    const std::string body = boost::json::serialize(boost::json::object{
+        {"address", node.address},
+        {"port", node.port},
+        {"state", aistore::metadata::storage_node_state_to_string(node.state)},
+    });
+    const std::string target = std::string{"/v1/storage-nodes/"} + node.node_id;
+    const aistore::http::HttpClientResponse response =
+        http_client_.request(beast_http::verb::put, target, body, "application/json");
+
+    if (status_code_of(response) != 200U) {
+        throw_remote_api_error(response);
+    }
+
+    boost::system::error_code parse_error;
+    const boost::json::value parsed = boost::json::parse(response.body(), parse_error);
+
+    if (parse_error || !parsed.is_object()) {
+        throw RemoteProtocolError{"storage node response is not a JSON object"};
+    }
+
+    const aistore::metadata::StorageNode response_node = parse_storage_node_json(parsed.as_object());
+
+    if (response_node != node) {
+        throw RemoteProtocolError{"storage node response does not match request"};
+    }
+}
+
+std::optional<aistore::metadata::StorageNode> MetadataClient::get_storage_node(std::string_view node_id) const {
+    if (!is_valid_node_id(node_id)) {
+        throw std::invalid_argument("node_id is invalid");
+    }
+
+    const std::string target = std::string{"/v1/storage-nodes/"} + std::string{node_id};
+    const aistore::http::HttpClientResponse response = http_client_.request(beast_http::verb::get, target);
+
+    const unsigned int status = status_code_of(response);
+
+    if (status == 200U) {
+        boost::system::error_code parse_error;
+        const boost::json::value parsed = boost::json::parse(response.body(), parse_error);
+
+        if (parse_error || !parsed.is_object()) {
+            throw RemoteProtocolError{"storage node response is not a JSON object"};
+        }
+
+        return parse_storage_node_json(parsed.as_object());
+    }
+
+    if (status == 404U && extract_error_code(response.body()) == "storage_node_not_found") {
+        return std::nullopt;
+    }
+
+    throw_remote_api_error(response);
+}
+
+std::vector<aistore::metadata::StorageNode> MetadataClient::list_storage_nodes() const {
+    const aistore::http::HttpClientResponse response = http_client_.request(beast_http::verb::get, "/v1/storage-nodes");
+
+    if (status_code_of(response) != 200U) {
+        throw_remote_api_error(response);
+    }
+
+    boost::system::error_code parse_error;
+    const boost::json::value parsed = boost::json::parse(response.body(), parse_error);
+
+    if (parse_error || !parsed.is_object()) {
+        throw RemoteProtocolError{"storage node list response is not a JSON object"};
+    }
+
+    const boost::json::object& object = parsed.as_object();
+
+    if (!json_object_has_exact_keys(object, {"nodes"}) || !object.at("nodes").is_array()) {
+        throw RemoteProtocolError{"storage node list response has unexpected fields"};
+    }
+
+    std::vector<aistore::metadata::StorageNode> nodes;
+
+    for (const boost::json::value& node_value : object.at("nodes").as_array()) {
+        if (!node_value.is_object()) {
+            throw RemoteProtocolError{"storage node list entry is not an object"};
+        }
+
+        nodes.push_back(parse_storage_node_json(node_value.as_object()));
+    }
+
+    return nodes;
+}
+
+aistore::metadata::ReplicationRun MetadataClient::start_replication_run(const aistore::metadata::UuidV7& run_id,
+                                                                        std::string_view version_id,
+                                                                        std::uint8_t replication_factor) const {
+    if (!is_valid_chunk_id(version_id)) {
+        throw std::invalid_argument("version_id must be 64 lowercase hex characters");
+    }
+
+    if (replication_factor < 1U || replication_factor > 8U) {
+        throw std::invalid_argument("replication_factor must be between 1 and 8");
+    }
+
+    const std::string body = boost::json::serialize(boost::json::object{
+        {"replication_run_id", run_id.str()},
+        {"version_id", std::string{version_id}},
+        {"replication_factor", static_cast<std::uint64_t>(replication_factor)},
+    });
+    const aistore::http::HttpClientResponse response =
+        http_client_.request(beast_http::verb::post, "/v1/replication-runs", body, "application/json");
+
+    if (status_code_of(response) != 200U) {
+        throw_remote_api_error(response);
+    }
+
+    aistore::metadata::ReplicationRun run = parse_replication_run_json(response.body());
+
+    if (run.run_id != run_id) {
+        throw RemoteProtocolError{"replication run response run_id does not match request"};
+    }
+
+    return run;
+}
+
+std::optional<aistore::metadata::ReplicationRun> MetadataClient::get_replication_run(
+    const aistore::metadata::UuidV7& run_id) const {
+    const std::string target = std::string{"/v1/replication-runs/"} + run_id.str();
+    const aistore::http::HttpClientResponse response = http_client_.request(beast_http::verb::get, target);
+
+    const unsigned int status = status_code_of(response);
+
+    if (status == 200U) {
+        aistore::metadata::ReplicationRun run = parse_replication_run_json(response.body());
+
+        if (run.run_id != run_id) {
+            throw RemoteProtocolError{"replication run response run_id does not match request"};
+        }
+
+        return run;
+    }
+
+    if (status == 404U && extract_error_code(response.body()) == "replication_run_not_found") {
+        return std::nullopt;
+    }
+
+    throw_remote_api_error(response);
+}
+
+aistore::metadata::ReplicationPlan MetadataClient::get_replication_plan(const aistore::metadata::UuidV7& run_id) const {
+    const std::string target = std::string{"/v1/replication-runs/"} + run_id.str() + "/plan";
+    const aistore::http::HttpClientResponse response = http_client_.request(beast_http::verb::get, target);
+
+    if (status_code_of(response) != 200U) {
+        throw_remote_api_error(response);
+    }
+
+    boost::system::error_code parse_error;
+    const boost::json::value parsed = boost::json::parse(response.body(), parse_error);
+
+    if (parse_error || !parsed.is_object()) {
+        throw RemoteProtocolError{"replication plan response is not a JSON object"};
+    }
+
+    const boost::json::object& object = parsed.as_object();
+
+    if (!object.contains("replication_run_id") || !object.contains("version_id") || !object.contains("layout_id") ||
+        !object.contains("replication_factor") || !object.contains("placement_node_ids") ||
+        !object.contains("chunks")) {
+        throw RemoteProtocolError{"replication plan response has unexpected fields"};
+    }
+
+    const std::optional<std::uint64_t> optional_replication_factor =
+        extract_positive_uint64(object.at("replication_factor"));
+
+    if (!optional_replication_factor.has_value() || *optional_replication_factor > 8U) {
+        throw RemoteProtocolError{"replication plan replication_factor is invalid"};
+    }
+
+    const auto replication_factor = static_cast<std::uint8_t>(*optional_replication_factor);
+    std::vector<std::string> placement_node_ids;
+
+    for (const boost::json::value& node_value : object.at("placement_node_ids").as_array()) {
+        placement_node_ids.emplace_back(node_value.as_string());
+    }
+
+    std::vector<aistore::metadata::ReplicationChunkPlan> chunks;
+
+    for (const boost::json::value& chunk_value : object.at("chunks").as_array()) {
+        const boost::json::object& chunk_object = chunk_value.as_object();
+        aistore::metadata::ReplicationChunkPlan chunk_plan{
+            .chunk_id = std::string{chunk_object.at("chunk_id").as_string()},
+            .offset = extract_nonnegative_uint64(chunk_object.at("offset")).value_or(0),
+            .size_bytes = extract_positive_uint64(chunk_object.at("size_bytes")).value_or(0),
+        };
+
+        for (const boost::json::value& source_value : chunk_object.at("source_nodes").as_array()) {
+            chunk_plan.source_nodes.push_back(parse_replication_node_endpoint(source_value.as_object()));
+        }
+
+        for (const boost::json::value& node_value : chunk_object.at("desired_node_ids").as_array()) {
+            chunk_plan.desired_node_ids.emplace_back(node_value.as_string());
+        }
+
+        for (const boost::json::value& target_value : chunk_object.at("target_nodes").as_array()) {
+            chunk_plan.target_nodes.push_back(parse_replication_node_endpoint(target_value.as_object()));
+        }
+
+        chunks.push_back(std::move(chunk_plan));
+    }
+
+    return aistore::metadata::ReplicationPlan{
+        .run_id = aistore::metadata::UuidV7{std::string{object.at("replication_run_id").as_string()}},
+        .version_id = std::string{object.at("version_id").as_string()},
+        .layout_id = std::string{object.at("layout_id").as_string()},
+        .replication_factor = replication_factor,
+        .placement_node_ids = std::move(placement_node_ids),
+        .chunks = std::move(chunks),
+    };
+}
+
+aistore::metadata::ReplicationRun MetadataClient::complete_replication_run(
+    const aistore::metadata::UuidV7& run_id, const aistore::metadata::ReplicationStats& stats) const {
+    const std::string body = boost::json::serialize(boost::json::object{
+        {"chunks_scanned", stats.chunks_scanned},
+        {"chunks_under_replicated", stats.chunks_under_replicated},
+        {"replicas_verified", stats.replicas_verified},
+        {"replicas_written", stats.replicas_written},
+        {"bytes_copied", stats.bytes_copied},
+        {"source_failovers", stats.source_failovers},
+    });
+    const std::string target = std::string{"/v1/replication-runs/"} + run_id.str() + "/complete";
+    const aistore::http::HttpClientResponse response =
+        http_client_.request(beast_http::verb::post, target, body, "application/json");
+
+    if (status_code_of(response) != 200U) {
+        throw_remote_api_error(response);
+    }
+
+    aistore::metadata::ReplicationRun run = parse_replication_run_json(response.body());
+
+    if (run.run_id != run_id) {
+        throw RemoteProtocolError{"replication run response run_id does not match request"};
+    }
+
+    if (run.state != aistore::metadata::ReplicationRunState::Completed) {
+        throw RemoteProtocolError{"replication run response state is not completed"};
     }
 
     return run;

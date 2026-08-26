@@ -12,6 +12,18 @@ STORAGE_BIN="$3"
 
 DB_URL="${AISTORE_TEST_DB_URL:-dbname=ai_artifact_store_test}"
 
+reset_registry_state() {
+  psql "${DB_URL}" -v ON_ERROR_STOP=1 <<'SQL' >/dev/null
+DELETE FROM upload_session_finalizations WHERE session_id IN (SELECT session_id FROM upload_sessions WHERE state = 'open');
+DELETE FROM upload_session_metadata WHERE session_id IN (SELECT session_id FROM upload_sessions WHERE state = 'open');
+DELETE FROM upload_sessions WHERE state = 'open';
+DELETE FROM replication_runs;
+DELETE FROM gc_runs;
+DELETE FROM storage_nodes;
+SQL
+}
+reset_registry_state
+
 ARTIFACT_ID="018f1f7e-7b3c-7000-8000-000000000041"
 LIVE_SESSION_ID="018f1f7e-7b3c-7000-8000-000000000042"
 BLOCKING_SESSION_ID="018f1f7e-7b3c-7000-8000-000000000043"
@@ -20,6 +32,20 @@ APPLY_GC_ID="018f1f7e-7b3c-7000-8000-000000000045"
 PUSH_DURING_GC_SESSION_ID="018f1f7e-7b3c-7000-8000-000000000046"
 ORPHAN_SESSION_ID="018f1f7e-7b3c-7000-8000-000000000047"
 NODE_ID="m7-node"
+
+psql "${DB_URL}" -v ON_ERROR_STOP=1 <<SQL >/dev/null
+DELETE FROM upload_session_finalizations WHERE session_id IN (
+  '${LIVE_SESSION_ID}'::uuid, '${BLOCKING_SESSION_ID}'::uuid, '${PUSH_DURING_GC_SESSION_ID}'::uuid, '${ORPHAN_SESSION_ID}'::uuid
+);
+DELETE FROM upload_session_metadata WHERE session_id IN (
+  '${LIVE_SESSION_ID}'::uuid, '${BLOCKING_SESSION_ID}'::uuid, '${PUSH_DURING_GC_SESSION_ID}'::uuid, '${ORPHAN_SESSION_ID}'::uuid
+);
+DELETE FROM upload_sessions WHERE session_id IN (
+  '${LIVE_SESSION_ID}'::uuid, '${BLOCKING_SESSION_ID}'::uuid, '${PUSH_DURING_GC_SESSION_ID}'::uuid, '${ORPHAN_SESSION_ID}'::uuid
+);
+DELETE FROM gc_runs WHERE run_id IN ('${DRY_RUN_GC_ID}'::uuid, '${APPLY_GC_ID}'::uuid);
+DELETE FROM storage_locations WHERE node_id = '${NODE_ID}';
+SQL
 
 WORK_DIR="$(mktemp -d)"
 STORAGE_ROOT="$(mktemp -d)"
@@ -213,17 +239,21 @@ METADATA_PID=$!
 
 wait_for_health "http://127.0.0.1:8080/health" "metadata-service"
 
-AISTORE_STORAGE_ROOT="${STORAGE_ROOT}" "${STORAGE_BIN}" &
+AISTORE_STORAGE_NODE_ID="${NODE_ID}" AISTORE_STORAGE_ROOT="${STORAGE_ROOT}" "${STORAGE_BIN}" &
 STORAGE_PID=$!
 
 wait_for_health "http://127.0.0.1:8081/health" "storage-node"
+
+"${AISTORE_BIN}" node register \
+  --storage-node-id "${NODE_ID}" \
+  --storage-address 127.0.0.1 \
+  --storage-port 8081
 
 # Step 1: live committed data via production push.
 set +e
 "${AISTORE_BIN}" push \
   --file "${SOURCE_FILE}" \
   --artifact-id "${ARTIFACT_ID}" \
-  --storage-node-id "${NODE_ID}" \
   --session-id "${LIVE_SESSION_ID}" \
   --chunk-size 4 \
   --metadata source=gc-process-e2e \
@@ -264,6 +294,8 @@ print(json.dumps({
     "session_id": session_id,
     "artifact_id": artifact_id,
     "target_node_id": node_id,
+    "replication_factor": 1,
+    "placement_node_ids": [node_id],
     "chunking_strategy": "fixed-size",
     "chunking_parameters": {"chunk_size_bytes": 4},
     "parent_version_id": None,
@@ -320,6 +352,8 @@ print(json.dumps({
     "session_id": session_id,
     "artifact_id": artifact_id,
     "target_node_id": node_id,
+    "replication_factor": 1,
+    "placement_node_ids": [node_id],
     "chunking_strategy": "fixed-size",
     "chunking_parameters": {"chunk_size_bytes": 4},
     "parent_version_id": None,
@@ -450,7 +484,6 @@ set +e
 "${AISTORE_BIN}" push \
   --file "${PUSH_BLOCK_FILE}" \
   --artifact-id "${ARTIFACT_ID}" \
-  --storage-node-id "${NODE_ID}" \
   --session-id "${PUSH_DURING_GC_SESSION_ID}" \
   --chunk-size 4 \
   >"${STDOUT_FILE}" 2>"${STDERR_FILE}"
@@ -555,7 +588,6 @@ set +e
 "${AISTORE_BIN}" pull \
   --version-id "${VERSION_ID}" \
   --output "${PULL_DEST}" \
-  --storage-node-id "${NODE_ID}" \
   >"${STDOUT_FILE}" 2>"${STDERR_FILE}"
 PULL_STATUS=$?
 set -e

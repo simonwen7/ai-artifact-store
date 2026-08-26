@@ -23,7 +23,7 @@
 #include "aistore/metadata/restore_plan.hpp"
 #include "aistore/metadata/storage_location.hpp"
 #include "aistore/metadata/upload_session.hpp"
-#include "aistore/metadata/uuid_v7.hpp"
+#include "aistore/service/metadata_service_m8_routes.hpp"
 
 namespace aistore::service {
 
@@ -229,10 +229,19 @@ aistore::http::HttpResponse make_method_not_allowed(const aistore::http::HttpReq
         metadata_object[key] = value;
     }
 
+    boost::json::array placement_array;
+    placement_array.reserve(session.placement_node_ids().size());
+
+    for (const std::string& node_id : session.placement_node_ids()) {
+        placement_array.push_back(boost::json::value(node_id));
+    }
+
     boost::json::object body{
         {"session_id", session.session_id().str()},
         {"artifact_id", session.artifact_id().str()},
         {"target_node_id", session.target_node_id()},
+        {"replication_factor", static_cast<std::uint64_t>(session.replication_factor())},
+        {"placement_node_ids", std::move(placement_array)},
         {"chunking_strategy", aistore::metadata::chunking_strategy_to_string(session.chunking_strategy())},
         {"chunking_parameters", chunking_parameters_to_json(session)},
         {"immutable_metadata", std::move(metadata_object)},
@@ -346,6 +355,8 @@ aistore::http::HttpResponse make_method_not_allowed(const aistore::http::HttpReq
                                          const aistore::metadata::UploadSession& requested) {
     return existing.session_id() == requested.session_id() && existing.artifact_id() == requested.artifact_id() &&
            existing.target_node_id() == requested.target_node_id() &&
+           existing.replication_factor() == requested.replication_factor() &&
+           existing.placement_node_ids() == requested.placement_node_ids() &&
            existing.chunking_strategy() == requested.chunking_strategy() &&
            existing.fixed_chunk_size_bytes() == requested.fixed_chunk_size_bytes() &&
            existing.fastcdc_parameters() == requested.fastcdc_parameters() &&
@@ -668,6 +679,12 @@ struct ParsedGcRunRoute {
             return make_json_response(request, beast_http::status::conflict,
                                       boost::json::object{
                                           {"error", "gc_in_progress"},
+                                      });
+
+        case aistore::metadata::GcErrorKind::ReplicationInProgress:
+            return make_json_response(request, beast_http::status::conflict,
+                                      boost::json::object{
+                                          {"error", "replication_in_progress"},
                                       });
     }
 
@@ -1041,8 +1058,9 @@ struct ParsedGcRunRoute {
 
     const boost::json::object& body = parsed.as_object();
 
-    if (body.size() != 7U || !body.contains("session_id") || !body.contains("artifact_id") ||
-        !body.contains("target_node_id") || !body.contains("chunking_strategy") ||
+    if (body.size() != 9U || !body.contains("session_id") || !body.contains("artifact_id") ||
+        !body.contains("target_node_id") || !body.contains("replication_factor") ||
+        !body.contains("placement_node_ids") || !body.contains("chunking_strategy") ||
         !body.contains("chunking_parameters") || !body.contains("parent_version_id") ||
         !body.contains("immutable_metadata")) {
         return make_json_response(request, beast_http::status::bad_request,
@@ -1052,8 +1070,44 @@ struct ParsedGcRunRoute {
     }
 
     if (!body.at("session_id").is_string() || !body.at("artifact_id").is_string() ||
-        !body.at("target_node_id").is_string() || !body.at("chunking_strategy").is_string() ||
-        !body.at("chunking_parameters").is_object() || !body.at("immutable_metadata").is_object()) {
+        !body.at("target_node_id").is_string() || !body.at("placement_node_ids").is_array() ||
+        !body.at("chunking_strategy").is_string() || !body.at("chunking_parameters").is_object() ||
+        !body.at("immutable_metadata").is_object()) {
+        return make_json_response(request, beast_http::status::bad_request,
+                                  boost::json::object{
+                                      {"error", "invalid_request"},
+                                  });
+    }
+
+    const std::optional<std::uint64_t> optional_replication_factor =
+        extract_positive_uint64(body.at("replication_factor"));
+
+    if (!optional_replication_factor.has_value() || *optional_replication_factor > 8U) {
+        return make_json_response(request, beast_http::status::bad_request,
+                                  boost::json::object{
+                                      {"error", "invalid_request"},
+                                  });
+    }
+
+    const auto replication_factor = static_cast<std::uint8_t>(*optional_replication_factor);
+
+    const std::string request_target_node_id{body.at("target_node_id").as_string()};
+
+    std::vector<std::string> placement_node_ids;
+    placement_node_ids.reserve(body.at("placement_node_ids").as_array().size());
+
+    for (const boost::json::value& node_value : body.at("placement_node_ids").as_array()) {
+        if (!node_value.is_string()) {
+            return make_json_response(request, beast_http::status::bad_request,
+                                      boost::json::object{
+                                          {"error", "invalid_request"},
+                                      });
+        }
+
+        placement_node_ids.emplace_back(node_value.as_string());
+    }
+
+    if (placement_node_ids.empty() || request_target_node_id != placement_node_ids.front()) {
         return make_json_response(request, beast_http::status::bad_request,
                                   boost::json::object{
                                       {"error", "invalid_request"},
@@ -1145,16 +1199,14 @@ struct ParsedGcRunRoute {
         aistore::metadata::UuidV7 artifact_id{std::string{body.at("artifact_id").as_string()}};
 
         if (*parsed_strategy == aistore::metadata::ChunkingStrategy::FixedSize) {
-            requested.emplace(std::move(session_id), std::move(artifact_id),
-                              std::string{body.at("target_node_id").as_string()},
-                              aistore::metadata::ChunkingStrategy::FixedSize, resolved_fixed_chunk_size_bytes,
-                              std::move(parent_version_id), std::move(immutable_metadata),
-                              aistore::metadata::UploadSessionState::Open, std::nullopt);
+            requested.emplace(std::move(session_id), std::move(artifact_id), replication_factor,
+                              std::move(placement_node_ids), aistore::metadata::ChunkingStrategy::FixedSize,
+                              resolved_fixed_chunk_size_bytes, std::move(parent_version_id),
+                              std::move(immutable_metadata), aistore::metadata::UploadSessionState::Open, std::nullopt);
         } else {
-            requested.emplace(std::move(session_id), std::move(artifact_id),
-                              std::string{body.at("target_node_id").as_string()}, resolved_fastcdc_parameters,
-                              std::move(parent_version_id), std::move(immutable_metadata),
-                              aistore::metadata::UploadSessionState::Open, std::nullopt);
+            requested.emplace(std::move(session_id), std::move(artifact_id), replication_factor,
+                              std::move(placement_node_ids), resolved_fastcdc_parameters, std::move(parent_version_id),
+                              std::move(immutable_metadata), aistore::metadata::UploadSessionState::Open, std::nullopt);
         }
     } catch (const std::invalid_argument&) {
         return make_json_response(request, beast_http::status::bad_request,
@@ -1195,6 +1247,11 @@ struct ParsedGcRunRoute {
 
             response_session = *created;
         }
+    } catch (const std::invalid_argument&) {
+        return make_json_response(request, beast_http::status::bad_request,
+                                  boost::json::object{
+                                      {"error", "invalid_request"},
+                                  });
     } catch (const pqxx::foreign_key_violation&) {
         return make_json_response(request, beast_http::status::not_found,
                                   boost::json::object{
@@ -1456,6 +1513,14 @@ struct ParsedGcRunRoute {
 
             case aistore::metadata::FinalizeUploadErrorKind::ChunkNotAvailableOnTarget:
                 error_body["error"] = "chunk_not_available_on_target";
+
+                if (error.chunk_id().has_value()) {
+                    error_body["chunk_id"] = *error.chunk_id();
+                }
+                break;
+
+            case aistore::metadata::FinalizeUploadErrorKind::ChunkUnderReplicated:
+                error_body["error"] = "chunk_under_replicated";
 
                 if (error.chunk_id().has_value()) {
                     error_body["chunk_id"] = *error.chunk_id();
@@ -1832,6 +1897,12 @@ aistore::http::HttpResponse MetadataService::handle_request(const aistore::http:
         }
 
         return make_method_not_allowed(request, "GET");
+    }
+
+    if (const std::optional<aistore::http::HttpResponse> m8_response =
+            try_handle_m8_routes(request, repository_, repository_mutex_);
+        m8_response.has_value()) {
+        return *m8_response;
     }
 
     const std::string_view target = request.target();

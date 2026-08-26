@@ -25,7 +25,7 @@
 #include "aistore/chunking/fastcdc_chunker.hpp"
 #include "aistore/client/client_error.hpp"
 #include "aistore/client/metadata_client.hpp"
-#include "aistore/client/storage_node_client.hpp"
+#include "aistore/client/storage_node_client_pool.hpp"
 #include "aistore/hashing/sha256.hpp"
 #include "aistore/http/http_client.hpp"
 #include "aistore/http/http_server.hpp"
@@ -33,8 +33,9 @@
 #include "aistore/metadata/chunk_metadata.hpp"
 #include "aistore/metadata/chunking.hpp"
 #include "aistore/metadata/object_layout_descriptor.hpp"
-#include "aistore/metadata/postgres_metadata_repository.hpp"
+#include "aistore/metadata/placement.hpp"
 #include "aistore/metadata/storage_location.hpp"
+#include "aistore/metadata/storage_node.hpp"
 #include "aistore/metadata/uuid_v7.hpp"
 #include "aistore/service/metadata_service.hpp"
 #include "aistore/service/storage_node_service.hpp"
@@ -47,6 +48,7 @@ using aistore::chunking::FastCdcChunker;
 using aistore::client::MetadataClient;
 using aistore::client::RemoteApiError;
 using aistore::client::StorageNodeClient;
+using aistore::client::StorageNodeClientPool;
 using aistore::http::HttpClientConfig;
 using aistore::http::HttpEndpoint;
 using aistore::http::HttpRequest;
@@ -63,8 +65,11 @@ using aistore::metadata::Object;
 using aistore::metadata::ObjectLayout;
 using aistore::metadata::ObjectLayoutDescriptor;
 using aistore::metadata::PostgresMetadataRepository;
+using aistore::metadata::select_replica_nodes;
 using aistore::metadata::StorageLocation;
 using aistore::metadata::StorageLocationState;
+using aistore::metadata::StorageNode;
+using aistore::metadata::StorageNodeState;
 using aistore::metadata::UuidV7;
 using aistore::metadata::VersionState;
 using aistore::pull::PullEngine;
@@ -243,6 +248,25 @@ class PullEngineFixture : public ::testing::Test {
         unique_tag_ = UuidV7::generate().str();
 
         repository_.emplace(test_database_connection_string());
+        {
+            pqxx::connection connection{test_database_connection_string()};
+            pqxx::work transaction{connection};
+            transaction
+                .exec(
+                    "DELETE FROM upload_session_finalizations WHERE session_id IN "
+                    "(SELECT session_id FROM upload_sessions WHERE state = 'open')")
+                .no_rows();
+            transaction
+                .exec(
+                    "DELETE FROM upload_session_metadata WHERE session_id IN "
+                    "(SELECT session_id FROM upload_sessions WHERE state = 'open')")
+                .no_rows();
+            transaction.exec("DELETE FROM upload_sessions WHERE state = 'open'").no_rows();
+            transaction.exec("DELETE FROM replication_runs").no_rows();
+            transaction.exec("DELETE FROM gc_runs").no_rows();
+            transaction.exec("DELETE FROM storage_nodes").no_rows();
+            transaction.commit();
+        }
         repository_->create_artifact(
             Artifact{artifact_id_, std::string{"m5-pull-artifact-"} + artifact_id_.str(), "m5-pull-project"});
 
@@ -260,12 +284,23 @@ class PullEngineFixture : public ::testing::Test {
         storage_client_.emplace(HttpClientConfig{
             .endpoint = HttpEndpoint{.address = "127.0.0.1", .port = storage_server_->port()},
         });
+        storage_pool_.emplace(std::vector<std::pair<std::string, StorageNodeClient>>{
+            {std::string{kSourceNode}, *storage_client_},
+        });
+
+        repository_->register_storage_node(StorageNode{
+            .node_id = std::string{kSourceNode},
+            .address = "127.0.0.1",
+            .port = storage_server_->port(),
+            .state = StorageNodeState::Active,
+        });
 
         dest_dir_.emplace();
     }
 
     void TearDown() override {
         pull_engine_.reset();
+        storage_pool_.reset();
         storage_client_.reset();
         storage_server_.reset();
         storage_service_.reset();
@@ -372,7 +407,7 @@ class PullEngineFixture : public ::testing::Test {
 
     PullEngine& engine() {
         if (!pull_engine_.has_value()) {
-            pull_engine_.emplace(*metadata_client_, *storage_client_, std::string{kSourceNode});
+            pull_engine_.emplace(*metadata_client_, *storage_pool_);
         }
         return *pull_engine_;
     }
@@ -397,6 +432,7 @@ class PullEngineFixture : public ::testing::Test {
     std::optional<StorageNodeService> storage_service_;
     std::optional<RunningHttpServer> storage_server_;
     std::optional<StorageNodeClient> storage_client_;
+    std::optional<StorageNodeClientPool> storage_pool_;
 
     std::optional<TemporaryDirectory> dest_dir_;
     std::optional<PullEngine> pull_engine_;
@@ -454,7 +490,10 @@ TEST_F(PullEngineFixture, PullsEmptyObjectWithoutStorageRequests) {
     StorageNodeClient counting_client{HttpClientConfig{
         .endpoint = HttpEndpoint{.address = "127.0.0.1", .port = counting_storage.port()},
     }};
-    PullEngine counting_engine{*metadata_client_, counting_client, std::string{kSourceNode}};
+    StorageNodeClientPool counting_pool{std::vector<std::pair<std::string, StorageNodeClient>>{
+        {std::string{kSourceNode}, std::move(counting_client)},
+    }};
+    PullEngine counting_engine{*metadata_client_, counting_pool};
 
     const PullResult result = counting_engine.pull(
         PullRequest{.version_id = version.version_id(), .destination_path = destination, .overwrite = false});
@@ -685,15 +724,20 @@ TEST_F(PullEngineFixture, WorkerFailureCancelsAndJoinsWithoutPublishing) {
     StorageNodeClient failing_client{HttpClientConfig{
         .endpoint = HttpEndpoint{.address = "127.0.0.1", .port = failing_storage.port()},
     }};
-    PullEngine failing_engine{*metadata_client_, failing_client, std::string{kSourceNode}};
+    StorageNodeClientPool failing_pool{std::vector<std::pair<std::string, StorageNodeClient>>{
+        {std::string{kSourceNode}, std::move(failing_client)},
+    }};
+    PullEngine failing_engine{*metadata_client_, failing_pool};
 
     try {
         (void)failing_engine.pull(
             PullRequest{.version_id = version.version_id(), .destination_path = destination, .overwrite = false});
-        FAIL() << "expected RemoteApiError";
+        FAIL() << "expected pull failure";
     } catch (const RemoteApiError& error) {
         EXPECT_EQ(error.status_code(), 500U);
         EXPECT_EQ(error.error_code(), "injected_storage_failure");
+    } catch (const std::runtime_error& error) {
+        EXPECT_NE(std::string_view{error.what()}.find("required chunk missing"), std::string_view::npos);
     }
 
     EXPECT_FALSE(std::filesystem::exists(destination));
@@ -768,7 +812,10 @@ TEST_F(PullEngineFixture, DownloadConcurrencyNeverExceedsFourAndWindowRemainsBou
     StorageNodeClient instrumented_client{HttpClientConfig{
         .endpoint = HttpEndpoint{.address = "127.0.0.1", .port = instrumented_storage.port()},
     }};
-    PullEngine instrumented_engine{*metadata_client_, instrumented_client, std::string{kSourceNode}};
+    StorageNodeClientPool instrumented_pool{std::vector<std::pair<std::string, StorageNodeClient>>{
+        {std::string{kSourceNode}, std::move(instrumented_client)},
+    }};
+    PullEngine instrumented_engine{*metadata_client_, instrumented_pool};
 
     const PullResult result = instrumented_engine.pull(
         PullRequest{.version_id = version.version_id(), .destination_path = destination, .overwrite = false});
@@ -809,6 +856,352 @@ TEST_F(PullEngineFixture, PullsFastCdcVariableSizedLayoutWithoutChunkingSpecific
     EXPECT_EQ(result.object_id, descriptor.object_id());
     EXPECT_EQ(result.stats.bytes_restored, fixture.size());
     EXPECT_EQ(result.stats.total_chunks, descriptor.layout().chunks().size());
+}
+
+class MultiNodePullEngineFixture : public ::testing::Test {
+   protected:
+    struct NodeStack {
+        explicit NodeStack(std::string id)
+            : node_id(std::move(id)), store(root.path().string()), service(store, node_id) {}
+
+        TemporaryDirectory root;
+        std::string node_id;
+        LocalChunkStore store;
+        StorageNodeService service;
+        RunningHttpServer server{[this](const HttpRequest& request) { return service.handle_request(request); }};
+        StorageNodeClient client{HttpClientConfig{
+            .endpoint = HttpEndpoint{.address = "127.0.0.1", .port = server.port()},
+        }};
+    };
+
+    void SetUp() override {
+        artifact_id_ = UuidV7::generate();
+        unique_tag_ = UuidV7::generate().str();
+
+        repository_.emplace(test_database_connection_string());
+        {
+            pqxx::connection connection{test_database_connection_string()};
+            pqxx::work transaction{connection};
+            transaction
+                .exec(
+                    "DELETE FROM upload_session_finalizations WHERE session_id IN "
+                    "(SELECT session_id FROM upload_sessions WHERE state = 'open')")
+                .no_rows();
+            transaction
+                .exec(
+                    "DELETE FROM upload_session_metadata WHERE session_id IN "
+                    "(SELECT session_id FROM upload_sessions WHERE state = 'open')")
+                .no_rows();
+            transaction.exec("DELETE FROM upload_sessions WHERE state = 'open'").no_rows();
+            transaction.exec("DELETE FROM replication_runs").no_rows();
+            transaction.exec("DELETE FROM gc_runs").no_rows();
+            transaction.exec("DELETE FROM storage_nodes").no_rows();
+            transaction.commit();
+        }
+        repository_->create_artifact(
+            Artifact{artifact_id_, std::string{"m8-pull-artifact-"} + artifact_id_.str(), "m8-pull-project"});
+
+        metadata_service_.emplace(*repository_);
+        metadata_server_.emplace(
+            [&](const HttpRequest& request) { return metadata_service_->handle_request(request); });
+        metadata_client_.emplace(HttpClientConfig{
+            .endpoint = HttpEndpoint{.address = "127.0.0.1", .port = metadata_server_->port()},
+        });
+
+        node_a_ = std::make_unique<NodeStack>("m8-pull-a");
+        node_b_ = std::make_unique<NodeStack>("m8-pull-b");
+        node_c_ = std::make_unique<NodeStack>("m8-pull-c");
+
+        for (NodeStack* node : {node_a_.get(), node_b_.get(), node_c_.get()}) {
+            repository_->register_storage_node(StorageNode{
+                .node_id = node->node_id,
+                .address = "127.0.0.1",
+                .port = node->server.port(),
+                .state = StorageNodeState::Active,
+            });
+        }
+
+        storage_pool_.emplace(std::vector<std::pair<std::string, StorageNodeClient>>{
+            {"m8-pull-a", node_a_->client},
+            {"m8-pull-b", node_b_->client},
+            {"m8-pull-c", node_c_->client},
+        });
+
+        dest_dir_.emplace();
+    }
+
+    void TearDown() override {
+        pull_engine_.reset();
+        storage_pool_.reset();
+        node_c_.reset();
+        node_b_.reset();
+        node_a_.reset();
+        metadata_client_.reset();
+        metadata_server_.reset();
+        metadata_service_.reset();
+
+        if (repository_.has_value()) {
+            cleanup_owned_rows();
+            repository_.reset();
+        }
+
+        dest_dir_.reset();
+    }
+
+    void cleanup_owned_rows() {
+        pqxx::connection connection{test_database_connection_string()};
+        pqxx::work transaction{connection};
+
+        for (const std::string& version_id : owned_version_ids_) {
+            transaction.exec("DELETE FROM artifact_version_metadata WHERE version_id = $1", pqxx::params{version_id})
+                .no_rows();
+            transaction.exec("DELETE FROM artifact_versions WHERE version_id = $1", pqxx::params{version_id}).no_rows();
+        }
+
+        for (const std::string& object_id : owned_object_ids_) {
+            transaction
+                .exec(
+                    "DELETE FROM object_layout_chunks WHERE layout_id IN "
+                    "(SELECT layout_id FROM object_layouts WHERE object_id = $1)",
+                    pqxx::params{object_id})
+                .no_rows();
+            transaction.exec("DELETE FROM object_layouts WHERE object_id = $1", pqxx::params{object_id}).no_rows();
+            transaction.exec("DELETE FROM objects WHERE object_id = $1", pqxx::params{object_id}).no_rows();
+        }
+
+        transaction.exec("DELETE FROM storage_locations WHERE node_id LIKE 'm8-pull-%'").no_rows();
+
+        for (const std::string& chunk_id : owned_chunk_ids_) {
+            transaction.exec("DELETE FROM storage_locations WHERE chunk_id = $1", pqxx::params{chunk_id}).no_rows();
+            transaction.exec("DELETE FROM chunks WHERE chunk_id = $1", pqxx::params{chunk_id}).no_rows();
+        }
+
+        transaction.exec("DELETE FROM storage_nodes WHERE node_id LIKE 'm8-pull-%'").no_rows();
+        transaction.exec("DELETE FROM artifacts WHERE artifact_id = $1::uuid", pqxx::params{artifact_id_.str()})
+            .no_rows();
+        transaction.commit();
+    }
+
+    void track_chunk(std::string chunk_id) { owned_chunk_ids_.push_back(std::move(chunk_id)); }
+
+    void track_object(std::string object_id) { owned_object_ids_.push_back(std::move(object_id)); }
+
+    void track_version(std::string version_id) { owned_version_ids_.push_back(std::move(version_id)); }
+
+    void store_chunk_on_node(NodeStack& node, std::string_view bytes) {
+        const std::string chunk_id = sha256_hex(bytes);
+        track_chunk(chunk_id);
+        repository_->register_chunks({ChunkMetadata{.chunk_id = chunk_id, .size_bytes = bytes.size()}});
+        node.store.put(chunk_id, std::as_bytes(std::span{bytes.data(), bytes.size()}));
+        repository_->register_storage_location(StorageLocation{
+            .chunk_id = chunk_id,
+            .node_id = node.node_id,
+            .storage_path = std::string{"/v1/chunks/"} + chunk_id,
+            .state = StorageLocationState::Available,
+        });
+    }
+
+    [[nodiscard]] ArtifactVersion create_rf2_version(const std::string& contents) {
+        const ObjectLayoutDescriptor descriptor = make_fixed_size_descriptor(contents, 4);
+        track_object(descriptor.object_id());
+
+        repository_->register_object(descriptor.object());
+        repository_->register_object_layout(descriptor);
+
+        const std::vector<std::string> placement{"m8-pull-a", "m8-pull-b", "m8-pull-c"};
+
+        for (const ChunkRef& chunk : descriptor.layout().chunks()) {
+            const std::string chunk_bytes =
+                contents.substr(static_cast<std::size_t>(chunk.offset), static_cast<std::size_t>(chunk.size));
+            const std::vector<std::string> desired = select_replica_nodes(chunk.chunk_id, placement, 2U);
+            store_chunk_on_node(*node_for(desired.front()), chunk_bytes);
+            if (desired.size() > 1U) {
+                store_chunk_on_node(*node_for(desired[1]), chunk_bytes);
+            }
+        }
+
+        ArtifactVersion version{artifact_id_, descriptor.object_id(), std::nullopt,
+                                ArtifactVersion::ImmutableMetadata{{"source", unique_tag_}}, VersionState::Committed};
+        repository_->create_version(version);
+        track_version(version.version_id());
+        return version;
+    }
+
+    [[nodiscard]] NodeStack* node_for(std::string_view node_id) {
+        if (node_id == "m8-pull-a") {
+            return node_a_.get();
+        }
+        if (node_id == "m8-pull-b") {
+            return node_b_.get();
+        }
+        return node_c_.get();
+    }
+
+    PullEngine& engine() {
+        if (!pull_engine_.has_value()) {
+            pull_engine_.emplace(*metadata_client_, *storage_pool_);
+        }
+        return *pull_engine_;
+    }
+
+    [[nodiscard]] std::filesystem::path destination_path(std::string_view name) const {
+        return dest_dir_->path() / std::string{name};
+    }
+
+    UuidV7 artifact_id_{UuidV7::generate()};
+    std::string unique_tag_;
+    std::vector<std::string> owned_chunk_ids_;
+    std::vector<std::string> owned_object_ids_;
+    std::vector<std::string> owned_version_ids_;
+
+    std::optional<PostgresMetadataRepository> repository_;
+    std::optional<MetadataService> metadata_service_;
+    std::optional<RunningHttpServer> metadata_server_;
+    std::optional<MetadataClient> metadata_client_;
+
+    std::unique_ptr<NodeStack> node_a_;
+    std::unique_ptr<NodeStack> node_b_;
+    std::unique_ptr<NodeStack> node_c_;
+    std::optional<StorageNodeClientPool> storage_pool_;
+    std::optional<TemporaryDirectory> dest_dir_;
+    std::optional<PullEngine> pull_engine_;
+};
+
+TEST_F(MultiNodePullEngineFixture, RestoresLayoutAcrossDifferentSourceNodes) {
+    const std::string contents = "ABCDABCDEFGH";
+    const ArtifactVersion version = create_rf2_version(contents);
+    const auto destination = destination_path("multi-source.bin");
+
+    const PullResult result = engine().pull(
+        PullRequest{.version_id = version.version_id(), .destination_path = destination, .overwrite = false});
+
+    EXPECT_EQ(read_file(destination), contents);
+    EXPECT_FALSE(result.source_node_id.empty());
+}
+
+TEST_F(MultiNodePullEngineFixture, FallsBackWhenFirstReplicaIsUnavailable) {
+    const std::string contents = "ABCDABCDEFGH";
+    const ObjectLayoutDescriptor descriptor = make_fixed_size_descriptor(contents, 4);
+    track_object(descriptor.object_id());
+    repository_->register_object(descriptor.object());
+    repository_->register_object_layout(descriptor);
+
+    const std::vector<std::string> placement{"m8-pull-a", "m8-pull-b", "m8-pull-c"};
+
+    for (const ChunkRef& chunk : descriptor.layout().chunks()) {
+        const std::string chunk_bytes =
+            contents.substr(static_cast<std::size_t>(chunk.offset), static_cast<std::size_t>(chunk.size));
+        const std::vector<std::string> desired = select_replica_nodes(chunk.chunk_id, placement, 2U);
+        store_chunk_on_node(*node_for(desired.back()), chunk_bytes);
+    }
+
+    ArtifactVersion version{artifact_id_, descriptor.object_id(), std::nullopt,
+                            ArtifactVersion::ImmutableMetadata{{"source", unique_tag_}}, VersionState::Committed};
+    repository_->create_version(version);
+    track_version(version.version_id());
+
+    RunningHttpServer failing_storage{[](const HttpRequest& request) {
+        HttpResponse response{beast_http::status::internal_server_error, request.version()};
+        response.set(beast_http::field::content_type, "application/json");
+        response.body() = R"({"error":"injected_storage_failure"})";
+        response.prepare_payload();
+        return response;
+    }};
+
+    StorageNodeClient failing_client{HttpClientConfig{
+        .endpoint = HttpEndpoint{.address = "127.0.0.1", .port = failing_storage.port()},
+    }};
+    StorageNodeClientPool failing_pool{std::vector<std::pair<std::string, StorageNodeClient>>{
+        {"m8-pull-a", std::move(failing_client)},
+        {"m8-pull-b", node_b_->client},
+        {"m8-pull-c", node_c_->client},
+    }};
+    PullEngine pull_engine{*metadata_client_, failing_pool};
+
+    const auto destination = destination_path("fallback.bin");
+    const PullResult result = pull_engine.pull(
+        PullRequest{.version_id = version.version_id(), .destination_path = destination, .overwrite = false});
+
+    EXPECT_EQ(read_file(destination), contents);
+    EXPECT_GT(result.stats.chunks_downloaded, 0U);
+}
+
+TEST_F(MultiNodePullEngineFixture, FallsBackWhenFirstReplicaReturnsInvalidChunk) {
+    const std::string contents = "ABCDABCDEFGH";
+    const ObjectLayoutDescriptor descriptor = make_fixed_size_descriptor(contents, 4);
+    track_object(descriptor.object_id());
+    repository_->register_object(descriptor.object());
+    repository_->register_object_layout(descriptor);
+
+    const std::vector<std::string> placement{"m8-pull-a", "m8-pull-b", "m8-pull-c"};
+    const ChunkRef& first_chunk = descriptor.layout().chunks().front();
+    const std::vector<std::string> desired = select_replica_nodes(first_chunk.chunk_id, placement, 2U);
+
+    store_chunk_on_node(*node_for(desired.front()), "ZZ");
+    store_chunk_on_node(*node_for(desired.back()), "ABCD");
+
+    for (std::size_t index = 1; index < descriptor.layout().chunks().size(); ++index) {
+        const ChunkRef& chunk = descriptor.layout().chunks()[index];
+        const std::string chunk_bytes =
+            contents.substr(static_cast<std::size_t>(chunk.offset), static_cast<std::size_t>(chunk.size));
+        const std::vector<std::string> chunk_desired = select_replica_nodes(chunk.chunk_id, placement, 2U);
+        store_chunk_on_node(*node_for(chunk_desired.back()), chunk_bytes);
+    }
+
+    ArtifactVersion version{artifact_id_, descriptor.object_id(), std::nullopt,
+                            ArtifactVersion::ImmutableMetadata{{"source", unique_tag_}}, VersionState::Committed};
+    repository_->create_version(version);
+    track_version(version.version_id());
+
+    const auto destination = destination_path("invalid-first.bin");
+    const PullResult result = engine().pull(
+        PullRequest{.version_id = version.version_id(), .destination_path = destination, .overwrite = false});
+
+    EXPECT_EQ(read_file(destination), contents);
+    EXPECT_GT(result.stats.chunks_downloaded, 0U);
+}
+
+TEST_F(MultiNodePullEngineFixture, FailsClosedWhenAllReplicaSourcesFail) {
+    const std::string contents = "ABCDABCDEFGH";
+    const ObjectLayoutDescriptor descriptor = make_fixed_size_descriptor(contents, 4);
+    track_object(descriptor.object_id());
+    repository_->register_object(descriptor.object());
+    repository_->register_object_layout(descriptor);
+
+    ArtifactVersion version{artifact_id_, descriptor.object_id(), std::nullopt,
+                            ArtifactVersion::ImmutableMetadata{{"source", unique_tag_}}, VersionState::Committed};
+    repository_->create_version(version);
+    track_version(version.version_id());
+
+    RunningHttpServer failing_storage{[](const HttpRequest& request) {
+        HttpResponse response{beast_http::status::internal_server_error, request.version()};
+        response.set(beast_http::field::content_type, "application/json");
+        response.body() = R"({"error":"injected_storage_failure"})";
+        response.prepare_payload();
+        return response;
+    }};
+
+    StorageNodeClient failing_a{HttpClientConfig{
+        .endpoint = HttpEndpoint{.address = "127.0.0.1", .port = failing_storage.port()},
+    }};
+    StorageNodeClient failing_b{HttpClientConfig{
+        .endpoint = HttpEndpoint{.address = "127.0.0.1", .port = failing_storage.port()},
+    }};
+    StorageNodeClient failing_c{HttpClientConfig{
+        .endpoint = HttpEndpoint{.address = "127.0.0.1", .port = failing_storage.port()},
+    }};
+    StorageNodeClientPool failing_pool{std::vector<std::pair<std::string, StorageNodeClient>>{
+        {"m8-pull-a", std::move(failing_a)},
+        {"m8-pull-b", std::move(failing_b)},
+        {"m8-pull-c", std::move(failing_c)},
+    }};
+
+    PullEngine failing_engine{*metadata_client_, failing_pool};
+    const auto destination = destination_path("all-fail.bin");
+
+    EXPECT_THROW((void)failing_engine.pull(PullRequest{
+                     .version_id = version.version_id(), .destination_path = destination, .overwrite = false}),
+                 std::runtime_error);
 }
 
 }  // namespace

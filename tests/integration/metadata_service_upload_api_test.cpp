@@ -24,11 +24,21 @@
 #include "aistore/metadata/chunk_metadata.hpp"
 #include "aistore/metadata/postgres_metadata_repository.hpp"
 #include "aistore/metadata/storage_location.hpp"
+#include "aistore/metadata/storage_node.hpp"
 #include "aistore/metadata/upload_session.hpp"
 #include "aistore/metadata/uuid_v7.hpp"
 #include "aistore/service/metadata_service.hpp"
 
 namespace {
+
+void ensure_active_node(aistore::metadata::PostgresMetadataRepository& repository, std::string node_id) {
+    repository.register_storage_node(aistore::metadata::StorageNode{
+        .node_id = std::move(node_id),
+        .address = "127.0.0.1",
+        .port = 8081,
+        .state = aistore::metadata::StorageNodeState::Active,
+    });
+}
 
 namespace asio = boost::asio;
 namespace beast = boost::beast;
@@ -181,6 +191,26 @@ class MetadataServiceUploadApiTest : public ::testing::Test {
         artifact_id_ = UuidV7::generate();
         session_id_ = UuidV7::generate();
         repository_.emplace(test_database_connection_string());
+        ensure_active_node(*repository_, "m4s2-target");
+        ensure_active_node(*repository_, "m6-fastcdc-target");
+        {
+            pqxx::connection connection{test_database_connection_string()};
+            pqxx::work transaction{connection};
+            transaction
+                .exec(
+                    "DELETE FROM upload_session_finalizations WHERE session_id IN "
+                    "(SELECT session_id FROM upload_sessions WHERE state = 'open')")
+                .no_rows();
+            transaction
+                .exec(
+                    "DELETE FROM upload_session_metadata WHERE session_id IN "
+                    "(SELECT session_id FROM upload_sessions WHERE state = 'open')")
+                .no_rows();
+            transaction.exec("DELETE FROM upload_sessions WHERE state = 'open'").no_rows();
+            transaction.exec("DELETE FROM replication_runs").no_rows();
+            transaction.exec("DELETE FROM gc_runs").no_rows();
+            transaction.commit();
+        }
         repository_->create_artifact(
             Artifact{artifact_id_, std::string{"m4s2-artifact-"} + artifact_id_.str(), "m4s2-project"});
         service_.emplace(*repository_);
@@ -265,6 +295,8 @@ class MetadataServiceUploadApiTest : public ::testing::Test {
             {"session_id", session_id.str()},
             {"artifact_id", artifact_id.str()},
             {"target_node_id", target_node_id},
+            {"replication_factor", std::uint64_t{1}},
+            {"placement_node_ids", boost::json::array{std::string{target_node_id}}},
             {"chunking_strategy", "fixed-size"},
             {"chunking_parameters",
              boost::json::object{
@@ -757,6 +789,8 @@ TEST_F(MetadataServiceUploadApiTest, CreatesAndGetsFastCdcUploadSession) {
         {"session_id", session_id.str()},
         {"artifact_id", artifact_id_.str()},
         {"target_node_id", "m6-fastcdc-target"},
+        {"replication_factor", std::uint64_t{1}},
+        {"placement_node_ids", boost::json::array{"m6-fastcdc-target"}},
         {"chunking_strategy", "fastcdc"},
         {"chunking_parameters",
          boost::json::object{
@@ -796,6 +830,8 @@ TEST_F(MetadataServiceUploadApiTest, RejectsMalformedFastCdcChunkingParameters) 
         {"session_id", session_id.str()},
         {"artifact_id", artifact_id_.str()},
         {"target_node_id", "m6-fastcdc-target"},
+        {"replication_factor", std::uint64_t{1}},
+        {"placement_node_ids", boost::json::array{"m6-fastcdc-target"}},
         {"chunking_strategy", "fastcdc"},
         {"chunking_parameters",
          boost::json::object{

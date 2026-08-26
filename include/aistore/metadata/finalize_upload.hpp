@@ -15,6 +15,7 @@ enum class FinalizeUploadErrorKind : std::uint8_t {
     SessionNotOpen,
     Conflict,
     ChunkNotAvailableOnTarget,
+    ChunkUnderReplicated,
 };
 
 class FinalizeUploadError : public std::runtime_error {

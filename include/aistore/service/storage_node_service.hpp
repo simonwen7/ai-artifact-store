@@ -8,12 +8,13 @@ namespace aistore::service {
 
 class StorageNodeService {
    public:
-    explicit StorageNodeService(storage::LocalChunkStore& chunk_store);
+    StorageNodeService(storage::LocalChunkStore& chunk_store, std::string node_id = "node-1");
 
     [[nodiscard]] aistore::http::HttpResponse handle_request(const aistore::http::HttpRequest& request) const;
 
    private:
     storage::LocalChunkStore& chunk_store_;
+    std::string node_id_;
 };
 
 }  // namespace aistore::service

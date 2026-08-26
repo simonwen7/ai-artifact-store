@@ -33,6 +33,7 @@ enum class GcErrorKind : std::uint8_t {
     OpenUploadSessionsPresent,
     RunNotOpen,
     GcInProgress,
+    ReplicationInProgress,
 };
 
 class GcError : public std::runtime_error {

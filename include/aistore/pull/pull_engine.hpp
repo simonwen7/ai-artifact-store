@@ -7,7 +7,7 @@
 #include <string>
 
 #include "aistore/client/metadata_client.hpp"
-#include "aistore/client/storage_node_client.hpp"
+#include "aistore/client/storage_node_client_pool.hpp"
 #include "aistore/metadata/uuid_v7.hpp"
 
 namespace aistore::pull {
@@ -42,15 +42,13 @@ class PullEngine {
     static constexpr std::size_t kWindowCapacity = 8;
     static constexpr std::uint64_t kMaxM5ChunkSize = 8ULL * 1024ULL * 1024ULL;
 
-    PullEngine(client::MetadataClient& metadata_client, client::StorageNodeClient& storage_client,
-               std::string source_node_id);
+    PullEngine(client::MetadataClient& metadata_client, client::StorageNodeClientPool& storage_pool);
 
     [[nodiscard]] PullResult pull(const PullRequest& request) const;
 
    private:
     client::MetadataClient& metadata_client_;
-    client::StorageNodeClient& storage_client_;
-    std::string source_node_id_;
+    client::StorageNodeClientPool& storage_pool_;
 };
 
 }  // namespace aistore::pull

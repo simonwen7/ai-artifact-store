@@ -24,8 +24,8 @@
 #include <utility>
 #include <vector>
 
+#include "aistore/client/client_error.hpp"
 #include "aistore/hashing/sha256.hpp"
-#include "aistore/metadata/object_layout.hpp"
 #include "aistore/metadata/restore_plan.hpp"
 
 namespace aistore::pull {
@@ -329,6 +329,7 @@ struct SharedDownloadState {
     bool cancelled{false};
 
     const std::vector<aistore::metadata::ChunkRef>* chunks{nullptr};
+    const std::vector<aistore::metadata::RestoreChunkSources>* chunk_sources{nullptr};
     std::size_t total_chunks{0};
     std::size_t next_write_index{0};
     std::size_t next_claim_index{0};
@@ -353,7 +354,7 @@ void cancel_download(SharedDownloadState& state) {
     state.cv.notify_all();
 }
 
-void download_worker_loop(SharedDownloadState& state, aistore::client::StorageNodeClient& storage_client) {
+void download_worker_loop(SharedDownloadState& state, aistore::client::StorageNodeClientPool& storage_pool) {
     while (true) {
         std::size_t chunk_index = 0;
 
@@ -385,11 +386,28 @@ void download_worker_loop(SharedDownloadState& state, aistore::client::StorageNo
 
         try {
             const aistore::metadata::ChunkRef& chunk = (*state.chunks)[chunk_index];
+            const aistore::metadata::RestoreChunkSources& sources = (*state.chunk_sources)[chunk_index];
 
-            std::optional<std::vector<std::byte>> downloaded = storage_client.get_chunk(chunk.chunk_id);
+            std::optional<std::vector<std::byte>> downloaded;
+
+            for (const aistore::metadata::RestoreNodeEndpoint& source : sources.sources) {
+                try {
+                    downloaded = storage_pool.client_for(source.node_id).get_chunk(chunk.chunk_id);
+
+                    if (downloaded.has_value()) {
+                        break;
+                    }
+                } catch (const aistore::client::RemoteApiError&) {
+                    continue;
+                } catch (const aistore::client::RemoteProtocolError&) {
+                    continue;
+                } catch (const std::runtime_error&) {
+                    continue;
+                }
+            }
 
             if (!downloaded.has_value()) {
-                throw std::runtime_error("required chunk missing from configured source node");
+                throw std::runtime_error("required chunk missing from all configured source nodes");
             }
 
             if (downloaded->size() != chunk.size) {
@@ -452,26 +470,35 @@ void publish_partial(const std::filesystem::path& partial_path, const std::files
 
 }  // namespace
 
-PullEngine::PullEngine(client::MetadataClient& metadata_client, client::StorageNodeClient& storage_client,
-                       std::string source_node_id)
-    : metadata_client_{metadata_client}, storage_client_{storage_client}, source_node_id_{std::move(source_node_id)} {
-    if (!is_valid_node_id(source_node_id_)) {
-        throw std::invalid_argument("source node ID is invalid");
-    }
-}
+PullEngine::PullEngine(client::MetadataClient& metadata_client, client::StorageNodeClientPool& storage_pool)
+    : metadata_client_{metadata_client}, storage_pool_{storage_pool} {}
 
 PullResult PullEngine::pull(const PullRequest& request) const {
     validate_destination(request);
 
-    const aistore::metadata::RestorePlan plan = metadata_client_.get_restore_plan(request.version_id, source_node_id_);
-
-    if (plan.source_node_id != source_node_id_) {
-        throw std::invalid_argument("restore plan source node does not match configured source node");
-    }
+    const aistore::metadata::MultiNodeRestorePlan plan =
+        metadata_client_.get_multi_node_restore_plan(request.version_id);
 
     const aistore::metadata::ObjectLayoutDescriptor& descriptor = plan.layout_descriptor;
     const std::vector<aistore::metadata::ChunkRef>& chunks = descriptor.layout().chunks();
     validate_chunk_sizes(chunks);
+
+    if (plan.chunks.size() != chunks.size()) {
+        throw std::runtime_error("multi-node restore plan chunk count does not match layout");
+    }
+
+    for (std::size_t index = 0; index < plan.chunks.size(); ++index) {
+        if (plan.chunks[index].chunk_id != chunks[index].chunk_id ||
+            plan.chunks[index].offset != chunks[index].offset || plan.chunks[index].size_bytes != chunks[index].size) {
+            throw std::runtime_error("multi-node restore plan chunk metadata does not match layout");
+        }
+    }
+
+    std::string primary_source_node_id;
+
+    if (!plan.chunks.empty() && !plan.chunks.front().sources.empty()) {
+        primary_source_node_id = plan.chunks.front().sources.front().node_id;
+    }
 
     const std::filesystem::path partial_path =
         std::filesystem::path{request.destination_path.string() + ".aistore." + request.version_id + ".part"};
@@ -488,6 +515,7 @@ PullResult PullEngine::pull(const PullRequest& request) const {
     if (resume_state.first_download_index < total_chunks) {
         SharedDownloadState shared;
         shared.chunks = &chunks;
+        shared.chunk_sources = &plan.chunks;
         shared.total_chunks = total_chunks;
         shared.next_write_index = resume_state.first_download_index;
         shared.next_claim_index = resume_state.first_download_index;
@@ -500,7 +528,7 @@ PullResult PullEngine::pull(const PullRequest& request) const {
 
             try {
                 for (std::size_t worker_index = 0; worker_index < kWorkerCount; ++worker_index) {
-                    workers.emplace_back(download_worker_loop, std::ref(shared), std::ref(storage_client_));
+                    workers.emplace_back(download_worker_loop, std::ref(shared), std::ref(storage_pool_));
                 }
 
                 for (std::size_t chunk_index = resume_state.first_download_index; chunk_index < total_chunks;
@@ -575,7 +603,7 @@ PullResult PullEngine::pull(const PullRequest& request) const {
     return PullResult{
         .version_id = plan.version_id,
         .artifact_id = plan.artifact_id,
-        .source_node_id = plan.source_node_id,
+        .source_node_id = primary_source_node_id,
         .object_id = descriptor.object_id(),
         .layout_id = descriptor.layout_id(),
         .destination_path = request.destination_path,

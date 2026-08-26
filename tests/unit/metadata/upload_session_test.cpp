@@ -5,6 +5,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 #include "aistore/metadata/chunking.hpp"
 
@@ -12,6 +13,7 @@ namespace {
 
 using aistore::metadata::ChunkingStrategy;
 using aistore::metadata::FastCdcParameters;
+using aistore::metadata::upload_session_identity_matches;
 using aistore::metadata::UploadSession;
 using aistore::metadata::UploadSessionState;
 using aistore::metadata::UuidV7;
@@ -326,6 +328,138 @@ TEST(UploadSessionTest, PreservesFixedSizeSessionSemantics) {
     EXPECT_EQ(session.fixed_chunk_size_bytes(), kFourMiB);
     EXPECT_EQ(session.chunk_size_bytes(), kFourMiB);
     EXPECT_FALSE(session.fastcdc_parameters().has_value());
+}
+
+TEST(UploadSessionTest, AcceptsMultiNodePlacementSnapshot) {
+    const UuidV7 session_id = UuidV7::generate();
+    const UuidV7 artifact_id = UuidV7::generate();
+
+    const UploadSession session{
+        session_id,
+        artifact_id,
+        3U,
+        std::vector<std::string>{"node-a", "node-b", "node-c"},
+        ChunkingStrategy::FixedSize,
+        kFourMiB,
+        std::nullopt,
+        UploadSession::ImmutableMetadata{{"framework", "pytorch"}},
+        UploadSessionState::Open,
+        std::nullopt,
+    };
+
+    EXPECT_EQ(session.replication_factor(), 3U);
+    EXPECT_EQ(session.placement_node_ids(), (std::vector<std::string>{"node-a", "node-b", "node-c"}));
+    EXPECT_EQ(session.target_node_id(), "node-a");
+}
+
+TEST(UploadSessionTest, RejectsInvalidReplicationFactorOrNodeSet) {
+    EXPECT_THROW((UploadSession{
+                     UuidV7::generate(),
+                     UuidV7::generate(),
+                     0U,
+                     std::vector<std::string>{"node-a"},
+                     ChunkingStrategy::FixedSize,
+                     kFourMiB,
+                     std::nullopt,
+                     UploadSession::ImmutableMetadata{},
+                     UploadSessionState::Open,
+                     std::nullopt,
+                 }),
+                 std::invalid_argument);
+
+    EXPECT_THROW((UploadSession{
+                     UuidV7::generate(),
+                     UuidV7::generate(),
+                     2U,
+                     std::vector<std::string>{"node-b", "node-a"},
+                     ChunkingStrategy::FixedSize,
+                     kFourMiB,
+                     std::nullopt,
+                     UploadSession::ImmutableMetadata{},
+                     UploadSessionState::Open,
+                     std::nullopt,
+                 }),
+                 std::invalid_argument);
+
+    EXPECT_THROW((UploadSession{
+                     UuidV7::generate(),
+                     UuidV7::generate(),
+                     2U,
+                     std::vector<std::string>{"node-a"},
+                     ChunkingStrategy::FixedSize,
+                     kFourMiB,
+                     std::nullopt,
+                     UploadSession::ImmutableMetadata{},
+                     UploadSessionState::Open,
+                     std::nullopt,
+                 }),
+                 std::invalid_argument);
+}
+
+TEST(UploadSessionTest, PreservesLegacySingleTargetAsRfOneSnapshot) {
+    const UploadSession session{
+        UuidV7::generate(),
+        UuidV7::generate(),
+        "node-a",
+        ChunkingStrategy::FixedSize,
+        kFourMiB,
+        std::nullopt,
+        UploadSession::ImmutableMetadata{},
+        UploadSessionState::Open,
+        std::nullopt,
+    };
+
+    EXPECT_EQ(session.replication_factor(), 1U);
+    EXPECT_EQ(session.placement_node_ids(), (std::vector<std::string>{"node-a"}));
+    EXPECT_EQ(session.target_node_id(), "node-a");
+}
+
+TEST(UploadSessionTest, SessionIdentityIncludesReplicationConfiguration) {
+    const UuidV7 session_id = UuidV7::generate();
+    const UuidV7 artifact_id = UuidV7::generate();
+
+    const UploadSession baseline{
+        session_id,
+        artifact_id,
+        2U,
+        std::vector<std::string>{"node-a", "node-b", "node-c"},
+        ChunkingStrategy::FixedSize,
+        kFourMiB,
+        std::nullopt,
+        UploadSession::ImmutableMetadata{{"marker", "same"}},
+        UploadSessionState::Open,
+        std::nullopt,
+    };
+
+    const UploadSession different_factor{
+        session_id,
+        artifact_id,
+        3U,
+        std::vector<std::string>{"node-a", "node-b", "node-c"},
+        ChunkingStrategy::FixedSize,
+        kFourMiB,
+        std::nullopt,
+        UploadSession::ImmutableMetadata{{"marker", "same"}},
+        UploadSessionState::Open,
+        std::nullopt,
+    };
+
+    const UploadSession different_placement{
+        session_id,
+        artifact_id,
+        2U,
+        std::vector<std::string>{"node-a", "node-b", "node-d"},
+        ChunkingStrategy::FixedSize,
+        kFourMiB,
+        std::nullopt,
+        UploadSession::ImmutableMetadata{{"marker", "same"}},
+        UploadSessionState::Open,
+        std::nullopt,
+    };
+
+    EXPECT_TRUE(upload_session_identity_matches(baseline, baseline));
+    EXPECT_FALSE(upload_session_identity_matches(baseline, different_factor));
+    EXPECT_FALSE(upload_session_identity_matches(baseline, different_placement));
 }
 
 }  // namespace

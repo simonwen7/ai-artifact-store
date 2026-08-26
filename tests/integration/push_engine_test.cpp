@@ -24,7 +24,7 @@
 #include "aistore/chunking/fastcdc_chunker.hpp"
 #include "aistore/client/client_error.hpp"
 #include "aistore/client/metadata_client.hpp"
-#include "aistore/client/storage_node_client.hpp"
+#include "aistore/client/storage_node_client_pool.hpp"
 #include "aistore/hashing/sha256.hpp"
 #include "aistore/http/http_client.hpp"
 #include "aistore/http/http_server.hpp"
@@ -32,8 +32,9 @@
 #include "aistore/metadata/chunk_metadata.hpp"
 #include "aistore/metadata/chunking.hpp"
 #include "aistore/metadata/object_layout_descriptor.hpp"
-#include "aistore/metadata/postgres_metadata_repository.hpp"
+#include "aistore/metadata/placement.hpp"
 #include "aistore/metadata/storage_location.hpp"
+#include "aistore/metadata/storage_node.hpp"
 #include "aistore/metadata/upload_session.hpp"
 #include "aistore/metadata/uuid_v7.hpp"
 #include "aistore/service/metadata_service.hpp"
@@ -47,6 +48,7 @@ using aistore::chunking::FastCdcChunker;
 using aistore::client::MetadataClient;
 using aistore::client::RemoteApiError;
 using aistore::client::StorageNodeClient;
+using aistore::client::StorageNodeClientPool;
 using aistore::http::HttpClientConfig;
 using aistore::http::HttpEndpoint;
 using aistore::http::HttpRequest;
@@ -56,10 +58,14 @@ using aistore::http::HttpServerConfig;
 using aistore::metadata::Artifact;
 using aistore::metadata::ChunkingStrategy;
 using aistore::metadata::ChunkMetadata;
+using aistore::metadata::ChunkRef;
 using aistore::metadata::FastCdcParameters;
 using aistore::metadata::PostgresMetadataRepository;
+using aistore::metadata::select_replica_nodes;
 using aistore::metadata::StorageLocation;
 using aistore::metadata::StorageLocationState;
+using aistore::metadata::StorageNode;
+using aistore::metadata::StorageNodeState;
 using aistore::metadata::UploadSession;
 using aistore::metadata::UploadSessionState;
 using aistore::metadata::UuidV7;
@@ -214,6 +220,30 @@ class PushEngineFixture : public ::testing::Test {
         unique_tag_ = UuidV7::generate().str();
 
         repository_.emplace(test_database_connection_string());
+        {
+            pqxx::connection connection{test_database_connection_string()};
+            pqxx::work transaction{connection};
+            transaction
+                .exec(
+                    "DELETE FROM upload_session_finalizations WHERE session_id IN "
+                    "(SELECT session_id FROM upload_sessions WHERE state = 'open')")
+                .no_rows();
+            transaction
+                .exec(
+                    "DELETE FROM upload_session_metadata WHERE session_id IN "
+                    "(SELECT session_id FROM upload_sessions WHERE state = 'open')")
+                .no_rows();
+            transaction
+                .exec(
+                    "DELETE FROM upload_session_nodes WHERE session_id IN "
+                    "(SELECT session_id FROM upload_sessions WHERE state = 'open')")
+                .no_rows();
+            transaction.exec("DELETE FROM upload_sessions WHERE state = 'open'").no_rows();
+            transaction.exec("DELETE FROM replication_runs").no_rows();
+            transaction.exec("DELETE FROM gc_runs").no_rows();
+            transaction.exec("DELETE FROM storage_nodes").no_rows();
+            transaction.commit();
+        }
         repository_->create_artifact(
             Artifact{artifact_id_, std::string{"m4s4-artifact-"} + artifact_id_.str(), "m4s4-project"});
 
@@ -231,12 +261,16 @@ class PushEngineFixture : public ::testing::Test {
         storage_client_.emplace(HttpClientConfig{
             .endpoint = HttpEndpoint{.address = "127.0.0.1", .port = storage_server_->port()},
         });
+        storage_pool_.emplace(std::vector<std::pair<std::string, StorageNodeClient>>{
+            {std::string{kTargetNode}, *storage_client_},
+        });
 
         source_dir_.emplace();
     }
 
     void TearDown() override {
         push_engine_.reset();
+        storage_pool_.reset();
         storage_client_.reset();
         storage_server_.reset();
         storage_service_.reset();
@@ -279,6 +313,12 @@ class PushEngineFixture : public ::testing::Test {
             session_id_,      artifact_id_, std::string{target_node}, ChunkingStrategy::FixedSize,
             chunk_size_bytes, std::nullopt, {{"source", "m4s4"}},     UploadSessionState::Open,
             std::nullopt};
+        metadata_client_->register_storage_node(aistore::metadata::StorageNode{
+            .node_id = session.target_node_id(),
+            .address = "127.0.0.1",
+            .port = 8081,
+            .state = aistore::metadata::StorageNodeState::Active,
+        });
         (void)metadata_client_->create_upload_session(session);
     }
 
@@ -291,12 +331,18 @@ class PushEngineFixture : public ::testing::Test {
                                     {{"source", "m6-fastcdc"}},
                                     UploadSessionState::Open,
                                     std::nullopt};
+        metadata_client_->register_storage_node(aistore::metadata::StorageNode{
+            .node_id = session.target_node_id(),
+            .address = "127.0.0.1",
+            .port = 8081,
+            .state = aistore::metadata::StorageNodeState::Active,
+        });
         (void)metadata_client_->create_upload_session(session);
     }
 
     PushEngine& engine() {
         if (!push_engine_.has_value()) {
-            push_engine_.emplace(*metadata_client_, *storage_client_, std::string{kTargetNode});
+            push_engine_.emplace(*metadata_client_, *storage_pool_);
         }
         return *push_engine_;
     }
@@ -316,6 +362,7 @@ class PushEngineFixture : public ::testing::Test {
     std::optional<StorageNodeService> storage_service_;
     std::optional<RunningHttpServer> storage_server_;
     std::optional<StorageNodeClient> storage_client_;
+    std::optional<StorageNodeClientPool> storage_pool_;
 
     std::optional<TemporaryDirectory> source_dir_;
     std::optional<PushEngine> push_engine_;
@@ -555,7 +602,10 @@ TEST_F(PushEngineFixture, WorkerFailurePropagatesAndSessionRemainsOpen) {
     StorageNodeClient failing_client{HttpClientConfig{
         .endpoint = HttpEndpoint{.address = "127.0.0.1", .port = failing_storage.port()},
     }};
-    PushEngine failing_engine{*metadata_client_, failing_client, std::string{kTargetNode}};
+    StorageNodeClientPool failing_pool{std::vector<std::pair<std::string, StorageNodeClient>>{
+        {std::string{kTargetNode}, std::move(failing_client)},
+    }};
+    PushEngine failing_engine{*metadata_client_, failing_pool};
 
     const std::string contents = "fail";
     const auto source = write_temp_file(source_dir_->path(), "fail.bin", contents);
@@ -580,7 +630,10 @@ TEST_F(PushEngineFixture, RejectsStorageClientNodeMismatchBeforeStorageIo) {
     StorageNodeClient unused_client{HttpClientConfig{
         .endpoint = HttpEndpoint{.address = "127.0.0.1", .port = 1},
     }};
-    PushEngine mismatched{*metadata_client_, unused_client, "m4s4-target-b"};
+    StorageNodeClientPool mismatched_pool{std::vector<std::pair<std::string, StorageNodeClient>>{
+        {"m4s4-target-b", std::move(unused_client)},
+    }};
+    PushEngine mismatched{*metadata_client_, mismatched_pool};
 
     const auto source = write_temp_file(source_dir_->path(), "mismatch.bin", "abcd");
     EXPECT_THROW((void)mismatched.push(PushRequest{.source_path = source, .session_id = session_id_}),
@@ -597,6 +650,12 @@ TEST_F(PushEngineFixture, RejectsChunkSizeAboveM4StorageLimit) {
                                 {},
                                 UploadSessionState::Open,
                                 std::nullopt};
+    metadata_client_->register_storage_node(aistore::metadata::StorageNode{
+        .node_id = session.target_node_id(),
+        .address = "127.0.0.1",
+        .port = 8081,
+        .state = aistore::metadata::StorageNodeState::Active,
+    });
     (void)metadata_client_->create_upload_session(session);
 
     const auto source = write_temp_file(source_dir_->path(), "toolarge.bin", "abcd");
@@ -605,15 +664,19 @@ TEST_F(PushEngineFixture, RejectsChunkSizeAboveM4StorageLimit) {
 }
 
 TEST(PushEngineRecoveryTest, PrepareCommittedRetryReconstructsDescriptorWithoutRemoteIO) {
+    constexpr std::string_view kRecoveryNode = "m4s6-recovery-node";
+
     MetadataClient unused_metadata{HttpClientConfig{
         .endpoint = HttpEndpoint{.address = "127.0.0.1", .port = 1},
     }};
     StorageNodeClient unused_storage{HttpClientConfig{
         .endpoint = HttpEndpoint{.address = "127.0.0.1", .port = 2},
     }};
+    StorageNodeClientPool unused_pool{std::vector<std::pair<std::string, StorageNodeClient>>{
+        {std::string{kRecoveryNode}, std::move(unused_storage)},
+    }};
 
-    constexpr std::string_view kRecoveryNode = "m4s6-recovery-node";
-    PushEngine engine{unused_metadata, unused_storage, std::string{kRecoveryNode}};
+    PushEngine engine{unused_metadata, unused_pool};
 
     TemporaryDirectory source_dir;
     const std::string contents = "ABCDABCDEFGH";
@@ -722,15 +785,19 @@ TEST_F(PushEngineFixture, FastCdcPushReusesKnownChunks) {
 }
 
 TEST(PushEngineRecoveryTest, FastCdcCommittedRetryReconstructsExactDescriptorWithoutRemoteIo) {
+    constexpr std::string_view kRecoveryNode = "m6-fastcdc-recovery-node";
+
     MetadataClient unused_metadata{HttpClientConfig{
         .endpoint = HttpEndpoint{.address = "127.0.0.1", .port = 1},
     }};
     StorageNodeClient unused_storage{HttpClientConfig{
         .endpoint = HttpEndpoint{.address = "127.0.0.1", .port = 2},
     }};
+    StorageNodeClientPool unused_pool{std::vector<std::pair<std::string, StorageNodeClient>>{
+        {std::string{kRecoveryNode}, std::move(unused_storage)},
+    }};
 
-    constexpr std::string_view kRecoveryNode = "m6-fastcdc-recovery-node";
-    PushEngine engine{unused_metadata, unused_storage, std::string{kRecoveryNode}};
+    PushEngine engine{unused_metadata, unused_pool};
 
     TemporaryDirectory source_dir;
     const std::vector<std::byte> fixture = make_fastcdc_golden_fixture();
@@ -798,7 +865,10 @@ TEST_F(PushEngineFixture, FastCdcPushRemainsOnePassAndBounded) {
     StorageNodeClient instrumented_client{HttpClientConfig{
         .endpoint = HttpEndpoint{.address = "127.0.0.1", .port = instrumented_storage.port()},
     }};
-    PushEngine instrumented_engine{*metadata_client_, instrumented_client, std::string{kTargetNode}};
+    StorageNodeClientPool instrumented_pool{std::vector<std::pair<std::string, StorageNodeClient>>{
+        {std::string{kTargetNode}, std::move(instrumented_client)},
+    }};
+    PushEngine instrumented_engine{*metadata_client_, instrumented_pool};
 
     const PreparedPush prepared =
         instrumented_engine.push(PushRequest{.source_path = source, .session_id = session_id_});
@@ -810,6 +880,329 @@ TEST_F(PushEngineFixture, FastCdcPushRemainsOnePassAndBounded) {
     EXPECT_EQ(prepared.stats.bytes_read, fixture.size());
     EXPECT_LE(max_in_flight.load(), static_cast<int>(PushEngine::kWorkerCount));
     EXPECT_LE(max_in_flight.load(), static_cast<int>(PushEngine::kQueueCapacity));
+}
+
+class MultiNodePushEngineFixture : public ::testing::Test {
+   protected:
+    struct NodeStack {
+        explicit NodeStack(std::string id)
+            : node_id(std::move(id)), store(root.path().string()), service(store, node_id) {}
+
+        TemporaryDirectory root;
+        std::string node_id;
+        LocalChunkStore store;
+        StorageNodeService service;
+        RunningHttpServer server{[this](const HttpRequest& request) { return service.handle_request(request); }};
+        StorageNodeClient client{HttpClientConfig{
+            .endpoint = HttpEndpoint{.address = "127.0.0.1", .port = server.port()},
+        }};
+    };
+
+    void SetUp() override {
+        artifact_id_ = UuidV7::generate();
+        session_id_ = UuidV7::generate();
+
+        repository_.emplace(test_database_connection_string());
+        {
+            pqxx::connection connection{test_database_connection_string()};
+            pqxx::work transaction{connection};
+            transaction
+                .exec(
+                    "DELETE FROM upload_session_finalizations WHERE session_id IN "
+                    "(SELECT session_id FROM upload_sessions WHERE state = 'open')")
+                .no_rows();
+            transaction
+                .exec(
+                    "DELETE FROM upload_session_metadata WHERE session_id IN "
+                    "(SELECT session_id FROM upload_sessions WHERE state = 'open')")
+                .no_rows();
+            transaction
+                .exec(
+                    "DELETE FROM upload_session_nodes WHERE session_id IN "
+                    "(SELECT session_id FROM upload_sessions WHERE state = 'open')")
+                .no_rows();
+            transaction.exec("DELETE FROM upload_sessions WHERE state = 'open'").no_rows();
+            transaction.exec("DELETE FROM replication_runs").no_rows();
+            transaction.exec("DELETE FROM gc_runs").no_rows();
+            transaction.exec("DELETE FROM storage_nodes").no_rows();
+            transaction.commit();
+        }
+        repository_->create_artifact(
+            Artifact{artifact_id_, std::string{"m8-push-artifact-"} + artifact_id_.str(), "m8-push-project"});
+
+        metadata_service_.emplace(*repository_);
+        metadata_server_.emplace(
+            [&](const HttpRequest& request) { return metadata_service_->handle_request(request); });
+        metadata_client_.emplace(HttpClientConfig{
+            .endpoint = HttpEndpoint{.address = "127.0.0.1", .port = metadata_server_->port()},
+        });
+
+        node_a_ = std::make_unique<NodeStack>("m8-push-a");
+        node_b_ = std::make_unique<NodeStack>("m8-push-b");
+        node_c_ = std::make_unique<NodeStack>("m8-push-c");
+
+        for (NodeStack* node : {node_a_.get(), node_b_.get(), node_c_.get()}) {
+            metadata_client_->register_storage_node(StorageNode{
+                .node_id = node->node_id,
+                .address = "127.0.0.1",
+                .port = node->server.port(),
+                .state = StorageNodeState::Active,
+            });
+        }
+
+        storage_pool_.emplace(std::vector<std::pair<std::string, StorageNodeClient>>{
+            {"m8-push-a", node_a_->client},
+            {"m8-push-b", node_b_->client},
+            {"m8-push-c", node_c_->client},
+        });
+
+        source_dir_.emplace();
+    }
+
+    void TearDown() override {
+        push_engine_.reset();
+        storage_pool_.reset();
+        node_c_.reset();
+        node_b_.reset();
+        node_a_.reset();
+        metadata_client_.reset();
+        metadata_server_.reset();
+        metadata_service_.reset();
+
+        if (repository_.has_value()) {
+            cleanup_owned_rows();
+            repository_.reset();
+        }
+
+        source_dir_.reset();
+    }
+
+    void cleanup_owned_rows() {
+        pqxx::connection connection{test_database_connection_string()};
+        pqxx::work transaction{connection};
+
+        transaction
+            .exec("DELETE FROM upload_session_finalizations WHERE session_id = $1::uuid",
+                  pqxx::params{session_id_.str()})
+            .no_rows();
+        transaction
+            .exec("DELETE FROM upload_session_metadata WHERE session_id = $1::uuid", pqxx::params{session_id_.str()})
+            .no_rows();
+        transaction
+            .exec("DELETE FROM upload_session_nodes WHERE session_id = $1::uuid", pqxx::params{session_id_.str()})
+            .no_rows();
+        transaction.exec("DELETE FROM upload_sessions WHERE session_id = $1::uuid", pqxx::params{session_id_.str()})
+            .no_rows();
+        transaction.exec("DELETE FROM replication_runs").no_rows();
+        transaction.exec("DELETE FROM gc_runs").no_rows();
+        transaction.exec("DELETE FROM storage_locations WHERE node_id LIKE 'm8-push-%'").no_rows();
+
+        for (const std::string& chunk_id : owned_chunk_ids_) {
+            transaction.exec("DELETE FROM object_layout_chunks WHERE chunk_id = $1", pqxx::params{chunk_id}).no_rows();
+            transaction.exec("DELETE FROM storage_locations WHERE chunk_id = $1", pqxx::params{chunk_id}).no_rows();
+            transaction.exec("DELETE FROM chunks WHERE chunk_id = $1", pqxx::params{chunk_id}).no_rows();
+        }
+
+        transaction.exec("DELETE FROM storage_nodes WHERE node_id LIKE 'm8-push-%'").no_rows();
+        transaction.exec("DELETE FROM artifacts WHERE artifact_id = $1::uuid", pqxx::params{artifact_id_.str()})
+            .no_rows();
+        transaction.commit();
+    }
+
+    void track_chunk(std::string chunk_id) { owned_chunk_ids_.push_back(std::move(chunk_id)); }
+
+    void create_open_multi_node_session() {
+        const std::vector<std::string> placement{"m8-push-a", "m8-push-b", "m8-push-c"};
+        const UploadSession session{session_id_,
+                                    artifact_id_,
+                                    2U,
+                                    placement,
+                                    ChunkingStrategy::FixedSize,
+                                    4U,
+                                    std::nullopt,
+                                    {{"source", "m8-push"}},
+                                    UploadSessionState::Open,
+                                    std::nullopt};
+        try {
+            (void)metadata_client_->create_upload_session(session);
+        } catch (const RemoteApiError& error) {
+            if (error.status_code() == 409U && error.error_code() == "upload_session_conflict") {
+                const std::optional<UploadSession> existing = metadata_client_->get_upload_session(session_id_);
+                if (!existing.has_value() || existing->state() != UploadSessionState::Open) {
+                    FAIL() << "upload session conflict with non-open session: " << error.response_body();
+                }
+                return;
+            }
+
+            FAIL() << "create_upload_session failed: status=" << error.status_code() << " code=" << error.error_code()
+                   << " body=" << error.response_body();
+        }
+    }
+
+    PushEngine& engine() {
+        if (!push_engine_.has_value()) {
+            push_engine_.emplace(*metadata_client_, *storage_pool_);
+        }
+        return *push_engine_;
+    }
+
+    [[nodiscard]] NodeStack* node_for(std::string_view node_id) {
+        if (node_id == "m8-push-a") {
+            return node_a_.get();
+        }
+        if (node_id == "m8-push-b") {
+            return node_b_.get();
+        }
+        return node_c_.get();
+    }
+
+    UuidV7 artifact_id_{UuidV7::generate()};
+    UuidV7 session_id_{UuidV7::generate()};
+    std::vector<std::string> owned_chunk_ids_;
+
+    std::optional<PostgresMetadataRepository> repository_;
+    std::optional<MetadataService> metadata_service_;
+    std::optional<RunningHttpServer> metadata_server_;
+    std::optional<MetadataClient> metadata_client_;
+
+    std::unique_ptr<NodeStack> node_a_;
+    std::unique_ptr<NodeStack> node_b_;
+    std::unique_ptr<NodeStack> node_c_;
+    std::optional<StorageNodeClientPool> storage_pool_;
+    std::optional<TemporaryDirectory> source_dir_;
+    std::optional<PushEngine> push_engine_;
+};
+
+TEST_F(MultiNodePushEngineFixture, MultiNodePushReusesExistingDesiredReplica) {
+    create_open_multi_node_session();
+    const std::string contents = "WXYZWXYZUVUV";
+    const auto source = write_temp_file(source_dir_->path(), "reuse.bin", contents);
+
+    const std::string chunk_a = sha256_hex("WXYZ");
+    track_chunk(chunk_a);
+    const std::vector<std::string> placement{"m8-push-a", "m8-push-b", "m8-push-c"};
+    const std::vector<std::string> desired = select_replica_nodes(chunk_a, placement, 2U);
+    NodeStack* seeded_node = node_for(desired.front());
+    seeded_node->store.put(chunk_a, std::as_bytes(std::span{contents.data(), 4U}));
+    repository_->register_chunks({ChunkMetadata{.chunk_id = chunk_a, .size_bytes = 4U}});
+    metadata_client_->register_storage_location(StorageLocation{
+        .chunk_id = chunk_a,
+        .node_id = seeded_node->node_id,
+        .storage_path = std::string{"/v1/chunks/"} + chunk_a,
+        .state = StorageLocationState::Available,
+    });
+
+    const PreparedPush prepared = engine().push(PushRequest{.source_path = source, .session_id = session_id_});
+
+    for (const ChunkRef& chunk : prepared.layout_descriptor.layout().chunks()) {
+        track_chunk(chunk.chunk_id);
+    }
+
+    EXPECT_GE(prepared.stats.verified_target_chunks, 1U);
+    EXPECT_LT(prepared.stats.put_requests, 4U);
+}
+
+TEST_F(MultiNodePushEngineFixture, RfTwoPushWritesEveryDesiredReplica) {
+    create_open_multi_node_session();
+    const std::string contents = "ABCDABCDEFGH";
+    const auto source = write_temp_file(source_dir_->path(), "rf2.bin", contents);
+
+    const PreparedPush prepared = engine().push(PushRequest{.source_path = source, .session_id = session_id_});
+
+    EXPECT_EQ(prepared.stats.unique_chunks, 2U);
+    EXPECT_EQ(prepared.stats.put_requests, 4U);
+
+    const std::vector<std::string> placement{"m8-push-a", "m8-push-b", "m8-push-c"};
+    for (const auto& ref : prepared.layout_descriptor.layout().chunks()) {
+        track_chunk(ref.chunk_id);
+        const std::vector<std::string> desired = select_replica_nodes(ref.chunk_id, placement, 2U);
+        for (const std::string& node_id : desired) {
+            EXPECT_TRUE(node_for(node_id)->client.has_chunk(ref.chunk_id));
+        }
+    }
+}
+
+TEST_F(MultiNodePushEngineFixture, MultiNodePushFailsWhenOneDesiredReplicaCannotBeWritten) {
+    create_open_multi_node_session();
+
+    RunningHttpServer failing_storage{[](const HttpRequest& request) {
+        if (request.method() == beast_http::verb::put) {
+            HttpResponse response{beast_http::status::internal_server_error, request.version()};
+            response.set(beast_http::field::content_type, "application/json");
+            response.body() = R"({"error":"injected_storage_failure"})";
+            response.prepare_payload();
+            return response;
+        }
+
+        HttpResponse response{beast_http::status::not_found, request.version()};
+        response.set(beast_http::field::content_type, "application/json");
+        response.body() = R"({"error":"chunk_not_found"})";
+        response.prepare_payload();
+        return response;
+    }};
+
+    StorageNodeClient failing_client{HttpClientConfig{
+        .endpoint = HttpEndpoint{.address = "127.0.0.1", .port = failing_storage.port()},
+    }};
+    StorageNodeClientPool failing_pool{std::vector<std::pair<std::string, StorageNodeClient>>{
+        {"m8-push-a", node_a_->client},
+        {"m8-push-b", std::move(failing_client)},
+        {"m8-push-c", node_c_->client},
+    }};
+    PushEngine failing_engine{*metadata_client_, failing_pool};
+
+    const auto source = write_temp_file(source_dir_->path(), "fail.bin", "ABCDABCDEFGH");
+
+    EXPECT_THROW((void)failing_engine.push(PushRequest{.source_path = source, .session_id = session_id_}),
+                 RemoteApiError);
+}
+
+TEST(MultiNodePushEngineRecoveryTest, CommittedMultiNodeRetryPerformsZeroStorageIo) {
+    MetadataClient unused_metadata{HttpClientConfig{
+        .endpoint = HttpEndpoint{.address = "127.0.0.1", .port = 1},
+    }};
+    StorageNodeClient unused_a{HttpClientConfig{
+        .endpoint = HttpEndpoint{.address = "127.0.0.1", .port = 2},
+    }};
+    StorageNodeClient unused_b{HttpClientConfig{
+        .endpoint = HttpEndpoint{.address = "127.0.0.1", .port = 3},
+    }};
+    StorageNodeClient unused_c{HttpClientConfig{
+        .endpoint = HttpEndpoint{.address = "127.0.0.1", .port = 4},
+    }};
+    StorageNodeClientPool unused_pool{std::vector<std::pair<std::string, StorageNodeClient>>{
+        {"m8-push-a", std::move(unused_a)},
+        {"m8-push-b", std::move(unused_b)},
+        {"m8-push-c", std::move(unused_c)},
+    }};
+
+    PushEngine engine{unused_metadata, unused_pool};
+
+    TemporaryDirectory source_dir;
+    const std::string contents = "ABCDABCDEFGH";
+    const auto source = write_temp_file(source_dir.path(), "committed.bin", contents);
+
+    const UuidV7 session_id = UuidV7::generate();
+    const UuidV7 artifact_id = UuidV7::generate();
+    const std::vector<std::string> placement{"m8-push-a", "m8-push-b", "m8-push-c"};
+
+    const UploadSession committed_session{session_id,
+                                          artifact_id,
+                                          2U,
+                                          placement,
+                                          ChunkingStrategy::FixedSize,
+                                          4U,
+                                          std::nullopt,
+                                          {},
+                                          UploadSessionState::Committed,
+                                          std::string(64, 'a')};
+
+    const PreparedPush prepared =
+        engine.prepare_committed_retry(PushRequest{.source_path = source, .session_id = session_id}, committed_session);
+
+    EXPECT_EQ(prepared.stats.put_requests, 0U);
+    EXPECT_EQ(prepared.stats.bytes_sent_to_storage, 0U);
+    EXPECT_EQ(prepared.stats.verified_target_chunks, 0U);
 }
 
 }  // namespace

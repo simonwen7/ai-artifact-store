@@ -17,16 +17,29 @@
 
 #include "aistore/http/http_server.hpp"
 #include "aistore/metadata/artifact_model.hpp"
+#include "aistore/metadata/chunk_metadata.hpp"
 #include "aistore/metadata/chunking.hpp"
 #include "aistore/metadata/object.hpp"
 #include "aistore/metadata/object_layout.hpp"
 #include "aistore/metadata/object_layout_descriptor.hpp"
+#include "aistore/metadata/placement.hpp"
 #include "aistore/metadata/postgres_metadata_repository.hpp"
+#include "aistore/metadata/storage_location.hpp"
+#include "aistore/metadata/storage_node.hpp"
 #include "aistore/metadata/upload_session.hpp"
 #include "aistore/metadata/uuid_v7.hpp"
 #include "aistore/service/metadata_service.hpp"
 
 namespace {
+
+void ensure_active_node(aistore::metadata::PostgresMetadataRepository& repository, std::string node_id) {
+    repository.register_storage_node(aistore::metadata::StorageNode{
+        .node_id = std::move(node_id),
+        .address = "127.0.0.1",
+        .port = 8081,
+        .state = aistore::metadata::StorageNodeState::Active,
+    });
+}
 
 namespace asio = boost::asio;
 namespace beast = boost::beast;
@@ -41,11 +54,15 @@ using aistore::http::HttpServerConfig;
 using aistore::metadata::Artifact;
 using aistore::metadata::ArtifactVersion;
 using aistore::metadata::ChunkingStrategy;
+using aistore::metadata::ChunkMetadata;
 using aistore::metadata::ChunkRef;
 using aistore::metadata::Object;
 using aistore::metadata::ObjectLayout;
 using aistore::metadata::ObjectLayoutDescriptor;
 using aistore::metadata::PostgresMetadataRepository;
+using aistore::metadata::select_replica_nodes;
+using aistore::metadata::StorageLocation;
+using aistore::metadata::StorageLocationState;
 using aistore::metadata::UploadSession;
 using aistore::metadata::UploadSessionState;
 using aistore::metadata::UuidV7;
@@ -210,6 +227,24 @@ class MetadataServiceGcApiTest : public ::testing::Test {
    protected:
     void SetUp() override {
         repository_.emplace(test_database_connection_string());
+        {
+            pqxx::connection connection{test_database_connection_string()};
+            pqxx::work transaction{connection};
+            transaction
+                .exec(
+                    "DELETE FROM upload_session_finalizations WHERE session_id IN "
+                    "(SELECT session_id FROM upload_sessions WHERE state = 'open')")
+                .no_rows();
+            transaction
+                .exec(
+                    "DELETE FROM upload_session_metadata WHERE session_id IN "
+                    "(SELECT session_id FROM upload_sessions WHERE state = 'open')")
+                .no_rows();
+            transaction.exec("DELETE FROM upload_sessions WHERE state = 'open'").no_rows();
+            transaction.exec("DELETE FROM replication_runs").no_rows();
+            transaction.exec("DELETE FROM gc_runs").no_rows();
+            transaction.commit();
+        }
         service_.emplace(*repository_);
         server_.emplace(*service_);
     }
@@ -232,12 +267,24 @@ class MetadataServiceGcApiTest : public ::testing::Test {
             transaction.exec("DELETE FROM gc_runs WHERE run_id = $1::uuid", pqxx::params{gc_run_id.str()}).no_rows();
         }
 
+        for (const UuidV7& replication_run_id : owned_replication_run_ids_) {
+            transaction
+                .exec("DELETE FROM replication_runs WHERE run_id = $1::uuid", pqxx::params{replication_run_id.str()})
+                .no_rows();
+        }
+
         for (const UuidV7& session_id : owned_session_ids_) {
             transaction.exec("DELETE FROM upload_sessions WHERE session_id = $1::uuid", pqxx::params{session_id.str()})
                 .no_rows();
         }
 
         for (const UuidV7& artifact_id : owned_artifact_ids_) {
+            transaction
+                .exec(
+                    "DELETE FROM replication_runs WHERE version_id IN "
+                    "(SELECT version_id FROM artifact_versions WHERE artifact_id = $1::uuid)",
+                    pqxx::params{artifact_id.str()})
+                .no_rows();
             transaction
                 .exec("DELETE FROM artifact_versions WHERE artifact_id = $1::uuid", pqxx::params{artifact_id.str()})
                 .no_rows();
@@ -246,6 +293,14 @@ class MetadataServiceGcApiTest : public ::testing::Test {
         }
 
         for (const std::string& object_id : owned_object_ids_) {
+            transaction
+                .exec(
+                    "DELETE FROM replication_runs WHERE version_id IN "
+                    "(SELECT version_id FROM artifact_versions WHERE root_object_id = $1)",
+                    pqxx::params{object_id})
+                .no_rows();
+            transaction.exec("DELETE FROM artifact_versions WHERE root_object_id = $1", pqxx::params{object_id})
+                .no_rows();
             transaction
                 .exec(
                     "DELETE FROM object_layout_chunks WHERE layout_id IN "
@@ -274,6 +329,8 @@ class MetadataServiceGcApiTest : public ::testing::Test {
             {"session_id", session_id.str()},
             {"artifact_id", artifact_id.str()},
             {"target_node_id", target_node_id},
+            {"replication_factor", std::uint64_t{1}},
+            {"placement_node_ids", boost::json::array{std::string{target_node_id}}},
             {"chunking_strategy", "fixed-size"},
             {"chunking_parameters",
              boost::json::object{
@@ -289,6 +346,10 @@ class MetadataServiceGcApiTest : public ::testing::Test {
 
     void track_gc_run(UuidV7 gc_run_id) { owned_gc_run_ids_.push_back(std::move(gc_run_id)); }
 
+    void track_replication_run(UuidV7 replication_run_id) {
+        owned_replication_run_ids_.push_back(std::move(replication_run_id));
+    }
+
     void track_session(UuidV7 session_id) { owned_session_ids_.push_back(std::move(session_id)); }
 
     void track_artifact(UuidV7 artifact_id) { owned_artifact_ids_.push_back(std::move(artifact_id)); }
@@ -296,6 +357,7 @@ class MetadataServiceGcApiTest : public ::testing::Test {
     void track_object(std::string object_id) { owned_object_ids_.push_back(std::move(object_id)); }
 
     std::vector<UuidV7> owned_gc_run_ids_;
+    std::vector<UuidV7> owned_replication_run_ids_;
     std::vector<UuidV7> owned_session_ids_;
     std::vector<UuidV7> owned_artifact_ids_;
     std::vector<std::string> owned_object_ids_;
@@ -413,6 +475,7 @@ TEST_F(MetadataServiceGcApiTest, GcErrorsAndMethodValidation) {
     track_artifact(artifact_id);
 
     repository_->create_artifact(Artifact{artifact_id, "gc-http-errors-" + session_id.str(), "m4gc-project"});
+    ensure_active_node(*repository_, "m4gc-target");
     repository_->create_upload_session(UploadSession{
         session_id,
         artifact_id,
@@ -512,6 +575,75 @@ TEST_F(MetadataServiceGcApiTest, CreateUploadSessionReturnsConflictWhileGcOpen) 
 
     EXPECT_EQ(response.result(), beast_http::status::conflict);
     EXPECT_EQ(boost::json::parse(response.body()).at("error").as_string(), "gc_in_progress");
+}
+
+TEST_F(MetadataServiceGcApiTest, ReplicationRunBlocksGcUntilCompleted) {
+    const UuidV7 artifact_id = UuidV7::generate();
+    const UuidV7 replication_run_id = UuidV7::generate();
+    const UuidV7 gc_run_id = UuidV7::generate();
+    track_artifact(artifact_id);
+    track_replication_run(replication_run_id);
+    track_gc_run(gc_run_id);
+
+    repository_->register_storage_node(aistore::metadata::StorageNode{
+        .node_id = "m4gc-node-a",
+        .address = "127.0.0.1",
+        .port = 9101,
+        .state = aistore::metadata::StorageNodeState::Active,
+    });
+    repository_->register_storage_node(aistore::metadata::StorageNode{
+        .node_id = "m4gc-node-b",
+        .address = "127.0.0.2",
+        .port = 9102,
+        .state = aistore::metadata::StorageNodeState::Active,
+    });
+    repository_->register_storage_node(aistore::metadata::StorageNode{
+        .node_id = "m4gc-node-c",
+        .address = "127.0.0.3",
+        .port = 9103,
+        .state = aistore::metadata::StorageNodeState::Active,
+    });
+
+    const auto descriptor = make_gc_layout('9', 'a', 'b');
+    track_object(descriptor.object_id());
+    register_live_gc_layout(*repository_, artifact_id, descriptor, replication_run_id.str());
+
+    const std::vector<std::string> placement{"m4gc-node-a", "m4gc-node-b", "m4gc-node-c"};
+    for (const ChunkRef& chunk : descriptor.layout().chunks()) {
+        const std::vector<std::string> desired = select_replica_nodes(chunk.chunk_id, placement, 2U);
+        for (const std::string& node_id : desired) {
+            repository_->register_chunks({ChunkMetadata{.chunk_id = chunk.chunk_id, .size_bytes = chunk.size}});
+            repository_->register_storage_location(StorageLocation{
+                .chunk_id = chunk.chunk_id,
+                .node_id = node_id,
+                .storage_path = std::string{"/v1/chunks/"} + chunk.chunk_id,
+                .state = StorageLocationState::Available,
+            });
+        }
+    }
+
+    const ArtifactVersion version_key{
+        artifact_id,
+        descriptor.object_id(),
+        std::nullopt,
+        ArtifactVersion::ImmutableMetadata{{"marker", replication_run_id.str()}},
+        VersionState::Committed,
+    };
+
+    const std::string start_replication = boost::json::serialize(boost::json::object{
+        {"replication_run_id", replication_run_id.str()},
+        {"version_id", version_key.version_id()},
+        {"replication_factor", 2},
+    });
+    ASSERT_EQ(http_exchange(server_->port(), beast_http::verb::post, "/v1/replication-runs", start_replication,
+                            "application/json")
+                  .result(),
+              beast_http::status::ok);
+
+    const HttpResponse blocked = http_exchange(server_->port(), beast_http::verb::post, "/v1/gc-runs",
+                                               make_start_gc_json(gc_run_id, "m4gc-node-a", false), "application/json");
+    EXPECT_EQ(blocked.result(), beast_http::status::conflict);
+    EXPECT_EQ(boost::json::parse(blocked.body()).at("error").as_string(), "replication_in_progress");
 }
 
 }  // namespace

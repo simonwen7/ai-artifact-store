@@ -6,6 +6,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include "aistore/metadata/artifact_model.hpp"
 #include "aistore/metadata/chunking.hpp"
@@ -33,11 +34,26 @@ class UploadSession {
                   ImmutableMetadata immutable_metadata, UploadSessionState state,
                   std::optional<std::string> finalized_version_id);
 
+    UploadSession(UuidV7 session_id, UuidV7 artifact_id, std::uint8_t replication_factor,
+                  std::vector<std::string> placement_node_ids, ChunkingStrategy chunking_strategy,
+                  std::uint64_t chunk_size_bytes, std::optional<std::string> parent_version_id,
+                  ImmutableMetadata immutable_metadata, UploadSessionState state,
+                  std::optional<std::string> finalized_version_id);
+
+    UploadSession(UuidV7 session_id, UuidV7 artifact_id, std::uint8_t replication_factor,
+                  std::vector<std::string> placement_node_ids, FastCdcParameters fastcdc_parameters,
+                  std::optional<std::string> parent_version_id, ImmutableMetadata immutable_metadata,
+                  UploadSessionState state, std::optional<std::string> finalized_version_id);
+
     [[nodiscard]] const UuidV7& session_id() const noexcept;
 
     [[nodiscard]] const UuidV7& artifact_id() const noexcept;
 
     [[nodiscard]] const std::string& target_node_id() const noexcept;
+
+    [[nodiscard]] std::uint8_t replication_factor() const noexcept;
+
+    [[nodiscard]] const std::vector<std::string>& placement_node_ids() const noexcept;
 
     [[nodiscard]] ChunkingStrategy chunking_strategy() const noexcept;
 
@@ -57,13 +73,18 @@ class UploadSession {
     [[nodiscard]] const std::optional<std::string>& finalized_version_id() const noexcept;
 
    private:
-    UploadSession(UuidV7 session_id, UuidV7 artifact_id, std::string target_node_id, ChunkingStrategy chunking_strategy,
+    UploadSession(UuidV7 session_id, UuidV7 artifact_id, std::uint8_t replication_factor,
+                  std::vector<std::string> placement_node_ids, ChunkingStrategy chunking_strategy,
                   std::optional<std::uint64_t> fixed_chunk_size_bytes,
                   std::optional<FastCdcParameters> fastcdc_parameters, std::optional<std::string> parent_version_id,
                   ImmutableMetadata immutable_metadata, UploadSessionState state,
                   std::optional<std::string> finalized_version_id);
 
     static void validate_node_id(std::string_view node_id);
+
+    static void validate_replication_configuration(std::uint8_t replication_factor,
+                                                   const std::vector<std::string>& placement_node_ids,
+                                                   std::string_view target_node_id);
 
     static void validate_content_id(const std::string& content_id, const char* field_name);
 
@@ -72,6 +93,8 @@ class UploadSession {
     UuidV7 session_id_;
     UuidV7 artifact_id_;
     std::string target_node_id_;
+    std::uint8_t replication_factor_;
+    std::vector<std::string> placement_node_ids_;
     ChunkingStrategy chunking_strategy_;
     std::optional<std::uint64_t> fixed_chunk_size_bytes_;
     std::optional<FastCdcParameters> fastcdc_parameters_;
@@ -80,6 +103,8 @@ class UploadSession {
     UploadSessionState state_;
     std::optional<std::string> finalized_version_id_;
 };
+
+[[nodiscard]] bool upload_session_identity_matches(const UploadSession& left, const UploadSession& right);
 
 }  // namespace aistore::metadata
 

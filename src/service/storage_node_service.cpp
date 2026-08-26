@@ -219,7 +219,23 @@ struct ChunkListQuery {
 
 }  // namespace
 
-StorageNodeService::StorageNodeService(storage::LocalChunkStore& chunk_store) : chunk_store_(chunk_store) {}
+StorageNodeService::StorageNodeService(storage::LocalChunkStore& chunk_store, std::string node_id)
+    : chunk_store_{chunk_store}, node_id_{std::move(node_id)} {
+    if (node_id_.empty() || node_id_.size() > 128U) {
+        throw std::invalid_argument("storage node ID is invalid");
+    }
+
+    for (const char character : node_id_) {
+        const bool is_upper = character >= 'A' && character <= 'Z';
+        const bool is_lower = character >= 'a' && character <= 'z';
+        const bool is_digit = character >= '0' && character <= '9';
+        const bool is_allowed_punct = character == '-' || character == '_' || character == '.';
+
+        if (!is_upper && !is_lower && !is_digit && !is_allowed_punct) {
+            throw std::invalid_argument("storage node ID is invalid");
+        }
+    }
+}
 
 aistore::http::HttpResponse StorageNodeService::handle_request(const aistore::http::HttpRequest& request) const {
     if (request.target() == "/health") {
@@ -227,6 +243,7 @@ aistore::http::HttpResponse StorageNodeService::handle_request(const aistore::ht
             return make_json_response(request, beast_http::status::ok,
                                       boost::json::object{
                                           {"status", "ok"},
+                                          {"node_id", node_id_},
                                       });
         }
 

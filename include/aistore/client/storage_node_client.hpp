@@ -26,6 +26,8 @@ class StorageNodeClient {
 
     [[nodiscard]] bool delete_chunk(std::string_view chunk_id) const;
 
+    [[nodiscard]] std::string probe_node_id() const;
+
    private:
     http::HttpClient http_client_;
 };

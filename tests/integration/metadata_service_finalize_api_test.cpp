@@ -26,10 +26,20 @@
 #include "aistore/metadata/object_layout_descriptor.hpp"
 #include "aistore/metadata/postgres_metadata_repository.hpp"
 #include "aistore/metadata/storage_location.hpp"
+#include "aistore/metadata/storage_node.hpp"
 #include "aistore/metadata/upload_session.hpp"
 #include "aistore/service/metadata_service.hpp"
 
 namespace {
+
+void ensure_active_node(aistore::metadata::PostgresMetadataRepository& repository, std::string node_id) {
+    repository.register_storage_node(aistore::metadata::StorageNode{
+        .node_id = std::move(node_id),
+        .address = "127.0.0.1",
+        .port = 8081,
+        .state = aistore::metadata::StorageNodeState::Active,
+    });
+}
 
 namespace asio = boost::asio;
 namespace beast = boost::beast;
@@ -134,6 +144,24 @@ class MetadataServiceFinalizeApiTest : public ::testing::Test {
         artifact_id_ = UuidV7::generate();
         session_id_ = UuidV7::generate();
         repository_.emplace(test_database_connection_string());
+        {
+            pqxx::connection connection{test_database_connection_string()};
+            pqxx::work transaction{connection};
+            transaction
+                .exec(
+                    "DELETE FROM upload_session_finalizations WHERE session_id IN "
+                    "(SELECT session_id FROM upload_sessions WHERE state = 'open')")
+                .no_rows();
+            transaction
+                .exec(
+                    "DELETE FROM upload_session_metadata WHERE session_id IN "
+                    "(SELECT session_id FROM upload_sessions WHERE state = 'open')")
+                .no_rows();
+            transaction.exec("DELETE FROM upload_sessions WHERE state = 'open'").no_rows();
+            transaction.exec("DELETE FROM replication_runs").no_rows();
+            transaction.exec("DELETE FROM gc_runs").no_rows();
+            transaction.commit();
+        }
         repository_->create_artifact(Artifact{artifact_id_, "m4s5-api-" + marker_, "m4s5"});
         service_.emplace(*repository_);
         server_.emplace(*service_);
@@ -178,6 +206,7 @@ class MetadataServiceFinalizeApiTest : public ::testing::Test {
     }
 
     void create_session(std::string_view target = "m4s5-api-target") {
+        ensure_active_node(*repository_, std::string{target});
         repository_->create_upload_session(UploadSession{session_id_,
                                                          artifact_id_,
                                                          std::string{target},
@@ -285,7 +314,7 @@ TEST_F(MetadataServiceFinalizeApiTest, FinalizeRequiresAvailableTargetChunk) {
         http_exchange(server_->port(), beast_http::verb::post, target(session_id_), payload(value), "application/json");
     EXPECT_EQ(response.result(), beast_http::status::conflict);
     const auto body = boost::json::parse(response.body());
-    EXPECT_EQ(body.at("error").as_string(), "chunk_not_available_on_target");
+    EXPECT_EQ(body.at("error").as_string(), "chunk_under_replicated");
     EXPECT_EQ(body.at("chunk_id").as_string(), value.layout().chunks().front().chunk_id);
 }
 
@@ -327,6 +356,7 @@ TEST_F(MetadataServiceFinalizeApiTest, FinalizesFastCdcUploadThroughHttp) {
         .max_chunk_size_bytes = 1024,
     };
 
+    ensure_active_node(*repository_, "m6-fastcdc-target");
     repository_->create_upload_session(UploadSession{session_id_,
                                                      artifact_id_,
                                                      "m6-fastcdc-target",

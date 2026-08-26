@@ -19,7 +19,10 @@
 
 #include "aistore/metadata/chunking.hpp"
 #include "aistore/metadata/gc.hpp"
+#include "aistore/metadata/placement.hpp"
+#include "aistore/metadata/replication.hpp"
 #include "aistore/metadata/restore_plan.hpp"
+#include "aistore/metadata/storage_node.hpp"
 
 namespace aistore::metadata {
 
@@ -235,9 +238,54 @@ void validate_chunk_id(std::string_view chunk_id) {
     }
 }
 
-[[nodiscard]] bool upload_session_configuration_matches(const UploadSession& left, const UploadSession& right) {
-    return left.fixed_chunk_size_bytes() == right.fixed_chunk_size_bytes() &&
-           left.fastcdc_parameters() == right.fastcdc_parameters();
+[[nodiscard]] std::vector<std::string> load_upload_session_placement_nodes(pqxx::work& transaction,
+                                                                           std::string_view session_id) {
+    std::vector<std::string> placement_node_ids;
+
+    for (const auto& [node_id] : transaction.query<std::string>("SELECT "
+                                                                "    node_id "
+                                                                "FROM upload_session_nodes "
+                                                                "WHERE session_id = $1::uuid "
+                                                                "ORDER BY node_rank",
+                                                                pqxx::params{
+                                                                    session_id,
+                                                                })) {
+        placement_node_ids.push_back(node_id);
+    }
+
+    return placement_node_ids;
+}
+
+[[nodiscard]] std::vector<std::string> load_replication_run_placement_nodes(pqxx::work& transaction,
+                                                                            std::string_view run_id) {
+    std::vector<std::string> placement_node_ids;
+
+    for (const auto& [node_id] : transaction.query<std::string>("SELECT "
+                                                                "    node_id "
+                                                                "FROM replication_run_nodes "
+                                                                "WHERE run_id = $1::uuid "
+                                                                "ORDER BY node_rank",
+                                                                pqxx::params{
+                                                                    run_id,
+                                                                })) {
+        placement_node_ids.push_back(node_id);
+    }
+
+    return placement_node_ids;
+}
+
+[[nodiscard]] StorageNode reconstruct_storage_node(std::string node_id, std::string address, int port,
+                                                   const std::string& state) {
+    if (port < 0 || port > 65535) {
+        throw std::runtime_error("stored storage node port is out of range");
+    }
+
+    return StorageNode{
+        .node_id = std::move(node_id),
+        .address = std::move(address),
+        .port = static_cast<std::uint16_t>(port),
+        .state = storage_node_state_from_string(state),
+    };
 }
 
 [[nodiscard]] bool stored_fastcdc_columns_match(std::optional<long long> stored_min,
@@ -302,6 +350,20 @@ constexpr std::string_view kLiveLayoutPredicate = R"(
             FROM upload_session_finalizations usf
             WHERE usf.layout_id = ol.layout_id
         )
+    )
+)";
+
+constexpr std::string_view kMultiNodeRestorableChunkPredicate = R"(
+    EXISTS (
+        SELECT 1
+        FROM storage_locations sl
+        INNER JOIN storage_nodes sn ON sn.node_id = sl.node_id
+        WHERE sl.chunk_id = olc.chunk_id
+          AND sl.state = 'available'
+          AND sn.state IN (
+              'active',
+              'draining'
+          )
     )
 )";
 
@@ -753,6 +815,199 @@ class PostgresMetadataRepository::Impl {
         transaction.commit();
 
         return plan;
+    }
+
+    [[nodiscard]] MultiNodeRestorePlan resolve_multi_node_restore_plan(std::string_view version_id) {
+        validate_version_id(version_id);
+
+        pqxx::work transaction{connection_};
+
+        auto version = load_version(transaction, version_id);
+
+        if (!version.has_value()) {
+            throw RestorePlanError{RestorePlanErrorKind::VersionNotFound,
+                                   "artifact version does not exist: " + std::string{version_id}};
+        }
+
+        if (version->state() != VersionState::Committed) {
+            throw RestorePlanError{RestorePlanErrorKind::VersionNotCommitted,
+                                   "artifact version is not committed: " + std::string{version_id}};
+        }
+
+        const std::string restorable_layout_sql =
+            std::string{
+                "SELECT "
+                "    layout_id "
+                "FROM object_layouts ol "
+                "WHERE ol.object_id = $1 "
+                "  AND NOT EXISTS ( "
+                "      SELECT 1 "
+                "      FROM object_layout_chunks olc "
+                "      WHERE olc.layout_id = ol.layout_id "
+                "        AND NOT ",
+            } +
+            std::string{kMultiNodeRestorableChunkPredicate} + ") ORDER BY layout_id LIMIT 1";
+
+        auto selected_layout = transaction.query01<std::string>(restorable_layout_sql, pqxx::params{
+                                                                                           version->root_object_id(),
+                                                                                       });
+
+        if (!selected_layout.has_value()) {
+            throw RestorePlanError{RestorePlanErrorKind::SourceUnavailable,
+                                   "no fully restorable layout for registered active or draining nodes"};
+        }
+
+        auto descriptor = load_object_layout(transaction, std::get<0>(*selected_layout));
+
+        if (!descriptor.has_value()) {
+            throw std::runtime_error("selected multi-node restore layout could not be loaded");
+        }
+
+        if (descriptor->object_id() != version->root_object_id()) {
+            throw std::runtime_error("selected multi-node restore layout object does not match version root object");
+        }
+
+        std::vector<RestoreChunkSources> chunk_sources;
+
+        for (const ChunkRef& chunk : descriptor->layout().chunks()) {
+            std::vector<RestoreNodeEndpoint> sources;
+
+            for (const auto& [node_id, address, port] : transaction.query<std::string, std::string, int>(
+                     "SELECT "
+                     "    sn.node_id, "
+                     "    sn.address, "
+                     "    sn.port "
+                     "FROM storage_locations sl "
+                     "INNER JOIN storage_nodes sn ON sn.node_id = sl.node_id "
+                     "WHERE sl.chunk_id = $1 "
+                     "  AND sl.state = 'available' "
+                     "  AND sn.state IN ("
+                     "      'active', "
+                     "      'draining'"
+                     "  ) "
+                     "ORDER BY sn.node_id",
+                     pqxx::params{
+                         chunk.chunk_id,
+                     })) {
+                if (port < 0 || port > 65535) {
+                    throw std::runtime_error("stored storage node port is out of range");
+                }
+
+                sources.push_back(RestoreNodeEndpoint{
+                    .node_id = node_id,
+                    .address = address,
+                    .port = static_cast<std::uint16_t>(port),
+                });
+            }
+
+            chunk_sources.push_back(RestoreChunkSources{
+                .chunk_id = chunk.chunk_id,
+                .offset = chunk.offset,
+                .size_bytes = chunk.size,
+                .sources = std::move(sources),
+            });
+        }
+
+        MultiNodeRestorePlan plan{
+            .artifact_id = version->artifact_id(),
+            .version_id = version->version_id(),
+            .object_id = descriptor->object_id(),
+            .layout_id = descriptor->layout_id(),
+            .layout_descriptor = *descriptor,
+            .chunks = std::move(chunk_sources),
+        };
+
+        transaction.commit();
+
+        return plan;
+    }
+
+    void register_storage_node(const StorageNode& node) {
+        validate_storage_node(node);
+
+        pqxx::work transaction{connection_};
+
+        transaction
+            .exec(
+                "INSERT INTO storage_nodes ("
+                "    node_id, "
+                "    address, "
+                "    port, "
+                "    state"
+                ") "
+                "VALUES ("
+                "    $1, "
+                "    $2, "
+                "    $3, "
+                "    $4"
+                ") "
+                "ON CONFLICT (node_id) "
+                "DO UPDATE SET "
+                "    address = EXCLUDED.address, "
+                "    port = EXCLUDED.port, "
+                "    state = EXCLUDED.state, "
+                "    updated_at = CURRENT_TIMESTAMP",
+                pqxx::params{
+                    node.node_id,
+                    node.address,
+                    static_cast<int>(node.port),
+                    storage_node_state_to_string(node.state),
+                })
+            .no_rows();
+
+        transaction.commit();
+    }
+
+    [[nodiscard]] std::optional<StorageNode> get_storage_node(std::string_view node_id) {
+        validate_storage_node_id(node_id);
+
+        pqxx::work transaction{connection_};
+
+        auto stored = transaction.query01<std::string, std::string, int, std::string>(
+            "SELECT "
+            "    node_id, "
+            "    address, "
+            "    port, "
+            "    state "
+            "FROM storage_nodes "
+            "WHERE node_id = $1",
+            pqxx::params{
+                node_id,
+            });
+
+        if (!stored.has_value()) {
+            transaction.commit();
+            return std::nullopt;
+        }
+
+        auto [stored_node_id, address, port, state] = std::move(*stored);
+
+        StorageNode node = reconstruct_storage_node(std::move(stored_node_id), std::move(address), port, state);
+
+        transaction.commit();
+
+        return node;
+    }
+
+    [[nodiscard]] std::vector<StorageNode> list_storage_nodes() {
+        pqxx::work transaction{connection_};
+
+        std::vector<StorageNode> nodes;
+
+        for (const auto& [node_id, address, port, state] :
+             transaction.query<std::string, std::string, int, std::string>("SELECT "
+                                                                           "    node_id, "
+                                                                           "    address, "
+                                                                           "    port, "
+                                                                           "    state "
+                                                                           "FROM storage_nodes "
+                                                                           "ORDER BY node_id")) {
+            nodes.push_back(reconstruct_storage_node(node_id, address, port, state));
+        }
+
+        transaction.commit();
+
+        return nodes;
     }
 
     void set_version_state(std::string_view version_id, VersionState state) {
@@ -1470,6 +1725,48 @@ class PostgresMetadataRepository::Impl {
             throw GcError{GcErrorKind::GcInProgress, "garbage collection is in progress"};
         }
 
+        const auto existing_session = transaction.query01<std::string>(
+            "SELECT "
+            "    session_id::text "
+            "FROM upload_sessions "
+            "WHERE session_id = $1::uuid "
+            "FOR UPDATE",
+            pqxx::params{
+                session.session_id().str(),
+            });
+
+        if (existing_session.has_value()) {
+            const UploadSession existing = load_upload_session(transaction, session.session_id());
+
+            if (existing.state() != UploadSessionState::Open || existing.finalized_version_id().has_value() ||
+                !upload_session_identity_matches(existing, session)) {
+                throw std::runtime_error("existing upload session does not match requested session");
+            }
+
+            transaction.commit();
+            return;
+        }
+
+        for (const std::string& placement_node_id : session.placement_node_ids()) {
+            const auto stored_state = transaction.query01<std::string>(
+                "SELECT "
+                "    state "
+                "FROM storage_nodes "
+                "WHERE node_id = $1 "
+                "FOR SHARE",
+                pqxx::params{
+                    placement_node_id,
+                });
+
+            if (!stored_state.has_value()) {
+                throw std::invalid_argument("upload session placement node is not registered: " + placement_node_id);
+            }
+
+            if (storage_node_state_from_string(std::get<0>(*stored_state)) != StorageNodeState::Active) {
+                throw std::invalid_argument("upload session placement node is not active: " + placement_node_id);
+            }
+        }
+
         const std::optional<long long> chunk_size_param =
             session.fixed_chunk_size_bytes().has_value()
                 ? std::optional<long long>{to_postgres_bigint(*session.fixed_chunk_size_bytes(),
@@ -1489,64 +1786,71 @@ class PostgresMetadataRepository::Impl {
                 ? std::optional<long long>{to_postgres_bigint(fastcdc->max_chunk_size_bytes, "FastCDC max chunk size")}
                 : std::nullopt;
 
-        const pqxx::result insert_result = transaction.exec(
-            "INSERT INTO upload_sessions ("
-            "    session_id, "
-            "    artifact_id, "
-            "    target_node_id, "
-            "    chunking_strategy, "
-            "    chunk_size_bytes, "
-            "    fastcdc_min_chunk_size_bytes, "
-            "    fastcdc_avg_chunk_size_bytes, "
-            "    fastcdc_max_chunk_size_bytes, "
-            "    parent_version_id, "
-            "    state, "
-            "    finalized_version_id"
-            ") "
-            "VALUES ("
-            "    $1::uuid, "
-            "    $2::uuid, "
-            "    $3, "
-            "    $4, "
-            "    $5, "
-            "    $6, "
-            "    $7, "
-            "    $8, "
-            "    $9, "
-            "    $10, "
-            "    $11"
-            ") "
-            "ON CONFLICT (session_id) "
-            "DO NOTHING",
-            pqxx::params{
-                session.session_id().str(),
-                session.artifact_id().str(),
-                session.target_node_id(),
-                chunking_strategy_to_string(session.chunking_strategy()),
-                chunk_size_param,
-                fastcdc_min,
-                fastcdc_avg,
-                fastcdc_max,
-                session.parent_version_id(),
-                upload_session_state_to_string(session.state()),
-                session.finalized_version_id(),
-            });
+        transaction
+            .exec(
+                "INSERT INTO upload_sessions ("
+                "    session_id, "
+                "    artifact_id, "
+                "    target_node_id, "
+                "    replication_factor, "
+                "    chunking_strategy, "
+                "    chunk_size_bytes, "
+                "    fastcdc_min_chunk_size_bytes, "
+                "    fastcdc_avg_chunk_size_bytes, "
+                "    fastcdc_max_chunk_size_bytes, "
+                "    parent_version_id, "
+                "    state, "
+                "    finalized_version_id"
+                ") "
+                "VALUES ("
+                "    $1::uuid, "
+                "    $2::uuid, "
+                "    $3, "
+                "    $4, "
+                "    $5, "
+                "    $6, "
+                "    $7, "
+                "    $8, "
+                "    $9, "
+                "    $10, "
+                "    $11, "
+                "    $12"
+                ")",
+                pqxx::params{
+                    session.session_id().str(),
+                    session.artifact_id().str(),
+                    session.target_node_id(),
+                    static_cast<int>(session.replication_factor()),
+                    chunking_strategy_to_string(session.chunking_strategy()),
+                    chunk_size_param,
+                    fastcdc_min,
+                    fastcdc_avg,
+                    fastcdc_max,
+                    session.parent_version_id(),
+                    upload_session_state_to_string(session.state()),
+                    session.finalized_version_id(),
+                })
+            .no_rows();
 
-        if (insert_result.affected_rows() == 0) {
-            const UploadSession existing = load_upload_session(transaction, session.session_id());
-
-            if (existing.state() != UploadSessionState::Open || existing.finalized_version_id().has_value() ||
-                existing.session_id() != session.session_id() || existing.artifact_id() != session.artifact_id() ||
-                existing.target_node_id() != session.target_node_id() ||
-                existing.chunking_strategy() != session.chunking_strategy() ||
-                !upload_session_configuration_matches(existing, session) ||
-                existing.parent_version_id() != session.parent_version_id() ||
-                existing.immutable_metadata() != session.immutable_metadata()) {
-                throw std::runtime_error("existing upload session does not match requested session");
-            }
-
-            transaction.commit();
-            return;
+        for (std::size_t rank = 0; rank < session.placement_node_ids().size(); ++rank) {
+            transaction
+                .exec(
+                    "INSERT INTO upload_session_nodes ("
+                    "    session_id, "
+                    "    node_rank, "
+                    "    node_id"
+                    ") "
+                    "VALUES ("
+                    "    $1::uuid, "
+                    "    $2, "
+                    "    $3"
+                    ")",
+                    pqxx::params{
+                        session.session_id().str(),
+                        static_cast<int>(rank),
+                        session.placement_node_ids()[rank],
+                    })
+                .no_rows();
         }
 
         for (const auto& [key, value] : session.immutable_metadata()) {
@@ -1572,13 +1876,8 @@ class PostgresMetadataRepository::Impl {
 
         const UploadSession verified = load_upload_session(transaction, session.session_id());
 
-        if (verified.session_id() != session.session_id() || verified.artifact_id() != session.artifact_id() ||
-            verified.target_node_id() != session.target_node_id() ||
-            verified.chunking_strategy() != session.chunking_strategy() ||
-            !upload_session_configuration_matches(verified, session) ||
-            verified.parent_version_id() != session.parent_version_id() ||
-            verified.immutable_metadata() != session.immutable_metadata() ||
-            verified.state() != UploadSessionState::Open || verified.finalized_version_id().has_value()) {
+        if (!upload_session_identity_matches(verified, session) || verified.state() != UploadSessionState::Open ||
+            verified.finalized_version_id().has_value()) {
             throw std::runtime_error("persisted upload session does not match requested session");
         }
 
@@ -1588,26 +1887,28 @@ class PostgresMetadataRepository::Impl {
     [[nodiscard]] std::optional<UploadSession> get_upload_session(const UuidV7& session_id) {
         pqxx::work transaction{connection_};
 
-        auto stored = transaction.query01<std::string, std::string, std::string, std::string, std::optional<long long>,
-                                          std::optional<long long>, std::optional<long long>, std::optional<long long>,
-                                          std::optional<std::string>, std::string, std::optional<std::string>>(
-            "SELECT "
-            "    session_id::text, "
-            "    artifact_id::text, "
-            "    target_node_id, "
-            "    chunking_strategy, "
-            "    chunk_size_bytes, "
-            "    fastcdc_min_chunk_size_bytes, "
-            "    fastcdc_avg_chunk_size_bytes, "
-            "    fastcdc_max_chunk_size_bytes, "
-            "    parent_version_id, "
-            "    state, "
-            "    finalized_version_id "
-            "FROM upload_sessions "
-            "WHERE session_id = $1::uuid",
-            pqxx::params{
-                session_id.str(),
-            });
+        auto stored =
+            transaction.query01<std::string, std::string, std::string, int, std::string, std::optional<long long>,
+                                std::optional<long long>, std::optional<long long>, std::optional<long long>,
+                                std::optional<std::string>, std::string, std::optional<std::string>>(
+                "SELECT "
+                "    session_id::text, "
+                "    artifact_id::text, "
+                "    target_node_id, "
+                "    replication_factor, "
+                "    chunking_strategy, "
+                "    chunk_size_bytes, "
+                "    fastcdc_min_chunk_size_bytes, "
+                "    fastcdc_avg_chunk_size_bytes, "
+                "    fastcdc_max_chunk_size_bytes, "
+                "    parent_version_id, "
+                "    state, "
+                "    finalized_version_id "
+                "FROM upload_sessions "
+                "WHERE session_id = $1::uuid",
+                pqxx::params{
+                    session_id.str(),
+                });
 
         if (!stored.has_value()) {
             transaction.commit();
@@ -1666,27 +1967,29 @@ class PostgresMetadataRepository::Impl {
                                                        const ObjectLayoutDescriptor& descriptor) {
         pqxx::work transaction{connection_};
 
-        auto stored = transaction.query01<std::string, std::string, std::string, std::string, std::optional<long long>,
-                                          std::optional<long long>, std::optional<long long>, std::optional<long long>,
-                                          std::optional<std::string>, std::string, std::optional<std::string>>(
-            "SELECT "
-            "    session_id::text, "
-            "    artifact_id::text, "
-            "    target_node_id, "
-            "    chunking_strategy, "
-            "    chunk_size_bytes, "
-            "    fastcdc_min_chunk_size_bytes, "
-            "    fastcdc_avg_chunk_size_bytes, "
-            "    fastcdc_max_chunk_size_bytes, "
-            "    parent_version_id, "
-            "    state, "
-            "    finalized_version_id "
-            "FROM upload_sessions "
-            "WHERE session_id = $1::uuid "
-            "FOR UPDATE",
-            pqxx::params{
-                session_id.str(),
-            });
+        auto stored =
+            transaction.query01<std::string, std::string, std::string, int, std::string, std::optional<long long>,
+                                std::optional<long long>, std::optional<long long>, std::optional<long long>,
+                                std::optional<std::string>, std::string, std::optional<std::string>>(
+                "SELECT "
+                "    session_id::text, "
+                "    artifact_id::text, "
+                "    target_node_id, "
+                "    replication_factor, "
+                "    chunking_strategy, "
+                "    chunk_size_bytes, "
+                "    fastcdc_min_chunk_size_bytes, "
+                "    fastcdc_avg_chunk_size_bytes, "
+                "    fastcdc_max_chunk_size_bytes, "
+                "    parent_version_id, "
+                "    state, "
+                "    finalized_version_id "
+                "FROM upload_sessions "
+                "WHERE session_id = $1::uuid "
+                "FOR UPDATE",
+                pqxx::params{
+                    session_id.str(),
+                });
 
         if (!stored.has_value()) {
             throw FinalizeUploadError{
@@ -1865,25 +2168,30 @@ class PostgresMetadataRepository::Impl {
                 };
             }
 
-            const auto stored_location = transaction.query01<std::string>(
-                "SELECT "
-                "    state "
-                "FROM storage_locations "
-                "WHERE chunk_id = $1 "
-                "  AND node_id = $2 "
-                "FOR SHARE",
-                pqxx::params{
-                    chunk_id,
-                    session.target_node_id(),
-                });
+            const std::vector<std::string> desired_node_ids =
+                select_replica_nodes(chunk_id, session.placement_node_ids(), session.replication_factor());
 
-            if (!stored_location.has_value() ||
-                storage_location_state_from_string(std::get<0>(*stored_location)) != StorageLocationState::Available) {
-                throw FinalizeUploadError{
-                    FinalizeUploadErrorKind::ChunkNotAvailableOnTarget,
-                    "chunk is not available on the upload session target node",
-                    chunk_id,
-                };
+            for (const std::string& desired_node_id : desired_node_ids) {
+                const auto stored_location = transaction.query01<std::string>(
+                    "SELECT "
+                    "    state "
+                    "FROM storage_locations "
+                    "WHERE chunk_id = $1 "
+                    "  AND node_id = $2 "
+                    "FOR SHARE",
+                    pqxx::params{
+                        chunk_id,
+                        desired_node_id,
+                    });
+
+                if (!stored_location.has_value() || storage_location_state_from_string(std::get<0>(*stored_location)) !=
+                                                        StorageLocationState::Available) {
+                    throw FinalizeUploadError{
+                        FinalizeUploadErrorKind::ChunkUnderReplicated,
+                        "chunk is not available on every desired replica node",
+                        chunk_id,
+                    };
+                }
             }
         }
 
@@ -2047,6 +2355,17 @@ class PostgresMetadataRepository::Impl {
 
         if (another_open_run) {
             throw GcError{GcErrorKind::AnotherRunOpen, "another GC run is already open"};
+        }
+
+        const bool replication_in_progress = transaction.query_value<bool>(
+            "SELECT EXISTS ("
+            "    SELECT 1 "
+            "    FROM replication_runs "
+            "    WHERE state = 'open'"
+            ")");
+
+        if (replication_in_progress) {
+            throw GcError{GcErrorKind::ReplicationInProgress, "replication is in progress"};
         }
 
         ensure_no_open_upload_sessions(transaction);
@@ -2250,11 +2569,508 @@ class PostgresMetadataRepository::Impl {
         return *completed;
     }
 
+    [[nodiscard]] ReplicationRun start_replication_run(const UuidV7& run_id, std::string_view version_id,
+                                                       std::uint8_t replication_factor) {
+        validate_version_id(version_id);
+
+        if (replication_factor < 1U || replication_factor > 8U) {
+            throw std::invalid_argument("replication factor must be between 1 and 8");
+        }
+
+        pqxx::work transaction{connection_};
+
+        acquire_gc_coordination_advisory_lock(transaction);
+
+        const bool gc_in_progress = transaction.query_value<bool>(
+            "SELECT EXISTS ("
+            "    SELECT 1 "
+            "    FROM gc_runs "
+            "    WHERE state = 'open'"
+            ")");
+
+        if (gc_in_progress) {
+            throw ReplicationError{ReplicationErrorKind::GcInProgress, "garbage collection is in progress"};
+        }
+
+        const auto existing = load_replication_run(transaction, run_id);
+
+        if (existing.has_value()) {
+            if (existing->version_id == version_id && existing->replication_factor == replication_factor) {
+                transaction.commit();
+                return *existing;
+            }
+
+            throw ReplicationError{ReplicationErrorKind::RunConflict,
+                                   "replication run ID conflicts with an existing run"};
+        }
+
+        const bool another_open_run = transaction.query_value<bool>(
+            "SELECT EXISTS ("
+            "    SELECT 1 "
+            "    FROM replication_runs "
+            "    WHERE state = 'open'"
+            ")");
+
+        if (another_open_run) {
+            throw ReplicationError{ReplicationErrorKind::AnotherRunOpen, "another replication run is already open"};
+        }
+
+        auto version = load_version(transaction, version_id);
+
+        if (!version.has_value()) {
+            throw ReplicationError{ReplicationErrorKind::VersionNotFound,
+                                   "artifact version does not exist: " + std::string{version_id}};
+        }
+
+        if (version->state() != VersionState::Committed) {
+            throw ReplicationError{ReplicationErrorKind::VersionNotCommitted,
+                                   "artifact version is not committed: " + std::string{version_id}};
+        }
+
+        const std::string restorable_layout_sql =
+            std::string{
+                "SELECT "
+                "    layout_id "
+                "FROM object_layouts ol "
+                "WHERE ol.object_id = $1 "
+                "  AND NOT EXISTS ( "
+                "      SELECT 1 "
+                "      FROM object_layout_chunks olc "
+                "      WHERE olc.layout_id = ol.layout_id "
+                "        AND NOT ",
+            } +
+            std::string{kMultiNodeRestorableChunkPredicate} + ") ORDER BY layout_id LIMIT 1";
+
+        auto selected_layout = transaction.query01<std::string>(restorable_layout_sql, pqxx::params{
+                                                                                           version->root_object_id(),
+                                                                                       });
+
+        if (!selected_layout.has_value()) {
+            throw ReplicationError{ReplicationErrorKind::SourceUnavailable,
+                                   "no fully restorable layout for registered active or draining nodes"};
+        }
+
+        std::vector<std::string> active_node_ids;
+
+        for (const auto& [node_id] : transaction.query<std::string>("SELECT "
+                                                                    "    node_id "
+                                                                    "FROM storage_nodes "
+                                                                    "WHERE state = 'active' "
+                                                                    "ORDER BY node_id")) {
+            active_node_ids.push_back(node_id);
+        }
+
+        if (active_node_ids.size() > 64U) {
+            throw ReplicationError{ReplicationErrorKind::SourceUnavailable,
+                                   "active storage node snapshot exceeds supported placement size"};
+        }
+
+        if (active_node_ids.size() < replication_factor) {
+            throw ReplicationError{ReplicationErrorKind::SourceUnavailable,
+                                   "active storage node count is below replication factor"};
+        }
+
+        transaction
+            .exec(
+                "INSERT INTO replication_runs ("
+                "    run_id, "
+                "    version_id, "
+                "    layout_id, "
+                "    replication_factor, "
+                "    state"
+                ") "
+                "VALUES ("
+                "    $1::uuid, "
+                "    $2, "
+                "    $3, "
+                "    $4, "
+                "    $5"
+                ")",
+                pqxx::params{
+                    run_id.str(),
+                    version_id,
+                    std::get<0>(*selected_layout),
+                    static_cast<int>(replication_factor),
+                    replication_run_state_to_string(ReplicationRunState::Open),
+                })
+            .no_rows();
+
+        for (std::size_t rank = 0; rank < active_node_ids.size(); ++rank) {
+            transaction
+                .exec(
+                    "INSERT INTO replication_run_nodes ("
+                    "    run_id, "
+                    "    node_rank, "
+                    "    node_id"
+                    ") "
+                    "VALUES ("
+                    "    $1::uuid, "
+                    "    $2, "
+                    "    $3"
+                    ")",
+                    pqxx::params{
+                        run_id.str(),
+                        static_cast<int>(rank),
+                        active_node_ids[rank],
+                    })
+                .no_rows();
+        }
+
+        const auto loaded = load_replication_run(transaction, run_id);
+
+        if (!loaded.has_value()) {
+            throw std::runtime_error("replication run disappeared immediately after insert");
+        }
+
+        transaction.commit();
+
+        return *loaded;
+    }
+
+    [[nodiscard]] std::optional<ReplicationRun> get_replication_run(const UuidV7& run_id) {
+        pqxx::work transaction{connection_};
+
+        const auto loaded = load_replication_run(transaction, run_id);
+
+        transaction.commit();
+
+        return loaded;
+    }
+
+    [[nodiscard]] ReplicationPlan get_replication_plan(const UuidV7& run_id) {
+        pqxx::work transaction{connection_};
+
+        const auto run = load_replication_run(transaction, run_id);
+
+        if (!run.has_value()) {
+            throw ReplicationError{ReplicationErrorKind::RunNotFound, "replication run does not exist"};
+        }
+
+        if (run->state != ReplicationRunState::Open) {
+            throw ReplicationError{ReplicationErrorKind::RunNotOpen, "replication run is not open"};
+        }
+
+        auto descriptor = load_object_layout(transaction, run->layout_id);
+
+        if (!descriptor.has_value()) {
+            throw std::runtime_error("replication run layout could not be loaded");
+        }
+
+        std::vector<ReplicationChunkPlan> chunk_plans;
+
+        for (const ChunkRef& chunk : descriptor->layout().chunks()) {
+            const std::vector<std::string> desired_node_ids =
+                select_replica_nodes(chunk.chunk_id, run->placement_node_ids, run->replication_factor);
+
+            for (const std::string& desired_node_id : desired_node_ids) {
+                const auto stored_state = transaction.query01<std::string>(
+                    "SELECT "
+                    "    state "
+                    "FROM storage_nodes "
+                    "WHERE node_id = $1",
+                    pqxx::params{
+                        desired_node_id,
+                    });
+
+                if (!stored_state.has_value() ||
+                    storage_node_state_from_string(std::get<0>(*stored_state)) == StorageNodeState::Disabled) {
+                    throw ReplicationError{ReplicationErrorKind::TargetDisabled,
+                                           "replication target node is disabled: " + desired_node_id};
+                }
+            }
+
+            std::vector<ReplicationNodeEndpoint> source_nodes;
+
+            for (const auto& [node_id, address, port] : transaction.query<std::string, std::string, int>(
+                     "SELECT "
+                     "    sn.node_id, "
+                     "    sn.address, "
+                     "    sn.port "
+                     "FROM storage_locations sl "
+                     "INNER JOIN storage_nodes sn ON sn.node_id = sl.node_id "
+                     "WHERE sl.chunk_id = $1 "
+                     "  AND sl.state = 'available' "
+                     "  AND sn.state IN ("
+                     "      'active', "
+                     "      'draining'"
+                     "  ) "
+                     "ORDER BY sn.node_id",
+                     pqxx::params{
+                         chunk.chunk_id,
+                     })) {
+                if (port < 0 || port > 65535) {
+                    throw std::runtime_error("stored storage node port is out of range");
+                }
+
+                source_nodes.push_back(ReplicationNodeEndpoint{
+                    .node_id = node_id,
+                    .address = address,
+                    .port = static_cast<std::uint16_t>(port),
+                });
+            }
+
+            std::vector<ReplicationNodeEndpoint> target_nodes;
+
+            for (const std::string& desired_node_id : desired_node_ids) {
+                auto stored_node = transaction.query01<std::string, int, std::string>(
+                    "SELECT "
+                    "    address, "
+                    "    port, "
+                    "    state "
+                    "FROM storage_nodes "
+                    "WHERE node_id = $1",
+                    pqxx::params{
+                        desired_node_id,
+                    });
+
+                if (!stored_node.has_value()) {
+                    throw ReplicationError{ReplicationErrorKind::TargetDisabled,
+                                           "replication target node is missing: " + desired_node_id};
+                }
+
+                auto [address, port, state] = std::move(*stored_node);
+
+                if (storage_node_state_from_string(state) == StorageNodeState::Disabled) {
+                    throw ReplicationError{ReplicationErrorKind::TargetDisabled,
+                                           "replication target node is disabled: " + desired_node_id};
+                }
+
+                if (port < 0 || port > 65535) {
+                    throw std::runtime_error("stored storage node port is out of range");
+                }
+
+                target_nodes.push_back(ReplicationNodeEndpoint{
+                    .node_id = desired_node_id,
+                    .address = address,
+                    .port = static_cast<std::uint16_t>(port),
+                });
+            }
+
+            chunk_plans.push_back(ReplicationChunkPlan{
+                .chunk_id = chunk.chunk_id,
+                .offset = chunk.offset,
+                .size_bytes = chunk.size,
+                .desired_node_ids = desired_node_ids,
+                .source_nodes = std::move(source_nodes),
+                .target_nodes = std::move(target_nodes),
+            });
+        }
+
+        ReplicationPlan plan{
+            .run_id = run->run_id,
+            .version_id = run->version_id,
+            .layout_id = run->layout_id,
+            .replication_factor = run->replication_factor,
+            .placement_node_ids = run->placement_node_ids,
+            .chunks = std::move(chunk_plans),
+        };
+
+        transaction.commit();
+
+        return plan;
+    }
+
+    [[nodiscard]] ReplicationRun complete_replication_run(const UuidV7& run_id, const ReplicationStats& stats) {
+        pqxx::work transaction{connection_};
+
+        acquire_gc_coordination_advisory_lock(transaction);
+
+        const pqxx::result locked_run = transaction.exec(
+            "SELECT "
+            "    run_id::text, "
+            "    version_id, "
+            "    layout_id, "
+            "    replication_factor, "
+            "    state, "
+            "    chunks_scanned, "
+            "    chunks_under_replicated, "
+            "    replicas_verified, "
+            "    replicas_written, "
+            "    bytes_copied, "
+            "    source_failovers "
+            "FROM replication_runs "
+            "WHERE run_id = $1::uuid "
+            "FOR UPDATE",
+            pqxx::params{
+                run_id.str(),
+            });
+
+        if (locked_run.empty()) {
+            throw ReplicationError{ReplicationErrorKind::RunNotFound, "replication run does not exist"};
+        }
+
+        const pqxx::row row{locked_run[0]};
+        ReplicationRun stored_run = reconstruct_replication_run_from_row(
+            row[0].as<std::string>(), row[1].as<std::string>(), row[2].as<std::string>(), row[3].as<int>(),
+            row[4].as<std::string>(), row[5].as<long long>(), row[6].as<long long>(), row[7].as<long long>(),
+            row[8].as<long long>(), row[9].as<long long>(), row[10].as<long long>(),
+            load_replication_run_placement_nodes(transaction, run_id.str()));
+
+        if (stored_run.state == ReplicationRunState::Completed) {
+            transaction.commit();
+            return stored_run;
+        }
+
+        if (stored_run.state != ReplicationRunState::Open) {
+            throw ReplicationError{ReplicationErrorKind::RunNotOpen, "replication run is not open"};
+        }
+
+        const bool gc_in_progress = transaction.query_value<bool>(
+            "SELECT EXISTS ("
+            "    SELECT 1 "
+            "    FROM gc_runs "
+            "    WHERE state = 'open'"
+            ")");
+
+        if (gc_in_progress) {
+            throw ReplicationError{ReplicationErrorKind::GcInProgress, "garbage collection is in progress"};
+        }
+
+        auto descriptor = load_object_layout(transaction, stored_run.layout_id);
+
+        if (!descriptor.has_value()) {
+            throw std::runtime_error("replication run layout could not be loaded");
+        }
+
+        for (const ChunkRef& chunk : descriptor->layout().chunks()) {
+            const std::vector<std::string> desired_node_ids =
+                select_replica_nodes(chunk.chunk_id, stored_run.placement_node_ids, stored_run.replication_factor);
+
+            for (const std::string& desired_node_id : desired_node_ids) {
+                const auto stored_location = transaction.query01<std::string>(
+                    "SELECT "
+                    "    state "
+                    "FROM storage_locations "
+                    "WHERE chunk_id = $1 "
+                    "  AND node_id = $2 "
+                    "FOR SHARE",
+                    pqxx::params{
+                        chunk.chunk_id,
+                        desired_node_id,
+                    });
+
+                if (!stored_location.has_value() || storage_location_state_from_string(std::get<0>(*stored_location)) !=
+                                                        StorageLocationState::Available) {
+                    throw ReplicationError{ReplicationErrorKind::UnderReplicated,
+                                           "chunk is under-replicated: " + chunk.chunk_id};
+                }
+            }
+        }
+
+        transaction
+            .exec(
+                "UPDATE replication_runs "
+                "SET "
+                "    chunks_scanned = $2, "
+                "    chunks_under_replicated = $3, "
+                "    replicas_verified = $4, "
+                "    replicas_written = $5, "
+                "    bytes_copied = $6, "
+                "    source_failovers = $7, "
+                "    state = 'completed', "
+                "    completed_at = CURRENT_TIMESTAMP, "
+                "    updated_at = CURRENT_TIMESTAMP "
+                "WHERE run_id = $1::uuid",
+                pqxx::params{
+                    run_id.str(),
+                    to_postgres_bigint(stats.chunks_scanned, "chunks_scanned"),
+                    to_postgres_bigint(stats.chunks_under_replicated, "chunks_under_replicated"),
+                    to_postgres_bigint(stats.replicas_verified, "replicas_verified"),
+                    to_postgres_bigint(stats.replicas_written, "replicas_written"),
+                    to_postgres_bigint(stats.bytes_copied, "bytes_copied"),
+                    to_postgres_bigint(stats.source_failovers, "source_failovers"),
+                })
+            .no_rows();
+
+        const auto completed = load_replication_run(transaction, run_id);
+
+        if (!completed.has_value()) {
+            throw std::runtime_error("replication run disappeared immediately after completion");
+        }
+
+        transaction.commit();
+
+        return *completed;
+    }
+
    private:
     using StoredUploadSessionRow =
-        std::tuple<std::string, std::string, std::string, std::string, std::optional<long long>,
+        std::tuple<std::string, std::string, std::string, int, std::string, std::optional<long long>,
                    std::optional<long long>, std::optional<long long>, std::optional<long long>,
                    std::optional<std::string>, std::string, std::optional<std::string>>;
+
+    [[nodiscard]] ReplicationRun reconstruct_replication_run_from_row(
+        std::string run_id, std::string version_id, std::string layout_id, int replication_factor,
+        const std::string& state, long long chunks_scanned, long long chunks_under_replicated,
+        long long replicas_verified, long long replicas_written, long long bytes_copied, long long source_failovers,
+        std::vector<std::string> placement_node_ids) {
+        auto require_non_negative = [](long long value, std::string_view field_name) -> std::uint64_t {
+            if (value < 0) {
+                throw std::runtime_error(std::string{field_name} + " is negative in stored replication run");
+            }
+
+            return static_cast<std::uint64_t>(value);
+        };
+
+        if (replication_factor < 1 || replication_factor > 8) {
+            throw std::runtime_error("stored replication run has invalid replication factor");
+        }
+
+        return ReplicationRun{
+            .run_id =
+                UuidV7{
+                    std::move(run_id),
+                },
+            .version_id = std::move(version_id),
+            .layout_id = std::move(layout_id),
+            .replication_factor = static_cast<std::uint8_t>(replication_factor),
+            .placement_node_ids = std::move(placement_node_ids),
+            .state = replication_run_state_from_string(state),
+            .stats =
+                ReplicationStats{
+                    .chunks_scanned = require_non_negative(chunks_scanned, "chunks_scanned"),
+                    .chunks_under_replicated = require_non_negative(chunks_under_replicated, "chunks_under_replicated"),
+                    .replicas_verified = require_non_negative(replicas_verified, "replicas_verified"),
+                    .replicas_written = require_non_negative(replicas_written, "replicas_written"),
+                    .bytes_copied = require_non_negative(bytes_copied, "bytes_copied"),
+                    .source_failovers = require_non_negative(source_failovers, "source_failovers"),
+                },
+        };
+    }
+
+    [[nodiscard]] std::optional<ReplicationRun> load_replication_run(pqxx::work& transaction, const UuidV7& run_id) {
+        auto stored = transaction.query01<std::string, std::string, std::string, int, std::string, long long, long long,
+                                          long long, long long, long long, long long>(
+            "SELECT "
+            "    run_id::text, "
+            "    version_id, "
+            "    layout_id, "
+            "    replication_factor, "
+            "    state, "
+            "    chunks_scanned, "
+            "    chunks_under_replicated, "
+            "    replicas_verified, "
+            "    replicas_written, "
+            "    bytes_copied, "
+            "    source_failovers "
+            "FROM replication_runs "
+            "WHERE run_id = $1::uuid",
+            pqxx::params{
+                run_id.str(),
+            });
+
+        if (!stored.has_value()) {
+            return std::nullopt;
+        }
+
+        auto [stored_run_id, version_id, layout_id, replication_factor, state, chunks_scanned, chunks_under_replicated,
+              replicas_verified, replicas_written, bytes_copied, source_failovers] = std::move(*stored);
+
+        return reconstruct_replication_run_from_row(
+            std::move(stored_run_id), std::move(version_id), std::move(layout_id), replication_factor, state,
+            chunks_scanned, chunks_under_replicated, replicas_verified, replicas_written, bytes_copied,
+            source_failovers, load_replication_run_placement_nodes(transaction, run_id.str()));
+    }
 
     void register_object_in_transaction(pqxx::work& transaction, const Object& object) {
         const long long total_size = to_postgres_bigint(object.total_size(), "object total size");
@@ -2494,9 +3310,26 @@ class PostgresMetadataRepository::Impl {
     }
 
     [[nodiscard]] UploadSession reconstruct_upload_session(pqxx::work& transaction, StoredUploadSessionRow stored) {
-        auto [stored_session_id, stored_artifact_id, target_node_id, stored_strategy, stored_chunk_size,
-              stored_fastcdc_min, stored_fastcdc_avg, stored_fastcdc_max, parent_version_id, state,
+        auto [stored_session_id, stored_artifact_id, target_node_id, stored_replication_factor, stored_strategy,
+              stored_chunk_size, stored_fastcdc_min, stored_fastcdc_avg, stored_fastcdc_max, parent_version_id, state,
               finalized_version_id] = std::move(stored);
+
+        if (stored_replication_factor < 1 || stored_replication_factor > 8) {
+            throw std::runtime_error("stored upload session has invalid replication factor");
+        }
+
+        std::vector<std::string> placement_node_ids =
+            load_upload_session_placement_nodes(transaction, stored_session_id);
+
+        if (placement_node_ids.empty()) {
+            throw std::runtime_error("stored upload session is missing placement nodes");
+        }
+
+        if (placement_node_ids.front() != target_node_id) {
+            throw std::runtime_error("stored upload session target node does not match placement snapshot");
+        }
+
+        const auto replication_factor = static_cast<std::uint8_t>(stored_replication_factor);
 
         UploadSession::ImmutableMetadata immutable_metadata;
 
@@ -2514,6 +3347,7 @@ class PostgresMetadataRepository::Impl {
         }
 
         const ChunkingStrategy strategy = chunking_strategy_from_string(stored_strategy);
+        const UploadSessionState session_state = upload_session_state_from_string(state);
 
         if (strategy == ChunkingStrategy::FixedSize) {
             if (!stored_chunk_size.has_value() || *stored_chunk_size <= 0 || stored_fastcdc_min.has_value() ||
@@ -2524,12 +3358,13 @@ class PostgresMetadataRepository::Impl {
             return UploadSession{
                 UuidV7{std::move(stored_session_id)},
                 UuidV7{std::move(stored_artifact_id)},
-                std::move(target_node_id),
+                replication_factor,
+                std::move(placement_node_ids),
                 strategy,
                 static_cast<std::uint64_t>(*stored_chunk_size),
                 std::move(parent_version_id),
                 std::move(immutable_metadata),
-                upload_session_state_from_string(state),
+                session_state,
                 std::move(finalized_version_id),
             };
         }
@@ -2548,36 +3383,39 @@ class PostgresMetadataRepository::Impl {
         return UploadSession{
             UuidV7{std::move(stored_session_id)},
             UuidV7{std::move(stored_artifact_id)},
-            std::move(target_node_id),
+            replication_factor,
+            std::move(placement_node_ids),
             fastcdc_parameters,
             std::move(parent_version_id),
             std::move(immutable_metadata),
-            upload_session_state_from_string(state),
+            session_state,
             std::move(finalized_version_id),
         };
     }
 
     [[nodiscard]] UploadSession load_upload_session(pqxx::work& transaction, const UuidV7& session_id) {
-        auto stored = transaction.query01<std::string, std::string, std::string, std::string, std::optional<long long>,
-                                          std::optional<long long>, std::optional<long long>, std::optional<long long>,
-                                          std::optional<std::string>, std::string, std::optional<std::string>>(
-            "SELECT "
-            "    session_id::text, "
-            "    artifact_id::text, "
-            "    target_node_id, "
-            "    chunking_strategy, "
-            "    chunk_size_bytes, "
-            "    fastcdc_min_chunk_size_bytes, "
-            "    fastcdc_avg_chunk_size_bytes, "
-            "    fastcdc_max_chunk_size_bytes, "
-            "    parent_version_id, "
-            "    state, "
-            "    finalized_version_id "
-            "FROM upload_sessions "
-            "WHERE session_id = $1::uuid",
-            pqxx::params{
-                session_id.str(),
-            });
+        auto stored =
+            transaction.query01<std::string, std::string, std::string, int, std::string, std::optional<long long>,
+                                std::optional<long long>, std::optional<long long>, std::optional<long long>,
+                                std::optional<std::string>, std::string, std::optional<std::string>>(
+                "SELECT "
+                "    session_id::text, "
+                "    artifact_id::text, "
+                "    target_node_id, "
+                "    replication_factor, "
+                "    chunking_strategy, "
+                "    chunk_size_bytes, "
+                "    fastcdc_min_chunk_size_bytes, "
+                "    fastcdc_avg_chunk_size_bytes, "
+                "    fastcdc_max_chunk_size_bytes, "
+                "    parent_version_id, "
+                "    state, "
+                "    finalized_version_id "
+                "FROM upload_sessions "
+                "WHERE session_id = $1::uuid",
+                pqxx::params{
+                    session_id.str(),
+                });
 
         if (!stored.has_value()) {
             throw std::runtime_error("upload session disappeared during transaction");
@@ -3124,6 +3962,36 @@ FinalizeUploadResult PostgresMetadataRepository::finalize_upload(const UuidV7& s
 RestorePlan PostgresMetadataRepository::resolve_restore_plan(std::string_view version_id,
                                                              std::string_view source_node_id) {
     return impl_->resolve_restore_plan(version_id, source_node_id);
+}
+
+MultiNodeRestorePlan PostgresMetadataRepository::resolve_multi_node_restore_plan(std::string_view version_id) {
+    return impl_->resolve_multi_node_restore_plan(version_id);
+}
+
+void PostgresMetadataRepository::register_storage_node(const StorageNode& node) { impl_->register_storage_node(node); }
+
+std::optional<StorageNode> PostgresMetadataRepository::get_storage_node(std::string_view node_id) {
+    return impl_->get_storage_node(node_id);
+}
+
+std::vector<StorageNode> PostgresMetadataRepository::list_storage_nodes() { return impl_->list_storage_nodes(); }
+
+ReplicationRun PostgresMetadataRepository::start_replication_run(const UuidV7& run_id, std::string_view version_id,
+                                                                 std::uint8_t replication_factor) {
+    return impl_->start_replication_run(run_id, version_id, replication_factor);
+}
+
+std::optional<ReplicationRun> PostgresMetadataRepository::get_replication_run(const UuidV7& run_id) {
+    return impl_->get_replication_run(run_id);
+}
+
+ReplicationPlan PostgresMetadataRepository::get_replication_plan(const UuidV7& run_id) {
+    return impl_->get_replication_plan(run_id);
+}
+
+ReplicationRun PostgresMetadataRepository::complete_replication_run(const UuidV7& run_id,
+                                                                    const ReplicationStats& stats) {
+    return impl_->complete_replication_run(run_id, stats);
 }
 
 GcRun PostgresMetadataRepository::start_gc_run(const GcRun& requested_run) {

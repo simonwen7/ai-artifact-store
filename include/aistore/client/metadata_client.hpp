@@ -12,8 +12,10 @@
 #include "aistore/metadata/finalize_upload.hpp"
 #include "aistore/metadata/gc.hpp"
 #include "aistore/metadata/object_layout_descriptor.hpp"
+#include "aistore/metadata/replication.hpp"
 #include "aistore/metadata/restore_plan.hpp"
 #include "aistore/metadata/storage_location.hpp"
+#include "aistore/metadata/storage_node.hpp"
 #include "aistore/metadata/upload_session.hpp"
 #include "aistore/metadata/uuid_v7.hpp"
 
@@ -54,10 +56,29 @@ class MetadataClient {
     [[nodiscard]] metadata::RestorePlan get_restore_plan(std::string_view version_id,
                                                          std::string_view source_node_id) const;
 
+    [[nodiscard]] metadata::MultiNodeRestorePlan get_multi_node_restore_plan(std::string_view version_id) const;
+
     [[nodiscard]] ChunkNegotiationResult negotiate_chunks(const metadata::UuidV7& session_id,
                                                           const std::vector<metadata::ChunkMetadata>& chunks) const;
 
     void register_storage_location(const metadata::StorageLocation& location) const;
+
+    void register_storage_node(const metadata::StorageNode& node) const;
+
+    [[nodiscard]] std::optional<metadata::StorageNode> get_storage_node(std::string_view node_id) const;
+
+    [[nodiscard]] std::vector<metadata::StorageNode> list_storage_nodes() const;
+
+    [[nodiscard]] metadata::ReplicationRun start_replication_run(const metadata::UuidV7& run_id,
+                                                                 std::string_view version_id,
+                                                                 std::uint8_t replication_factor) const;
+
+    [[nodiscard]] std::optional<metadata::ReplicationRun> get_replication_run(const metadata::UuidV7& run_id) const;
+
+    [[nodiscard]] metadata::ReplicationPlan get_replication_plan(const metadata::UuidV7& run_id) const;
+
+    [[nodiscard]] metadata::ReplicationRun complete_replication_run(const metadata::UuidV7& run_id,
+                                                                    const metadata::ReplicationStats& stats) const;
 
     [[nodiscard]] metadata::GcRun start_gc_run(const metadata::UuidV7& gc_run_id, std::string_view target_node_id,
                                                bool dry_run) const;
