@@ -179,6 +179,7 @@ endif()
 add_library(
     aistore_http
     src/http/http_server.cpp
+    src/http/http_client.cpp
 )
 
 target_include_directories(
@@ -255,6 +256,50 @@ target_link_libraries(
 if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
     target_compile_options(
         aistore_services
+        PRIVATE
+        -Wall
+        -Wextra
+        -Wpedantic
+    )
+endif()
+
+add_library(
+    aistore_client
+    src/client/client_error.cpp
+    src/client/metadata_client.cpp
+    src/client/storage_node_client.cpp
+)
+
+target_include_directories(
+    aistore_client
+    PUBLIC
+    ${PROJECT_SOURCE_DIR}/include
+)
+
+target_compile_features(
+    aistore_client
+    PUBLIC
+    cxx_std_20
+)
+
+set_target_properties(
+    aistore_client
+    PROPERTIES
+    CXX_EXTENSIONS OFF
+)
+
+target_link_libraries(
+    aistore_client
+    PUBLIC
+    aistore_http
+    aistore_metadata
+    PRIVATE
+    Boost::json
+)
+
+if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+    target_compile_options(
+        aistore_client
         PRIVATE
         -Wall
         -Wextra
@@ -627,6 +672,56 @@ if(BUILD_TESTING)
     target_link_libraries(
         aistore_metadata_service_upload_api_tests
         PRIVATE
+        aistore_http
+        aistore_services
+        aistore_metadata
+        aistore_hashing
+        Boost::json
+        Boost::headers
+        Threads::Threads
+        libpqxx::pqxx
+    )
+
+    aistore_add_test(
+        aistore_http_client_tests
+        tests/integration/http_client_test.cpp
+    )
+
+    target_link_libraries(
+        aistore_http_client_tests
+        PRIVATE
+        aistore_http
+        Boost::headers
+        Threads::Threads
+    )
+
+    aistore_add_test(
+        aistore_storage_node_client_tests
+        tests/integration/storage_node_client_test.cpp
+    )
+
+    target_link_libraries(
+        aistore_storage_node_client_tests
+        PRIVATE
+        aistore_client
+        aistore_http
+        aistore_services
+        aistore_storage
+        aistore_hashing
+        Boost::json
+        Boost::headers
+        Threads::Threads
+    )
+
+    aistore_add_test(
+        aistore_metadata_client_tests
+        tests/integration/metadata_client_test.cpp
+    )
+
+    target_link_libraries(
+        aistore_metadata_client_tests
+        PRIVATE
+        aistore_client
         aistore_http
         aistore_services
         aistore_metadata
