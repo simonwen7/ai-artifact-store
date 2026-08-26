@@ -254,6 +254,12 @@ jobs:
           curl -fsS \
             -X PUT \
             -H "Content-Type: application/json" \
+            --data-binary '{"address":"127.0.0.1","port":8081,"state":"active"}' \
+            "http://127.0.0.1:8080/v1/storage-nodes/ci-node"
+
+          curl -fsS \
+            -X PUT \
+            -H "Content-Type: application/json" \
             --data-binary '{"storage_path":"/ci/storage/abc","state":"available"}' \
             "http://127.0.0.1:8080/v1/chunks/${chunk_id}/locations/ci-node"
 
@@ -277,7 +283,7 @@ jobs:
           session_response="$(curl -fsS \
             -X POST \
             -H "Content-Type: application/json" \
-            --data-binary "{\"session_id\":\"${session_id}\",\"artifact_id\":\"${artifact_id}\",\"target_node_id\":\"ci-node\",\"chunking_strategy\":\"fixed-size\",\"chunking_parameters\":{\"chunk_size_bytes\":4194304},\"parent_version_id\":null,\"immutable_metadata\":{\"source\":\"ci\"}}" \
+            --data-binary "{\"session_id\":\"${session_id}\",\"artifact_id\":\"${artifact_id}\",\"target_node_id\":\"ci-node\",\"replication_factor\":1,\"placement_node_ids\":[\"ci-node\"],\"chunking_strategy\":\"fixed-size\",\"chunking_parameters\":{\"chunk_size_bytes\":4194304},\"parent_version_id\":null,\"immutable_metadata\":{\"source\":\"ci\"}}" \
             "http://127.0.0.1:8080/v1/upload-sessions")"
 
           case "${session_response}" in
@@ -337,7 +343,7 @@ jobs:
           finalize_session_response="$(curl -fsS \
             -X POST \
             -H "Content-Type: application/json" \
-            --data-binary "{\"session_id\":\"${finalize_session_id}\",\"artifact_id\":\"${finalize_artifact_id}\",\"target_node_id\":\"ci-node\",\"chunking_strategy\":\"fixed-size\",\"chunking_parameters\":{\"chunk_size_bytes\":4194304},\"parent_version_id\":null,\"immutable_metadata\":{\"source\":\"ci-finalize\"}}" \
+            --data-binary "{\"session_id\":\"${finalize_session_id}\",\"artifact_id\":\"${finalize_artifact_id}\",\"target_node_id\":\"ci-node\",\"replication_factor\":1,\"placement_node_ids\":[\"ci-node\"],\"chunking_strategy\":\"fixed-size\",\"chunking_parameters\":{\"chunk_size_bytes\":4194304},\"parent_version_id\":null,\"immutable_metadata\":{\"source\":\"ci-finalize\"}}" \
             "http://127.0.0.1:8080/v1/upload-sessions")"
 
           case "${finalize_session_response}" in
@@ -427,5 +433,7 @@ jobs:
             "DELETE FROM artifacts WHERE artifact_id IN ('${artifact_id}'::uuid, '${finalize_artifact_id}'::uuid);"
           psql "${AISTORE_TEST_DB_URL}" -v ON_ERROR_STOP=1 -c \
             "DELETE FROM storage_locations WHERE chunk_id = '${chunk_id}' AND node_id = 'ci-node';"
+          psql "${AISTORE_TEST_DB_URL}" -v ON_ERROR_STOP=1 -c \
+            "DELETE FROM storage_nodes WHERE node_id = 'ci-node';"
           psql "${AISTORE_TEST_DB_URL}" -v ON_ERROR_STOP=1 -c \
             "DELETE FROM chunks WHERE chunk_id = '${chunk_id}';"
