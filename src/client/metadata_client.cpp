@@ -312,6 +312,89 @@ aistore::metadata::UploadSession MetadataClient::abort_upload_session(
     return parse_upload_session_json(response.body());
 }
 
+aistore::metadata::FinalizeUploadResult MetadataClient::finalize_upload(
+    const aistore::metadata::UuidV7& session_id, const aistore::metadata::ObjectLayoutDescriptor& descriptor) const {
+    boost::json::array chunks;
+    chunks.reserve(descriptor.layout().chunks().size());
+
+    for (const aistore::metadata::ChunkRef& chunk : descriptor.layout().chunks()) {
+        chunks.push_back(boost::json::object{
+            {"chunk_id", chunk.chunk_id},
+            {"offset", chunk.offset},
+            {"size_bytes", chunk.size},
+        });
+    }
+
+    const std::string body = boost::json::serialize(boost::json::object{
+        {"object_id", descriptor.object_id()},
+        {"total_size_bytes", descriptor.object().total_size()},
+        {"chunking_strategy", "fixed-size"},
+        {"chunks", std::move(chunks)},
+    });
+    const std::string target = std::string{"/v1/upload-sessions/"} + session_id.str() + "/finalize";
+    const aistore::http::HttpClientResponse response =
+        http_client_.request(beast_http::verb::post, target, body, "application/json");
+
+    if (status_code_of(response) != 200U) {
+        throw_remote_api_error(response);
+    }
+
+    boost::system::error_code parse_error;
+    const boost::json::value parsed = boost::json::parse(response.body(), parse_error);
+
+    if (parse_error || !parsed.is_object()) {
+        throw RemoteProtocolError{"finalize response is not a JSON object"};
+    }
+
+    const boost::json::object& object = parsed.as_object();
+
+    if (object.size() != 5U || !object.contains("session_id") || !object.contains("version_id") ||
+        !object.contains("object_id") || !object.contains("layout_id") || !object.contains("state") ||
+        !object.at("session_id").is_string() || !object.at("version_id").is_string() ||
+        !object.at("object_id").is_string() || !object.at("layout_id").is_string() || !object.at("state").is_string()) {
+        throw RemoteProtocolError{"finalize response has unexpected fields"};
+    }
+
+    std::optional<aistore::metadata::UuidV7> response_session_id;
+
+    try {
+        response_session_id.emplace(std::string{object.at("session_id").as_string()});
+    } catch (const std::invalid_argument&) {
+        throw RemoteProtocolError{"finalize response session_id is invalid"};
+    }
+
+    if (*response_session_id != session_id) {
+        throw RemoteProtocolError{"finalize response session_id does not match request"};
+    }
+
+    const std::string version_id{object.at("version_id").as_string()};
+    const std::string object_id{object.at("object_id").as_string()};
+    const std::string layout_id{object.at("layout_id").as_string()};
+
+    if (!is_valid_chunk_id(version_id) || !is_valid_chunk_id(object_id) || !is_valid_chunk_id(layout_id)) {
+        throw RemoteProtocolError{"finalize response contains an invalid content ID"};
+    }
+
+    if (object_id != descriptor.object_id()) {
+        throw RemoteProtocolError{"finalize response object_id does not match request"};
+    }
+
+    if (layout_id != descriptor.layout_id()) {
+        throw RemoteProtocolError{"finalize response layout_id does not match request"};
+    }
+
+    if (object.at("state").as_string() != "committed") {
+        throw RemoteProtocolError{"finalize response state is invalid"};
+    }
+
+    return aistore::metadata::FinalizeUploadResult{
+        .session_id = *response_session_id,
+        .version_id = version_id,
+        .object_id = object_id,
+        .layout_id = layout_id,
+    };
+}
+
 ChunkNegotiationResult MetadataClient::negotiate_chunks(
     const aistore::metadata::UuidV7& session_id, const std::vector<aistore::metadata::ChunkMetadata>& chunks) const {
     if (chunks.empty() || chunks.size() > kMaxNegotiationChunks) {

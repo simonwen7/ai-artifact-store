@@ -102,6 +102,13 @@ jobs:
             -v ON_ERROR_STOP=1 \
             -f migrations/005_upload_sessions.sql
 
+          psql \
+            -h localhost \
+            -U postgres \
+            -d ai_artifact_store_test \
+            -v ON_ERROR_STOP=1 \
+            -f migrations/006_upload_session_finalizations.sql
+
       - name: Configure
         run: |
           cmake \
@@ -294,14 +301,103 @@ jobs:
               ;;
           esac
 
+          finalize_artifact_id="018f1f7e-7b3c-7000-8000-000000000011"
+          finalize_session_id="018f1f7e-7b3c-7000-8000-000000000012"
+
+          psql "${AISTORE_TEST_DB_URL}" -v ON_ERROR_STOP=1 -c \
+            "INSERT INTO artifacts (artifact_id, name, project) VALUES ('${finalize_artifact_id}'::uuid, 'ci-m4s5-finalize-artifact', 'ci-m4s5-finalize-project') ON CONFLICT (artifact_id) DO NOTHING;"
+
+          finalize_session_response="$(curl -fsS \
+            -X POST \
+            -H "Content-Type: application/json" \
+            --data-binary "{\"session_id\":\"${finalize_session_id}\",\"artifact_id\":\"${finalize_artifact_id}\",\"target_node_id\":\"ci-node\",\"chunking_strategy\":\"fixed-size\",\"chunk_size_bytes\":4194304,\"parent_version_id\":null,\"immutable_metadata\":{\"source\":\"ci-finalize\"}}" \
+            "http://127.0.0.1:8080/v1/upload-sessions")"
+
+          case "${finalize_session_response}" in
+            *"${finalize_session_id}"*"${finalize_artifact_id}"*ci-node*open*)
+              ;;
+            *)
+              echo "unexpected finalize upload session create response: ${finalize_session_response}" >&2
+              exit 1
+              ;;
+          esac
+
+          finalize_body="{\"object_id\":\"${chunk_id}\",\"total_size_bytes\":3,\"chunking_strategy\":\"fixed-size\",\"chunks\":[{\"chunk_id\":\"${chunk_id}\",\"offset\":0,\"size_bytes\":3}]}"
+
+          finalize_response="$(curl -fsS \
+            -X POST \
+            -H "Content-Type: application/json" \
+            --data-binary "${finalize_body}" \
+            "http://127.0.0.1:8080/v1/upload-sessions/${finalize_session_id}/finalize")"
+
+          case "${finalize_response}" in
+            *"${finalize_session_id}"*"${chunk_id}"*committed*)
+              ;;
+            *)
+              echo "unexpected finalize response: ${finalize_response}" >&2
+              exit 1
+              ;;
+          esac
+
+          finalize_version_id="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["version_id"])' <<<"${finalize_response}")"
+          finalize_layout_id="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["layout_id"])' <<<"${finalize_response}")"
+
+          if [[ ! "${finalize_version_id}" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "finalize version_id is not 64 lowercase hex: ${finalize_version_id}" >&2
+            exit 1
+          fi
+
+          if [[ ! "${finalize_layout_id}" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "finalize layout_id is not 64 lowercase hex: ${finalize_layout_id}" >&2
+            exit 1
+          fi
+
+          finalize_retry_response="$(curl -fsS \
+            -X POST \
+            -H "Content-Type: application/json" \
+            --data-binary "${finalize_body}" \
+            "http://127.0.0.1:8080/v1/upload-sessions/${finalize_session_id}/finalize")"
+
+          case "${finalize_retry_response}" in
+            *"${finalize_version_id}"*"${finalize_layout_id}"*committed*)
+              ;;
+            *)
+              echo "unexpected finalize retry response: ${finalize_retry_response}" >&2
+              exit 1
+              ;;
+          esac
+
+          finalize_get_response="$(curl -fsS "http://127.0.0.1:8080/v1/upload-sessions/${finalize_session_id}")"
+
+          case "${finalize_get_response}" in
+            *committed*"${finalize_version_id}"*)
+              ;;
+            *)
+              echo "unexpected finalized session get response: ${finalize_get_response}" >&2
+              exit 1
+              ;;
+          esac
+
           kill "${metadata_pid}"
           wait "${metadata_pid}" || true
           metadata_pid=""
 
           psql "${AISTORE_TEST_DB_URL}" -v ON_ERROR_STOP=1 -c \
-            "DELETE FROM upload_sessions WHERE session_id = '${session_id}'::uuid;"
+            "DELETE FROM upload_session_finalizations WHERE session_id = '${finalize_session_id}'::uuid;"
           psql "${AISTORE_TEST_DB_URL}" -v ON_ERROR_STOP=1 -c \
-            "DELETE FROM artifacts WHERE artifact_id = '${artifact_id}'::uuid;"
+            "DELETE FROM upload_sessions WHERE session_id IN ('${session_id}'::uuid, '${finalize_session_id}'::uuid);"
+          psql "${AISTORE_TEST_DB_URL}" -v ON_ERROR_STOP=1 -c \
+            "DELETE FROM artifact_version_metadata WHERE version_id = '${finalize_version_id}';"
+          psql "${AISTORE_TEST_DB_URL}" -v ON_ERROR_STOP=1 -c \
+            "DELETE FROM artifact_versions WHERE version_id = '${finalize_version_id}';"
+          psql "${AISTORE_TEST_DB_URL}" -v ON_ERROR_STOP=1 -c \
+            "DELETE FROM object_layout_chunks WHERE layout_id = '${finalize_layout_id}';"
+          psql "${AISTORE_TEST_DB_URL}" -v ON_ERROR_STOP=1 -c \
+            "DELETE FROM object_layouts WHERE layout_id = '${finalize_layout_id}';"
+          psql "${AISTORE_TEST_DB_URL}" -v ON_ERROR_STOP=1 -c \
+            "DELETE FROM objects WHERE object_id = '${chunk_id}';"
+          psql "${AISTORE_TEST_DB_URL}" -v ON_ERROR_STOP=1 -c \
+            "DELETE FROM artifacts WHERE artifact_id IN ('${artifact_id}'::uuid, '${finalize_artifact_id}'::uuid);"
           psql "${AISTORE_TEST_DB_URL}" -v ON_ERROR_STOP=1 -c \
             "DELETE FROM storage_locations WHERE chunk_id = '${chunk_id}' AND node_id = 'ci-node';"
           psql "${AISTORE_TEST_DB_URL}" -v ON_ERROR_STOP=1 -c \

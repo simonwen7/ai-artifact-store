@@ -11,6 +11,8 @@
 #include <string>
 #include <vector>
 
+#include "aistore/metadata/finalize_upload.hpp"
+
 namespace {
 
 using aistore::metadata::Artifact;
@@ -18,6 +20,8 @@ using aistore::metadata::ArtifactVersion;
 using aistore::metadata::ChunkingStrategy;
 using aistore::metadata::ChunkMetadata;
 using aistore::metadata::ChunkRef;
+using aistore::metadata::FinalizeUploadError;
+using aistore::metadata::FinalizeUploadErrorKind;
 using aistore::metadata::Manifest;
 using aistore::metadata::Object;
 using aistore::metadata::ObjectLayout;
@@ -70,6 +74,7 @@ void reset_metadata_data() {
             "    tags, "
             "    artifact_version_metadata, "
             "    storage_locations, "
+            "    upload_session_finalizations, "
             "    upload_session_metadata, "
             "    upload_sessions, "
             "    artifact_versions, "
@@ -156,6 +161,46 @@ ArtifactVersion create_manifest_test_version(PostgresMetadataRepository& reposit
     repository.create_version(version);
 
     return version;
+}
+
+ObjectLayoutDescriptor make_finalize_descriptor(char object_marker, char first_chunk_marker = 'a',
+                                                char second_chunk_marker = 'b') {
+    return ObjectLayoutDescriptor{
+        Object{std::string(64, object_marker), 6},
+        ChunkingStrategy::FixedSize,
+        ObjectLayout{{
+            ChunkRef{.chunk_id = std::string(64, first_chunk_marker), .offset = 0, .size = 4},
+            ChunkRef{.chunk_id = std::string(64, second_chunk_marker), .offset = 4, .size = 2},
+        }},
+    };
+}
+
+UploadSession make_finalize_session(const UuidV7& session_id, const UuidV7& artifact_id, std::string target_node,
+                                    std::string marker) {
+    return UploadSession{
+        session_id,
+        artifact_id,
+        std::move(target_node),
+        ChunkingStrategy::FixedSize,
+        4,
+        std::nullopt,
+        UploadSession::ImmutableMetadata{{"marker", std::move(marker)}},
+        UploadSessionState::Open,
+        std::nullopt,
+    };
+}
+
+void register_finalize_chunks(PostgresMetadataRepository& repository, const ObjectLayoutDescriptor& descriptor,
+                              std::string_view node_id, StorageLocationState state) {
+    for (const ChunkRef& chunk : descriptor.layout().chunks()) {
+        repository.register_chunks({ChunkMetadata{.chunk_id = chunk.chunk_id, .size_bytes = chunk.size}});
+        repository.register_storage_location(StorageLocation{
+            .chunk_id = chunk.chunk_id,
+            .node_id = std::string{node_id},
+            .storage_path = std::string{"/m4s5/"} + chunk.chunk_id,
+            .state = state,
+        });
+    }
 }
 
 TEST(PostgresMetadataRepositoryTest, CreatesAndReadsArtifact) {
@@ -2054,6 +2099,260 @@ TEST(PostgresMetadataRepositoryTest, DatabaseRejectsUploadSessionParentVersionFr
                      std::nullopt,
                  }),
                  pqxx::foreign_key_violation);
+}
+
+TEST(PostgresMetadataRepositoryTest, FinalizesUploadAtomically) {
+    reset_metadata_data();
+    PostgresMetadataRepository repository{test_database_connection_string()};
+    const UuidV7 marker = UuidV7::generate();
+    const UuidV7 artifact_id = UuidV7::generate();
+    const UuidV7 session_id = UuidV7::generate();
+    const auto descriptor = make_finalize_descriptor('2', '3', '4');
+
+    repository.create_artifact(Artifact{artifact_id, "finalize-" + marker.str(), "m4s5"});
+    repository.create_upload_session(make_finalize_session(session_id, artifact_id, "m4s5-target", marker.str()));
+    register_finalize_chunks(repository, descriptor, "m4s5-target", StorageLocationState::Available);
+
+    const auto result = repository.finalize_upload(session_id, descriptor);
+    const auto session = repository.get_upload_session(session_id);
+    const auto version = repository.get_version(result.version_id);
+
+    ASSERT_TRUE(session.has_value());
+    ASSERT_TRUE(version.has_value());
+    EXPECT_EQ(result.session_id, session_id);
+    EXPECT_EQ(result.object_id, descriptor.object_id());
+    EXPECT_EQ(result.layout_id, descriptor.layout_id());
+    EXPECT_EQ(session->state(), UploadSessionState::Committed);
+    EXPECT_EQ(session->finalized_version_id(), result.version_id);
+    EXPECT_EQ(version->root_object_id(), descriptor.object_id());
+    EXPECT_EQ(version->immutable_metadata().at("marker"), marker.str());
+    EXPECT_EQ(version->state(), VersionState::Committed);
+    ASSERT_TRUE(repository.get_object(descriptor.object_id()).has_value());
+    ASSERT_TRUE(repository.get_object_layout(descriptor.layout_id()).has_value());
+}
+
+TEST(PostgresMetadataRepositoryTest, FinalizeUploadIsIdempotent) {
+    reset_metadata_data();
+    PostgresMetadataRepository repository{test_database_connection_string()};
+    const UuidV7 marker = UuidV7::generate();
+    const UuidV7 artifact_id = UuidV7::generate();
+    const UuidV7 session_id = UuidV7::generate();
+    const auto descriptor = make_finalize_descriptor('5', '6', '7');
+
+    repository.create_artifact(Artifact{artifact_id, "idempotent-" + marker.str(), "m4s5"});
+    repository.create_upload_session(make_finalize_session(session_id, artifact_id, "m4s5-target", marker.str()));
+    register_finalize_chunks(repository, descriptor, "m4s5-target", StorageLocationState::Available);
+
+    const auto first = repository.finalize_upload(session_id, descriptor);
+    const auto second = repository.finalize_upload(session_id, descriptor);
+
+    EXPECT_EQ(second.version_id, first.version_id);
+    EXPECT_EQ(second.object_id, first.object_id);
+    EXPECT_EQ(second.layout_id, first.layout_id);
+
+    pqxx::connection connection{test_database_connection_string()};
+    pqxx::work transaction{connection};
+    EXPECT_EQ(transaction.query_value<long long>("SELECT COUNT(*) FROM artifact_versions WHERE version_id = $1",
+                                                 pqxx::params{first.version_id}),
+              1);
+    EXPECT_EQ(transaction.query_value<long long>(
+                  "SELECT COUNT(*) FROM upload_session_finalizations WHERE session_id = $1::uuid",
+                  pqxx::params{session_id.str()}),
+              1);
+    transaction.commit();
+}
+
+TEST(PostgresMetadataRepositoryTest, CommittedSessionDifferentLayoutConflicts) {
+    reset_metadata_data();
+    PostgresMetadataRepository repository{test_database_connection_string()};
+    const UuidV7 marker = UuidV7::generate();
+    const UuidV7 artifact_id = UuidV7::generate();
+    const UuidV7 session_id = UuidV7::generate();
+    const auto first = make_finalize_descriptor('8', '9', 'a');
+    const auto different = make_finalize_descriptor('8', 'b', 'c');
+
+    repository.create_artifact(Artifact{artifact_id, "layout-conflict-" + marker.str(), "m4s5"});
+    repository.create_upload_session(make_finalize_session(session_id, artifact_id, "m4s5-target", marker.str()));
+    register_finalize_chunks(repository, first, "m4s5-target", StorageLocationState::Available);
+    register_finalize_chunks(repository, different, "m4s5-target", StorageLocationState::Available);
+    (void)repository.finalize_upload(session_id, first);
+
+    try {
+        (void)repository.finalize_upload(session_id, different);
+        FAIL() << "expected FinalizeUploadError";
+    } catch (const FinalizeUploadError& error) {
+        EXPECT_EQ(error.kind(), FinalizeUploadErrorKind::Conflict);
+    }
+}
+
+TEST(PostgresMetadataRepositoryTest, AbortedSessionCannotFinalize) {
+    reset_metadata_data();
+    PostgresMetadataRepository repository{test_database_connection_string()};
+    const UuidV7 marker = UuidV7::generate();
+    const UuidV7 artifact_id = UuidV7::generate();
+    const UuidV7 session_id = UuidV7::generate();
+    const auto descriptor = make_finalize_descriptor('d', 'e', 'f');
+
+    repository.create_artifact(Artifact{artifact_id, "aborted-" + marker.str(), "m4s5"});
+    repository.create_upload_session(make_finalize_session(session_id, artifact_id, "m4s5-target", marker.str()));
+    repository.abort_upload_session(session_id);
+
+    try {
+        (void)repository.finalize_upload(session_id, descriptor);
+        FAIL() << "expected FinalizeUploadError";
+    } catch (const FinalizeUploadError& error) {
+        EXPECT_EQ(error.kind(), FinalizeUploadErrorKind::SessionNotOpen);
+    }
+}
+
+TEST(PostgresMetadataRepositoryTest, FinalizeRequiresAvailableLocationOnTarget) {
+    reset_metadata_data();
+    PostgresMetadataRepository repository{test_database_connection_string()};
+    const UuidV7 marker = UuidV7::generate();
+    const UuidV7 artifact_id = UuidV7::generate();
+    const UuidV7 session_id = UuidV7::generate();
+    const auto descriptor = make_finalize_descriptor('1', '2', '3');
+
+    repository.create_artifact(Artifact{artifact_id, "missing-target-" + marker.str(), "m4s5"});
+    repository.create_upload_session(make_finalize_session(session_id, artifact_id, "m4s5-target", marker.str()));
+    register_finalize_chunks(repository, descriptor, "m4s5-target", StorageLocationState::Missing);
+
+    try {
+        (void)repository.finalize_upload(session_id, descriptor);
+        FAIL() << "expected FinalizeUploadError";
+    } catch (const FinalizeUploadError& error) {
+        EXPECT_EQ(error.kind(), FinalizeUploadErrorKind::ChunkNotAvailableOnTarget);
+        ASSERT_TRUE(error.chunk_id().has_value());
+    }
+}
+
+TEST(PostgresMetadataRepositoryTest, AvailableElsewhereDoesNotSatisfyFinalize) {
+    reset_metadata_data();
+    PostgresMetadataRepository repository{test_database_connection_string()};
+    const UuidV7 marker = UuidV7::generate();
+    const UuidV7 artifact_id = UuidV7::generate();
+    const UuidV7 session_id = UuidV7::generate();
+    const auto descriptor = make_finalize_descriptor('4', '5', '6');
+
+    repository.create_artifact(Artifact{artifact_id, "elsewhere-" + marker.str(), "m4s5"});
+    repository.create_upload_session(make_finalize_session(session_id, artifact_id, "m4s5-target", marker.str()));
+    register_finalize_chunks(repository, descriptor, "m4s5-other", StorageLocationState::Available);
+
+    try {
+        (void)repository.finalize_upload(session_id, descriptor);
+        FAIL() << "expected FinalizeUploadError";
+    } catch (const FinalizeUploadError& error) {
+        EXPECT_EQ(error.kind(), FinalizeUploadErrorKind::ChunkNotAvailableOnTarget);
+    }
+}
+
+TEST(PostgresMetadataRepositoryTest, LateVersionConflictRollsBackObjectAndLayout) {
+    reset_metadata_data();
+    PostgresMetadataRepository repository{test_database_connection_string()};
+    const UuidV7 marker = UuidV7::generate();
+    const UuidV7 artifact_id = UuidV7::generate();
+    const UuidV7 session_id = UuidV7::generate();
+    const auto descriptor = make_finalize_descriptor('7', '8', '9');
+    const UploadSession session = make_finalize_session(session_id, artifact_id, "m4s5-target", marker.str());
+    const ArtifactVersion expected{artifact_id, descriptor.object_id(), std::nullopt, session.immutable_metadata(),
+                                   VersionState::Committed};
+    const Object conflicting_object{std::string(64, 'a'), 1};
+    const ArtifactVersion conflicting{
+        artifact_id, conflicting_object.object_id(), std::nullopt, {}, VersionState::Committed};
+
+    repository.create_artifact(Artifact{artifact_id, "late-conflict-" + marker.str(), "m4s5"});
+    repository.create_upload_session(session);
+    register_finalize_chunks(repository, descriptor, "m4s5-target", StorageLocationState::Available);
+    repository.register_object(conflicting_object);
+
+    {
+        pqxx::connection connection{test_database_connection_string()};
+        pqxx::work transaction{connection};
+        transaction
+            .exec(
+                "INSERT INTO artifact_versions (version_id, artifact_id, root_object_id, parent_version_id, "
+                "descriptor_version, canonical_descriptor, state) "
+                "VALUES ($1, $2::uuid, $3, NULL, $4, $5::bytea, 'committed')",
+                pqxx::params{expected.version_id(), artifact_id.str(), conflicting_object.object_id(),
+                             static_cast<int>(ArtifactVersion::kFormatVersion), conflicting.canonical_bytes()})
+            .no_rows();
+        transaction.commit();
+    }
+
+    try {
+        (void)repository.finalize_upload(session_id, descriptor);
+        FAIL() << "expected FinalizeUploadError";
+    } catch (const FinalizeUploadError& error) {
+        EXPECT_EQ(error.kind(), FinalizeUploadErrorKind::Conflict);
+    }
+
+    EXPECT_FALSE(repository.get_object(descriptor.object_id()).has_value());
+    EXPECT_FALSE(repository.get_object_layout(descriptor.layout_id()).has_value());
+    const auto stored_session = repository.get_upload_session(session_id);
+    ASSERT_TRUE(stored_session.has_value());
+    EXPECT_EQ(stored_session->state(), UploadSessionState::Open);
+
+    pqxx::connection connection{test_database_connection_string()};
+    pqxx::work transaction{connection};
+    EXPECT_EQ(transaction.query_value<long long>(
+                  "SELECT COUNT(*) FROM upload_session_finalizations WHERE session_id = $1::uuid",
+                  pqxx::params{session_id.str()}),
+              0);
+    transaction.exec("DELETE FROM artifact_versions WHERE version_id = $1", pqxx::params{expected.version_id()})
+        .no_rows();
+    transaction.commit();
+}
+
+TEST(PostgresMetadataRepositoryTest, FinalizesEmptyObject) {
+    reset_metadata_data();
+    PostgresMetadataRepository repository{test_database_connection_string()};
+    const UuidV7 marker = UuidV7::generate();
+    const UuidV7 artifact_id = UuidV7::generate();
+    const UuidV7 session_id = UuidV7::generate();
+    const ObjectLayoutDescriptor descriptor{
+        Object{std::string(64, 'b'), 0},
+        ChunkingStrategy::FixedSize,
+        ObjectLayout{{}},
+    };
+
+    repository.create_artifact(Artifact{artifact_id, "empty-" + marker.str(), "m4s5"});
+    repository.create_upload_session(make_finalize_session(session_id, artifact_id, "m4s5-target", marker.str()));
+
+    const auto result = repository.finalize_upload(session_id, descriptor);
+    EXPECT_EQ(result.object_id, descriptor.object_id());
+    EXPECT_EQ(result.layout_id, descriptor.layout_id());
+    ASSERT_TRUE(repository.get_version(result.version_id).has_value());
+}
+
+TEST(PostgresMetadataRepositoryTest, DifferentSessionsReuseIdenticalArtifactVersion) {
+    reset_metadata_data();
+    PostgresMetadataRepository repository{test_database_connection_string()};
+    const UuidV7 marker = UuidV7::generate();
+    const UuidV7 artifact_id = UuidV7::generate();
+    const UuidV7 first_session_id = UuidV7::generate();
+    const UuidV7 second_session_id = UuidV7::generate();
+    const auto descriptor = make_finalize_descriptor('c', 'd', 'e');
+
+    repository.create_artifact(Artifact{artifact_id, "version-reuse-" + marker.str(), "m4s5"});
+    repository.create_upload_session(make_finalize_session(first_session_id, artifact_id, "m4s5-target", marker.str()));
+    repository.create_upload_session(
+        make_finalize_session(second_session_id, artifact_id, "m4s5-target", marker.str()));
+    register_finalize_chunks(repository, descriptor, "m4s5-target", StorageLocationState::Available);
+
+    const auto first = repository.finalize_upload(first_session_id, descriptor);
+    const auto second = repository.finalize_upload(second_session_id, descriptor);
+    EXPECT_EQ(second.version_id, first.version_id);
+
+    pqxx::connection connection{test_database_connection_string()};
+    pqxx::work transaction{connection};
+    EXPECT_EQ(transaction.query_value<long long>("SELECT COUNT(*) FROM artifact_versions WHERE version_id = $1",
+                                                 pqxx::params{first.version_id}),
+              1);
+    EXPECT_EQ(transaction.query_value<long long>(
+                  "SELECT COUNT(*) FROM upload_session_finalizations WHERE session_id IN ($1::uuid, $2::uuid)",
+                  pqxx::params{first_session_id.str(), second_session_id.str()}),
+              2);
+    transaction.commit();
 }
 
 }  // namespace

@@ -14,6 +14,9 @@
 #include <vector>
 
 #include "aistore/metadata/chunk_metadata.hpp"
+#include "aistore/metadata/finalize_upload.hpp"
+#include "aistore/metadata/object.hpp"
+#include "aistore/metadata/object_layout.hpp"
 #include "aistore/metadata/object_layout_descriptor.hpp"
 #include "aistore/metadata/storage_location.hpp"
 #include "aistore/metadata/upload_session.hpp"
@@ -30,6 +33,7 @@ constexpr std::string_view kNegotiatePath = "/v1/chunks/negotiate";
 constexpr std::string_view kUploadSessionsCollection = "/v1/upload-sessions";
 constexpr std::string_view kUploadSessionsPrefix = "/v1/upload-sessions/";
 constexpr std::string_view kAbortSuffix = "/abort";
+constexpr std::string_view kFinalizeSuffix = "/finalize";
 constexpr std::string_view kLocationsSuffix = "/locations";
 constexpr std::string_view kLocationsPrefix = "/locations/";
 constexpr std::string_view kApplicationJson = "application/json";
@@ -219,6 +223,34 @@ aistore::http::HttpResponse make_method_not_allowed(const aistore::http::HttpReq
     return number;
 }
 
+[[nodiscard]] std::optional<std::uint64_t> extract_nonnegative_uint64(const boost::json::value& value) {
+    if (value.is_double()) {
+        return std::nullopt;
+    }
+
+    std::uint64_t number = 0;
+
+    if (value.is_uint64()) {
+        number = value.as_uint64();
+    } else if (value.is_int64()) {
+        const std::int64_t signed_number = value.as_int64();
+
+        if (signed_number < 0) {
+            return std::nullopt;
+        }
+
+        number = static_cast<std::uint64_t>(signed_number);
+    } else {
+        return std::nullopt;
+    }
+
+    if (number > kPostgresBigintMax) {
+        return std::nullopt;
+    }
+
+    return number;
+}
+
 [[nodiscard]] bool creation_fields_match(const aistore::metadata::UploadSession& existing,
                                          const aistore::metadata::UploadSession& requested) {
     return existing.session_id() == requested.session_id() && existing.artifact_id() == requested.artifact_id() &&
@@ -297,6 +329,7 @@ enum class UploadSessionRouteKind : std::uint8_t {
     Collection,
     Item,
     Abort,
+    Finalize,
     InvalidSessionId,
     UnknownSubroute,
 };
@@ -345,6 +378,11 @@ struct ParsedUploadSessionRoute {
 
     if (remainder.substr(slash) == kAbortSuffix) {
         parsed.kind = UploadSessionRouteKind::Abort;
+        return parsed;
+    }
+
+    if (remainder.substr(slash) == kFinalizeSuffix) {
+        parsed.kind = UploadSessionRouteKind::Finalize;
         return parsed;
     }
 
@@ -564,6 +602,164 @@ struct ParsedUploadSessionRoute {
     }
 
     return make_json_response(request, beast_http::status::ok, upload_session_to_json(*aborted_session));
+}
+
+[[nodiscard]] aistore::http::HttpResponse handle_finalize_upload_session(
+    const aistore::http::HttpRequest& request, aistore::metadata::PostgresMetadataRepository& repository,
+    std::mutex& repository_mutex, std::string_view session_id_text) {
+    if (request[beast_http::field::content_type] != kApplicationJson) {
+        return make_json_response(request, beast_http::status::unsupported_media_type,
+                                  boost::json::object{
+                                      {"error", "unsupported_media_type"},
+                                  });
+    }
+
+    boost::system::error_code parse_error;
+    const boost::json::value parsed = boost::json::parse(request.body(), parse_error);
+
+    if (parse_error) {
+        return make_json_response(request, beast_http::status::bad_request,
+                                  boost::json::object{
+                                      {"error", "invalid_json"},
+                                  });
+    }
+
+    if (!parsed.is_object()) {
+        return make_json_response(request, beast_http::status::bad_request,
+                                  boost::json::object{
+                                      {"error", "invalid_request"},
+                                  });
+    }
+
+    const boost::json::object& body = parsed.as_object();
+
+    if (body.size() != 4U || !body.contains("object_id") || !body.contains("total_size_bytes") ||
+        !body.contains("chunking_strategy") || !body.contains("chunks") || !body.at("object_id").is_string() ||
+        !body.at("chunking_strategy").is_string() || !body.at("chunks").is_array()) {
+        return make_json_response(request, beast_http::status::bad_request,
+                                  boost::json::object{
+                                      {"error", "invalid_request"},
+                                  });
+    }
+
+    const std::string object_id{body.at("object_id").as_string()};
+    const std::optional<std::uint64_t> total_size_bytes = extract_nonnegative_uint64(body.at("total_size_bytes"));
+
+    if (!is_valid_chunk_id(object_id) || !total_size_bytes.has_value() ||
+        body.at("chunking_strategy").as_string() != "fixed-size") {
+        return make_json_response(request, beast_http::status::bad_request,
+                                  boost::json::object{
+                                      {"error", "invalid_request"},
+                                  });
+    }
+
+    const boost::json::array& chunks_json = body.at("chunks").as_array();
+    std::vector<aistore::metadata::ChunkRef> chunks;
+    chunks.reserve(chunks_json.size());
+
+    for (const boost::json::value& entry : chunks_json) {
+        if (!entry.is_object()) {
+            return make_json_response(request, beast_http::status::bad_request,
+                                      boost::json::object{
+                                          {"error", "invalid_request"},
+                                      });
+        }
+
+        const boost::json::object& chunk_object = entry.as_object();
+
+        if (chunk_object.size() != 3U || !chunk_object.contains("chunk_id") || !chunk_object.contains("offset") ||
+            !chunk_object.contains("size_bytes") || !chunk_object.at("chunk_id").is_string()) {
+            return make_json_response(request, beast_http::status::bad_request,
+                                      boost::json::object{
+                                          {"error", "invalid_request"},
+                                      });
+        }
+
+        const std::string chunk_id{chunk_object.at("chunk_id").as_string()};
+        const std::optional<std::uint64_t> offset = extract_nonnegative_uint64(chunk_object.at("offset"));
+        const std::optional<std::uint64_t> size_bytes = extract_positive_uint64(chunk_object.at("size_bytes"));
+
+        if (!is_valid_chunk_id(chunk_id) || !offset.has_value() || !size_bytes.has_value()) {
+            return make_json_response(request, beast_http::status::bad_request,
+                                      boost::json::object{
+                                          {"error", "invalid_request"},
+                                      });
+        }
+
+        chunks.push_back(aistore::metadata::ChunkRef{
+            .chunk_id = chunk_id,
+            .offset = *offset,
+            .size = *size_bytes,
+        });
+    }
+
+    std::optional<aistore::metadata::ObjectLayoutDescriptor> descriptor;
+
+    try {
+        descriptor.emplace(aistore::metadata::Object{object_id, *total_size_bytes},
+                           aistore::metadata::ChunkingStrategy::FixedSize,
+                           aistore::metadata::ObjectLayout{std::move(chunks)});
+    } catch (const std::invalid_argument&) {
+        return make_json_response(request, beast_http::status::bad_request,
+                                  boost::json::object{
+                                      {"error", "invalid_request"},
+                                  });
+    } catch (const std::overflow_error&) {
+        return make_json_response(request, beast_http::status::bad_request,
+                                  boost::json::object{
+                                      {"error", "invalid_request"},
+                                  });
+    }
+
+    const aistore::metadata::UuidV7 session_id{std::string{session_id_text}};
+    std::optional<aistore::metadata::FinalizeUploadResult> result;
+
+    try {
+        const std::scoped_lock lock{repository_mutex};
+        result = repository.finalize_upload(session_id, *descriptor);
+    } catch (const aistore::metadata::FinalizeUploadError& error) {
+        boost::json::object error_body;
+        beast_http::status status = beast_http::status::conflict;
+
+        switch (error.kind()) {
+            case aistore::metadata::FinalizeUploadErrorKind::SessionNotFound:
+                status = beast_http::status::not_found;
+                error_body["error"] = "upload_session_not_found";
+                break;
+
+            case aistore::metadata::FinalizeUploadErrorKind::SessionNotOpen:
+                error_body["error"] = "upload_session_not_open";
+                break;
+
+            case aistore::metadata::FinalizeUploadErrorKind::Conflict:
+                error_body["error"] = "finalize_conflict";
+                break;
+
+            case aistore::metadata::FinalizeUploadErrorKind::ChunkNotAvailableOnTarget:
+                error_body["error"] = "chunk_not_available_on_target";
+
+                if (error.chunk_id().has_value()) {
+                    error_body["chunk_id"] = *error.chunk_id();
+                }
+                break;
+        }
+
+        return make_json_response(request, status, error_body);
+    } catch (const std::invalid_argument&) {
+        return make_json_response(request, beast_http::status::bad_request,
+                                  boost::json::object{
+                                      {"error", "invalid_request"},
+                                  });
+    }
+
+    return make_json_response(request, beast_http::status::ok,
+                              boost::json::object{
+                                  {"session_id", result->session_id.str()},
+                                  {"version_id", result->version_id},
+                                  {"object_id", result->object_id},
+                                  {"layout_id", result->layout_id},
+                                  {"state", "committed"},
+                              });
 }
 
 [[nodiscard]] std::string_view classify_availability(std::string_view target_node_id,
@@ -956,6 +1152,13 @@ aistore::http::HttpResponse MetadataService::handle_request(const aistore::http:
                 }
 
                 return handle_abort_upload_session(request, repository_, repository_mutex_, route.session_id);
+
+            case UploadSessionRouteKind::Finalize:
+                if (request.method() != beast_http::verb::post) {
+                    return make_method_not_allowed(request, "POST");
+                }
+
+                return handle_finalize_upload_session(request, repository_, repository_mutex_, route.session_id);
 
             case UploadSessionRouteKind::InvalidSessionId:
                 return make_json_response(request, beast_http::status::bad_request,

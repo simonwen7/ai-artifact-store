@@ -326,38 +326,7 @@ class PostgresMetadataRepository::Impl {
     void register_object(const Object& object) {
         pqxx::work transaction{connection_};
 
-        const long long total_size = to_postgres_bigint(object.total_size(), "object total size");
-
-        transaction
-            .exec(
-                "INSERT INTO objects ("
-                "    object_id, "
-                "    total_size_bytes"
-                ") "
-                "VALUES ("
-                "    $1, "
-                "    $2"
-                ") "
-                "ON CONFLICT (object_id) "
-                "DO NOTHING",
-                pqxx::params{
-                    object.object_id(),
-                    total_size,
-                })
-            .no_rows();
-
-        const auto stored_total_size = transaction.query_value<long long>(
-            "SELECT "
-            "    total_size_bytes "
-            "FROM objects "
-            "WHERE object_id = $1",
-            pqxx::params{
-                object.object_id(),
-            });
-
-        if (stored_total_size != total_size) {
-            throw std::runtime_error("existing object size does not match object identity");
-        }
+        register_object_in_transaction(transaction, object);
 
         transaction.commit();
     }
@@ -401,133 +370,7 @@ class PostgresMetadataRepository::Impl {
     void register_object_layout(const ObjectLayoutDescriptor& descriptor) {
         pqxx::work transaction{connection_};
 
-        const Object& object = descriptor.object();
-
-        const ObjectLayout& layout = descriptor.layout();
-
-        const auto stored_object_size = transaction.query01<long long>(
-            "SELECT "
-            "    total_size_bytes "
-            "FROM objects "
-            "WHERE object_id = $1",
-            pqxx::params{
-                object.object_id(),
-            });
-
-        if (!stored_object_size.has_value()) {
-            throw std::runtime_error("object must be registered before its layout");
-        }
-
-        const auto [stored_size] = *stored_object_size;
-
-        if (stored_size != to_postgres_bigint(object.total_size(), "object total size")) {
-            throw std::runtime_error("registered object size does not match object layout");
-        }
-
-        for (const ChunkRef& chunk : layout.chunks()) {
-            const long long chunk_size = to_postgres_bigint(chunk.size, "chunk size");
-
-            transaction
-                .exec(
-                    "INSERT INTO chunks ("
-                    "    chunk_id, "
-                    "    size_bytes"
-                    ") "
-                    "VALUES ("
-                    "    $1, "
-                    "    $2"
-                    ") "
-                    "ON CONFLICT (chunk_id) "
-                    "DO NOTHING",
-                    pqxx::params{
-                        chunk.chunk_id,
-                        chunk_size,
-                    })
-                .no_rows();
-
-            const auto stored_chunk_size = transaction.query_value<long long>(
-                "SELECT "
-                "    size_bytes "
-                "FROM chunks "
-                "WHERE chunk_id = $1",
-                pqxx::params{
-                    chunk.chunk_id,
-                });
-
-            if (stored_chunk_size != chunk_size) {
-                throw std::runtime_error("existing chunk size does not match object layout");
-            }
-        }
-
-        const long long total_size = to_postgres_bigint(layout.total_size(), "object layout total size");
-
-        const long long chunk_count = size_to_postgres_bigint(layout.chunks().size(), "object layout chunk count");
-
-        const pqxx::result layout_insert = transaction.exec(
-            "INSERT INTO object_layouts ("
-            "    layout_id, "
-            "    object_id, "
-            "    descriptor_version, "
-            "    chunking_strategy, "
-            "    canonical_descriptor, "
-            "    total_size_bytes, "
-            "    chunk_count"
-            ") "
-            "VALUES ("
-            "    $1, "
-            "    $2, "
-            "    $3, "
-            "    $4, "
-            "    $5::bytea, "
-            "    $6, "
-            "    $7"
-            ") "
-            "ON CONFLICT (layout_id) "
-            "DO NOTHING",
-            pqxx::params{
-                descriptor.layout_id(),
-                descriptor.object_id(),
-                static_cast<int>(ObjectLayoutDescriptor::kFormatVersion),
-                chunking_strategy_to_string(descriptor.chunking_strategy()),
-                descriptor.canonical_bytes(),
-                total_size,
-                chunk_count,
-            });
-
-        const bool layout_was_inserted = layout_insert.affected_rows() == 1U;
-
-        if (layout_was_inserted) {
-            for (std::size_t index = 0; index < layout.chunks().size(); ++index) {
-                const ChunkRef& chunk = layout.chunks()[index];
-
-                transaction
-                    .exec(
-                        "INSERT INTO object_layout_chunks ("
-                        "    layout_id, "
-                        "    chunk_index, "
-                        "    chunk_id, "
-                        "    byte_offset, "
-                        "    chunk_size_bytes"
-                        ") "
-                        "VALUES ("
-                        "    $1, "
-                        "    $2, "
-                        "    $3, "
-                        "    $4, "
-                        "    $5"
-                        ")",
-                        pqxx::params{
-                            descriptor.layout_id(),
-                            size_to_postgres_bigint(index, "chunk index"),
-                            chunk.chunk_id,
-                            to_postgres_bigint(chunk.offset, "chunk byte offset"),
-                            to_postgres_bigint(chunk.size, "chunk size"),
-                        })
-                    .no_rows();
-            }
-        }
-
-        verify_registered_object_layout(transaction, descriptor);
+        register_object_layout_in_transaction(transaction, descriptor);
 
         transaction.commit();
     }
@@ -1569,9 +1412,554 @@ class PostgresMetadataRepository::Impl {
         transaction.commit();
     }
 
+    [[nodiscard]] FinalizeUploadResult finalize_upload(const UuidV7& session_id,
+                                                       const ObjectLayoutDescriptor& descriptor) {
+        pqxx::work transaction{connection_};
+
+        auto stored = transaction.query01<std::string, std::string, std::string, std::string, long long,
+                                          std::optional<std::string>, std::string, std::optional<std::string>>(
+            "SELECT "
+            "    session_id::text, "
+            "    artifact_id::text, "
+            "    target_node_id, "
+            "    chunking_strategy, "
+            "    chunk_size_bytes, "
+            "    parent_version_id, "
+            "    state, "
+            "    finalized_version_id "
+            "FROM upload_sessions "
+            "WHERE session_id = $1::uuid "
+            "FOR UPDATE",
+            pqxx::params{
+                session_id.str(),
+            });
+
+        if (!stored.has_value()) {
+            throw FinalizeUploadError{
+                FinalizeUploadErrorKind::SessionNotFound,
+                "upload session does not exist",
+            };
+        }
+
+        const UploadSession session = reconstruct_upload_session(transaction, std::move(*stored));
+        const ArtifactVersion version{
+            session.artifact_id(),        descriptor.object_id(),  session.parent_version_id(),
+            session.immutable_metadata(), VersionState::Committed,
+        };
+
+        if (session.state() == UploadSessionState::Aborted) {
+            throw FinalizeUploadError{
+                FinalizeUploadErrorKind::SessionNotOpen,
+                "upload session is aborted",
+            };
+        }
+
+        if (session.state() == UploadSessionState::Committed) {
+            if (!session.finalized_version_id().has_value()) {
+                throw FinalizeUploadError{
+                    FinalizeUploadErrorKind::Conflict,
+                    "committed upload session has no finalized version ID",
+                };
+            }
+
+            const auto finalized_layout = transaction.query01<std::string>(
+                "SELECT "
+                "    layout_id "
+                "FROM upload_session_finalizations "
+                "WHERE session_id = $1::uuid",
+                pqxx::params{
+                    session_id.str(),
+                });
+
+            if (!finalized_layout.has_value() || std::get<0>(*finalized_layout) != descriptor.layout_id() ||
+                *session.finalized_version_id() != version.version_id()) {
+                throw FinalizeUploadError{
+                    FinalizeUploadErrorKind::Conflict,
+                    "finalize upload retry does not match the committed result",
+                };
+            }
+
+            const auto stored_object_size = transaction.query01<long long>(
+                "SELECT "
+                "    total_size_bytes "
+                "FROM objects "
+                "WHERE object_id = $1",
+                pqxx::params{
+                    descriptor.object_id(),
+                });
+
+            if (!stored_object_size.has_value() ||
+                std::get<0>(*stored_object_size) !=
+                    to_postgres_bigint(descriptor.object().total_size(), "object total size")) {
+                throw FinalizeUploadError{
+                    FinalizeUploadErrorKind::Conflict,
+                    "finalized object does not match the submitted descriptor",
+                };
+            }
+
+            std::optional<ObjectLayoutDescriptor> stored_layout;
+
+            try {
+                stored_layout = load_object_layout(transaction, descriptor.layout_id());
+            } catch (const std::runtime_error&) {
+                throw FinalizeUploadError{
+                    FinalizeUploadErrorKind::Conflict,
+                    "finalized object layout is inconsistent with the submitted descriptor",
+                };
+            }
+
+            if (!stored_layout.has_value() || stored_layout->object_id() != descriptor.object_id() ||
+                stored_layout->chunking_strategy() != descriptor.chunking_strategy() ||
+                stored_layout->canonical_bytes() != descriptor.canonical_bytes()) {
+                throw FinalizeUploadError{
+                    FinalizeUploadErrorKind::Conflict,
+                    "finalized object layout does not match the submitted descriptor",
+                };
+            }
+
+            if (!artifact_version_identity_matches(transaction, version)) {
+                throw FinalizeUploadError{
+                    FinalizeUploadErrorKind::Conflict,
+                    "finalized artifact version does not match the upload session",
+                };
+            }
+
+            transaction.commit();
+
+            return FinalizeUploadResult{
+                .session_id = session_id,
+                .version_id = version.version_id(),
+                .object_id = descriptor.object_id(),
+                .layout_id = descriptor.layout_id(),
+            };
+        }
+
+        if (descriptor.chunking_strategy() != session.chunking_strategy()) {
+            throw std::invalid_argument("object layout chunking strategy does not match upload session");
+        }
+
+        const auto& chunks = descriptor.layout().chunks();
+
+        if (!chunks.empty() && session.chunking_strategy() == ChunkingStrategy::FixedSize) {
+            for (std::size_t index = 0; index + 1U < chunks.size(); ++index) {
+                if (chunks[index].size != session.chunk_size_bytes()) {
+                    throw std::invalid_argument("non-final chunk size does not match upload session chunk size");
+                }
+            }
+
+            const std::uint64_t final_size = chunks.back().size;
+
+            if (final_size == 0U || final_size > session.chunk_size_bytes()) {
+                throw std::invalid_argument("final chunk size is invalid for upload session chunk size");
+            }
+        }
+
+        std::map<std::string, std::uint64_t> unique_chunks;
+
+        for (const ChunkRef& chunk : chunks) {
+            const auto [existing, inserted] = unique_chunks.emplace(chunk.chunk_id, chunk.size);
+
+            if (!inserted && existing->second != chunk.size) {
+                throw FinalizeUploadError{
+                    FinalizeUploadErrorKind::Conflict,
+                    "object layout uses the same chunk ID with different sizes",
+                    chunk.chunk_id,
+                };
+            }
+        }
+
+        for (const auto& [chunk_id, chunk_size] : unique_chunks) {
+            const auto stored_chunk = transaction.query01<long long>(
+                "SELECT "
+                "    size_bytes "
+                "FROM chunks "
+                "WHERE chunk_id = $1 "
+                "FOR SHARE",
+                pqxx::params{
+                    chunk_id,
+                });
+
+            if (!stored_chunk.has_value() ||
+                std::get<0>(*stored_chunk) != to_postgres_bigint(chunk_size, "chunk size")) {
+                throw FinalizeUploadError{
+                    FinalizeUploadErrorKind::Conflict,
+                    "chunk metadata is missing or has a conflicting size",
+                    chunk_id,
+                };
+            }
+
+            const auto stored_location = transaction.query01<std::string>(
+                "SELECT "
+                "    state "
+                "FROM storage_locations "
+                "WHERE chunk_id = $1 "
+                "  AND node_id = $2 "
+                "FOR SHARE",
+                pqxx::params{
+                    chunk_id,
+                    session.target_node_id(),
+                });
+
+            if (!stored_location.has_value() ||
+                storage_location_state_from_string(std::get<0>(*stored_location)) != StorageLocationState::Available) {
+                throw FinalizeUploadError{
+                    FinalizeUploadErrorKind::ChunkNotAvailableOnTarget,
+                    "chunk is not available on the upload session target node",
+                    chunk_id,
+                };
+            }
+        }
+
+        try {
+            register_object_in_transaction(transaction, descriptor.object());
+            register_object_layout_in_transaction(transaction, descriptor);
+        } catch (const std::runtime_error&) {
+            throw FinalizeUploadError{
+                FinalizeUploadErrorKind::Conflict,
+                "registered object or layout conflicts with the submitted descriptor",
+            };
+        }
+
+        const pqxx::result version_insert = transaction.exec(
+            "INSERT INTO artifact_versions ("
+            "    version_id, "
+            "    artifact_id, "
+            "    root_object_id, "
+            "    parent_version_id, "
+            "    descriptor_version, "
+            "    canonical_descriptor, "
+            "    state"
+            ") "
+            "VALUES ("
+            "    $1, "
+            "    $2::uuid, "
+            "    $3, "
+            "    $4, "
+            "    $5, "
+            "    $6::bytea, "
+            "    $7"
+            ") "
+            "ON CONFLICT (version_id) "
+            "DO NOTHING",
+            pqxx::params{
+                version.version_id(),
+                version.artifact_id().str(),
+                version.root_object_id(),
+                version.parent_version_id(),
+                static_cast<int>(ArtifactVersion::kFormatVersion),
+                version.canonical_bytes(),
+                version_state_to_string(version.state()),
+            });
+
+        if (version_insert.affected_rows() == 1U) {
+            for (const auto& [key, value] : version.immutable_metadata()) {
+                transaction
+                    .exec(
+                        "INSERT INTO artifact_version_metadata ("
+                        "    version_id, "
+                        "    metadata_key, "
+                        "    metadata_value"
+                        ") "
+                        "VALUES ("
+                        "    $1, "
+                        "    $2, "
+                        "    $3"
+                        ")",
+                        pqxx::params{
+                            version.version_id(),
+                            key,
+                            value,
+                        })
+                    .no_rows();
+            }
+        } else {
+            if (!artifact_version_identity_matches(transaction, version)) {
+                throw FinalizeUploadError{
+                    FinalizeUploadErrorKind::Conflict,
+                    "existing artifact version conflicts with the finalized upload",
+                };
+            }
+
+            const pqxx::result version_update = transaction.exec(
+                "UPDATE artifact_versions "
+                "SET state = 'committed' "
+                "WHERE version_id = $1 "
+                "  AND state <> 'committed'",
+                pqxx::params{
+                    version.version_id(),
+                });
+
+            if (version_update.affected_rows() > 1) {
+                throw std::runtime_error("updated more than one artifact version");
+            }
+        }
+
+        const pqxx::result finalization_insert = transaction.exec(
+            "INSERT INTO upload_session_finalizations ("
+            "    session_id, "
+            "    layout_id"
+            ") "
+            "VALUES ("
+            "    $1::uuid, "
+            "    $2"
+            ") "
+            "ON CONFLICT (session_id) "
+            "DO NOTHING",
+            pqxx::params{
+                session_id.str(),
+                descriptor.layout_id(),
+            });
+
+        if (finalization_insert.affected_rows() != 1U) {
+            throw FinalizeUploadError{
+                FinalizeUploadErrorKind::Conflict,
+                "upload session already has a conflicting finalization record",
+            };
+        }
+
+        const pqxx::result session_update = transaction.exec(
+            "UPDATE upload_sessions "
+            "SET "
+            "    state = 'committed', "
+            "    finalized_version_id = $2, "
+            "    updated_at = CURRENT_TIMESTAMP "
+            "WHERE session_id = $1::uuid",
+            pqxx::params{
+                session_id.str(),
+                version.version_id(),
+            });
+
+        if (session_update.affected_rows() != 1U) {
+            throw std::runtime_error("upload session disappeared during finalization");
+        }
+
+        transaction.commit();
+
+        return FinalizeUploadResult{
+            .session_id = session_id,
+            .version_id = version.version_id(),
+            .object_id = descriptor.object_id(),
+            .layout_id = descriptor.layout_id(),
+        };
+    }
+
    private:
     using StoredUploadSessionRow = std::tuple<std::string, std::string, std::string, std::string, long long,
                                               std::optional<std::string>, std::string, std::optional<std::string>>;
+
+    void register_object_in_transaction(pqxx::work& transaction, const Object& object) {
+        const long long total_size = to_postgres_bigint(object.total_size(), "object total size");
+
+        transaction
+            .exec(
+                "INSERT INTO objects ("
+                "    object_id, "
+                "    total_size_bytes"
+                ") "
+                "VALUES ("
+                "    $1, "
+                "    $2"
+                ") "
+                "ON CONFLICT (object_id) "
+                "DO NOTHING",
+                pqxx::params{
+                    object.object_id(),
+                    total_size,
+                })
+            .no_rows();
+
+        const auto stored_total_size = transaction.query_value<long long>(
+            "SELECT "
+            "    total_size_bytes "
+            "FROM objects "
+            "WHERE object_id = $1",
+            pqxx::params{
+                object.object_id(),
+            });
+
+        if (stored_total_size != total_size) {
+            throw std::runtime_error("existing object size does not match object identity");
+        }
+    }
+
+    void register_object_layout_in_transaction(pqxx::work& transaction, const ObjectLayoutDescriptor& descriptor) {
+        const Object& object = descriptor.object();
+        const ObjectLayout& layout = descriptor.layout();
+
+        const auto stored_object_size = transaction.query01<long long>(
+            "SELECT "
+            "    total_size_bytes "
+            "FROM objects "
+            "WHERE object_id = $1",
+            pqxx::params{
+                object.object_id(),
+            });
+
+        if (!stored_object_size.has_value()) {
+            throw std::runtime_error("object must be registered before its layout");
+        }
+
+        const auto [stored_size] = *stored_object_size;
+
+        if (stored_size != to_postgres_bigint(object.total_size(), "object total size")) {
+            throw std::runtime_error("registered object size does not match object layout");
+        }
+
+        for (const ChunkRef& chunk : layout.chunks()) {
+            const long long chunk_size = to_postgres_bigint(chunk.size, "chunk size");
+
+            transaction
+                .exec(
+                    "INSERT INTO chunks ("
+                    "    chunk_id, "
+                    "    size_bytes"
+                    ") "
+                    "VALUES ("
+                    "    $1, "
+                    "    $2"
+                    ") "
+                    "ON CONFLICT (chunk_id) "
+                    "DO NOTHING",
+                    pqxx::params{
+                        chunk.chunk_id,
+                        chunk_size,
+                    })
+                .no_rows();
+
+            const auto stored_chunk_size = transaction.query_value<long long>(
+                "SELECT "
+                "    size_bytes "
+                "FROM chunks "
+                "WHERE chunk_id = $1",
+                pqxx::params{
+                    chunk.chunk_id,
+                });
+
+            if (stored_chunk_size != chunk_size) {
+                throw std::runtime_error("existing chunk size does not match object layout");
+            }
+        }
+
+        const long long total_size = to_postgres_bigint(layout.total_size(), "object layout total size");
+        const long long chunk_count = size_to_postgres_bigint(layout.chunks().size(), "object layout chunk count");
+
+        const pqxx::result layout_insert = transaction.exec(
+            "INSERT INTO object_layouts ("
+            "    layout_id, "
+            "    object_id, "
+            "    descriptor_version, "
+            "    chunking_strategy, "
+            "    canonical_descriptor, "
+            "    total_size_bytes, "
+            "    chunk_count"
+            ") "
+            "VALUES ("
+            "    $1, "
+            "    $2, "
+            "    $3, "
+            "    $4, "
+            "    $5::bytea, "
+            "    $6, "
+            "    $7"
+            ") "
+            "ON CONFLICT (layout_id) "
+            "DO NOTHING",
+            pqxx::params{
+                descriptor.layout_id(),
+                descriptor.object_id(),
+                static_cast<int>(ObjectLayoutDescriptor::kFormatVersion),
+                chunking_strategy_to_string(descriptor.chunking_strategy()),
+                descriptor.canonical_bytes(),
+                total_size,
+                chunk_count,
+            });
+
+        if (layout_insert.affected_rows() == 1U) {
+            for (std::size_t index = 0; index < layout.chunks().size(); ++index) {
+                const ChunkRef& chunk = layout.chunks()[index];
+
+                transaction
+                    .exec(
+                        "INSERT INTO object_layout_chunks ("
+                        "    layout_id, "
+                        "    chunk_index, "
+                        "    chunk_id, "
+                        "    byte_offset, "
+                        "    chunk_size_bytes"
+                        ") "
+                        "VALUES ("
+                        "    $1, "
+                        "    $2, "
+                        "    $3, "
+                        "    $4, "
+                        "    $5"
+                        ")",
+                        pqxx::params{
+                            descriptor.layout_id(),
+                            size_to_postgres_bigint(index, "chunk index"),
+                            chunk.chunk_id,
+                            to_postgres_bigint(chunk.offset, "chunk byte offset"),
+                            to_postgres_bigint(chunk.size, "chunk size"),
+                        })
+                    .no_rows();
+            }
+        }
+
+        verify_registered_object_layout(transaction, descriptor);
+    }
+
+    [[nodiscard]] bool artifact_version_identity_matches(pqxx::work& transaction, const ArtifactVersion& expected) {
+        auto stored =
+            transaction.query01<std::string, std::string, std::string, std::optional<std::string>, int, std::string>(
+                "SELECT "
+                "    version_id, "
+                "    artifact_id::text, "
+                "    root_object_id, "
+                "    parent_version_id, "
+                "    descriptor_version, "
+                "    encode("
+                "        canonical_descriptor, "
+                "        'hex'"
+                "    ) "
+                "FROM artifact_versions "
+                "WHERE version_id = $1",
+                pqxx::params{
+                    expected.version_id(),
+                });
+
+        if (!stored.has_value()) {
+            return false;
+        }
+
+        const auto& [stored_version_id, stored_artifact_id, stored_root_object_id, stored_parent_version_id,
+                     descriptor_version, stored_descriptor_hex] = *stored;
+
+        if (stored_version_id != expected.version_id() || stored_artifact_id != expected.artifact_id().str() ||
+            stored_root_object_id != expected.root_object_id() ||
+            stored_parent_version_id != expected.parent_version_id() ||
+            std::cmp_not_equal(descriptor_version, ArtifactVersion::kFormatVersion) ||
+            stored_descriptor_hex != bytes_to_hex(std::span<const std::byte>{
+                                         expected.canonical_bytes(),
+                                     })) {
+            return false;
+        }
+
+        ArtifactVersion::ImmutableMetadata stored_metadata;
+
+        for (auto [key, value] : transaction.query<std::string, std::string>("SELECT "
+                                                                             "    metadata_key, "
+                                                                             "    metadata_value "
+                                                                             "FROM artifact_version_metadata "
+                                                                             "WHERE version_id = $1 "
+                                                                             "ORDER BY metadata_key",
+                                                                             pqxx::params{
+                                                                                 expected.version_id(),
+                                                                             })) {
+            stored_metadata.emplace(std::move(key), std::move(value));
+        }
+
+        return stored_metadata == expected.immutable_metadata();
+    }
 
     [[nodiscard]] UploadSession reconstruct_upload_session(pqxx::work& transaction, StoredUploadSessionRow stored) {
         auto [stored_session_id, stored_artifact_id, target_node_id, stored_strategy, stored_chunk_size,
@@ -1960,6 +2348,11 @@ std::optional<UploadSession> PostgresMetadataRepository::get_upload_session(cons
 
 void PostgresMetadataRepository::abort_upload_session(const UuidV7& session_id) {
     impl_->abort_upload_session(session_id);
+}
+
+FinalizeUploadResult PostgresMetadataRepository::finalize_upload(const UuidV7& session_id,
+                                                                 const ObjectLayoutDescriptor& descriptor) {
+    return impl_->finalize_upload(session_id, descriptor);
 }
 
 }  // namespace aistore::metadata

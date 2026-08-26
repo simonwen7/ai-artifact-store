@@ -8,6 +8,8 @@
 
 #include "aistore/http/http_client.hpp"
 #include "aistore/metadata/chunk_metadata.hpp"
+#include "aistore/metadata/finalize_upload.hpp"
+#include "aistore/metadata/object_layout_descriptor.hpp"
 #include "aistore/metadata/storage_location.hpp"
 #include "aistore/metadata/upload_session.hpp"
 #include "aistore/metadata/uuid_v7.hpp"
@@ -42,6 +44,9 @@ class MetadataClient {
     [[nodiscard]] std::optional<metadata::UploadSession> get_upload_session(const metadata::UuidV7& session_id) const;
 
     [[nodiscard]] metadata::UploadSession abort_upload_session(const metadata::UuidV7& session_id) const;
+
+    [[nodiscard]] metadata::FinalizeUploadResult finalize_upload(
+        const metadata::UuidV7& session_id, const metadata::ObjectLayoutDescriptor& descriptor) const;
 
     [[nodiscard]] ChunkNegotiationResult negotiate_chunks(const metadata::UuidV7& session_id,
                                                           const std::vector<metadata::ChunkMetadata>& chunks) const;

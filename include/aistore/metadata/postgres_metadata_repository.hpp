@@ -9,6 +9,7 @@
 
 #include "aistore/metadata/artifact_model.hpp"
 #include "aistore/metadata/chunk_metadata.hpp"
+#include "aistore/metadata/finalize_upload.hpp"
 #include "aistore/metadata/manifest_model.hpp"
 #include "aistore/metadata/object.hpp"
 #include "aistore/metadata/object_layout_descriptor.hpp"
@@ -79,6 +80,9 @@ class PostgresMetadataRepository {
     [[nodiscard]] std::optional<UploadSession> get_upload_session(const UuidV7& session_id);
 
     void abort_upload_session(const UuidV7& session_id);
+
+    [[nodiscard]] FinalizeUploadResult finalize_upload(const UuidV7& session_id,
+                                                       const ObjectLayoutDescriptor& descriptor);
 
    private:
     class Impl;

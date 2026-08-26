@@ -137,6 +137,7 @@ add_library(
     src/metadata/manifest_model.cpp
     src/metadata/run_model.cpp
     src/metadata/upload_session.cpp
+    src/metadata/finalize_upload.cpp
     src/metadata/postgres_metadata_repository.cpp
 )
 
@@ -727,6 +728,24 @@ if(BUILD_TESTING)
     )
 
     aistore_add_test(
+        aistore_metadata_service_finalize_api_tests
+        tests/integration/metadata_service_finalize_api_test.cpp
+    )
+
+    target_link_libraries(
+        aistore_metadata_service_finalize_api_tests
+        PRIVATE
+        aistore_http
+        aistore_services
+        aistore_metadata
+        aistore_hashing
+        Boost::json
+        Boost::headers
+        Threads::Threads
+        libpqxx::pqxx
+    )
+
+    aistore_add_test(
         aistore_http_client_tests
         tests/integration/http_client_test.cpp
     )
@@ -783,6 +802,28 @@ if(BUILD_TESTING)
 
     target_link_libraries(
         aistore_push_engine_tests
+        PRIVATE
+        aistore_push
+        aistore_client
+        aistore_http
+        aistore_services
+        aistore_storage
+        aistore_hashing
+        aistore_chunking
+        aistore_metadata
+        Boost::json
+        Boost::headers
+        Threads::Threads
+        libpqxx::pqxx
+    )
+
+    aistore_add_test(
+        aistore_push_finalize_tests
+        tests/integration/push_finalize_test.cpp
+    )
+
+    target_link_libraries(
+        aistore_push_finalize_tests
         PRIVATE
         aistore_push
         aistore_client

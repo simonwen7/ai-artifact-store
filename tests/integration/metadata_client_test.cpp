@@ -23,6 +23,7 @@
 #include "aistore/http/http_server.hpp"
 #include "aistore/metadata/artifact_model.hpp"
 #include "aistore/metadata/chunk_metadata.hpp"
+#include "aistore/metadata/finalize_upload.hpp"
 #include "aistore/metadata/object_layout_descriptor.hpp"
 #include "aistore/metadata/postgres_metadata_repository.hpp"
 #include "aistore/metadata/storage_location.hpp"
@@ -45,6 +46,10 @@ using aistore::http::HttpServerConfig;
 using aistore::metadata::Artifact;
 using aistore::metadata::ChunkingStrategy;
 using aistore::metadata::ChunkMetadata;
+using aistore::metadata::ChunkRef;
+using aistore::metadata::Object;
+using aistore::metadata::ObjectLayout;
+using aistore::metadata::ObjectLayoutDescriptor;
 using aistore::metadata::PostgresMetadataRepository;
 using aistore::metadata::StorageLocation;
 using aistore::metadata::StorageLocationState;
@@ -165,6 +170,20 @@ class MetadataClientFixture : public ::testing::Test {
                 pqxx::params{session_id_.str()})
             .no_rows();
 
+        transaction.exec("DELETE FROM artifact_versions WHERE artifact_id = $1::uuid", pqxx::params{artifact_id_.str()})
+            .no_rows();
+
+        for (const std::string& object_id : owned_object_ids_) {
+            transaction
+                .exec(
+                    "DELETE FROM object_layout_chunks WHERE layout_id IN "
+                    "(SELECT layout_id FROM object_layouts WHERE object_id = $1)",
+                    pqxx::params{object_id})
+                .no_rows();
+            transaction.exec("DELETE FROM object_layouts WHERE object_id = $1", pqxx::params{object_id}).no_rows();
+            transaction.exec("DELETE FROM objects WHERE object_id = $1", pqxx::params{object_id}).no_rows();
+        }
+
         transaction.exec("DELETE FROM storage_locations WHERE node_id LIKE 'm4s3-%'").no_rows();
 
         for (const std::string& chunk_id : owned_chunk_ids_) {
@@ -206,9 +225,20 @@ class MetadataClientFixture : public ::testing::Test {
 
     void track_chunk(std::string chunk_id) { owned_chunk_ids_.push_back(std::move(chunk_id)); }
 
+    [[nodiscard]] ObjectLayoutDescriptor make_descriptor() {
+        const std::string marker = UuidV7::generate().str();
+        const std::string object_id = sha256_hex("m4s5-client-object-" + marker);
+        const std::string chunk_id = sha256_hex("m4s5-client-chunk-" + marker);
+        owned_object_ids_.push_back(object_id);
+        track_chunk(chunk_id);
+        return ObjectLayoutDescriptor{Object{object_id, 4}, ChunkingStrategy::FixedSize,
+                                      ObjectLayout{{ChunkRef{.chunk_id = chunk_id, .offset = 0, .size = 4}}}};
+    }
+
     UuidV7 artifact_id_{UuidV7::generate()};
     UuidV7 session_id_{UuidV7::generate()};
     std::vector<std::string> owned_chunk_ids_;
+    std::vector<std::string> owned_object_ids_;
     std::optional<PostgresMetadataRepository> repository_;
     std::optional<MetadataService> service_;
     std::optional<RunningHttpServer> server_;
@@ -470,6 +500,71 @@ TEST_F(MetadataClientFixture, MissingChunkLocationRegistrationProducesRemoteApiE
         EXPECT_EQ(error.status_code(), 404U);
         EXPECT_EQ(error.error_code(), "chunk_not_found");
     }
+}
+
+TEST_F(MetadataClientFixture, FinalizesUploadThroughMetadataClient) {
+    (void)client_->create_upload_session(make_open_session());
+    const ObjectLayoutDescriptor descriptor = make_descriptor();
+    const ChunkRef& chunk = descriptor.layout().chunks().front();
+    repository_->register_chunks({ChunkMetadata{.chunk_id = chunk.chunk_id, .size_bytes = chunk.size}});
+    repository_->register_storage_location(StorageLocation{
+        .chunk_id = chunk.chunk_id,
+        .node_id = "m4s3-target",
+        .storage_path = std::string{"/v1/chunks/"} + chunk.chunk_id,
+        .state = StorageLocationState::Available,
+    });
+
+    const auto result = client_->finalize_upload(session_id_, descriptor);
+
+    EXPECT_EQ(result.session_id, session_id_);
+    EXPECT_EQ(result.object_id, descriptor.object_id());
+    EXPECT_EQ(result.layout_id, descriptor.layout_id());
+    ASSERT_TRUE(repository_->get_version(result.version_id).has_value());
+    const auto session = repository_->get_upload_session(session_id_);
+    ASSERT_TRUE(session.has_value());
+    EXPECT_EQ(session->state(), UploadSessionState::Committed);
+    EXPECT_EQ(session->finalized_version_id(), result.version_id);
+}
+
+TEST_F(MetadataClientFixture, FinalizeRemoteFailureProducesRemoteApiError) {
+    (void)client_->create_upload_session(make_open_session());
+    const ObjectLayoutDescriptor descriptor = make_descriptor();
+    const ChunkRef& chunk = descriptor.layout().chunks().front();
+    repository_->register_chunks({ChunkMetadata{.chunk_id = chunk.chunk_id, .size_bytes = chunk.size}});
+
+    try {
+        (void)client_->finalize_upload(session_id_, descriptor);
+        FAIL() << "expected RemoteApiError";
+    } catch (const RemoteApiError& error) {
+        EXPECT_EQ(error.status_code(), 409U);
+        EXPECT_EQ(error.error_code(), "chunk_not_available_on_target");
+        EXPECT_NE(error.response_body().find(chunk.chunk_id), std::string::npos);
+    }
+}
+
+TEST(MetadataClientStandaloneTest, MalformedFinalizeSuccessProducesProtocolError) {
+    const UuidV7 session_id = UuidV7::generate();
+    const std::string object_id = sha256_hex("m4s5-malformed-object-" + session_id.str());
+    const ObjectLayoutDescriptor descriptor{
+        Object{object_id, 0},
+        ChunkingStrategy::FixedSize,
+        ObjectLayout{{}},
+    };
+
+    RunningHttpServer server{[session_id](const HttpRequest& request) {
+        EXPECT_EQ(request.method(), beast_http::verb::post);
+        EXPECT_EQ(request.target(), std::string{"/v1/upload-sessions/"} + session_id.str() + "/finalize");
+        HttpResponse response{beast_http::status::ok, request.version()};
+        response.set(beast_http::field::content_type, "application/json");
+        response.body() = R"({"session_id":"broken"})";
+        response.prepare_payload();
+        return response;
+    }};
+    MetadataClient client{HttpClientConfig{
+        .endpoint = HttpEndpoint{.address = "127.0.0.1", .port = server.port()},
+    }};
+
+    EXPECT_THROW((void)client.finalize_upload(session_id, descriptor), RemoteProtocolError);
 }
 
 }  // namespace
