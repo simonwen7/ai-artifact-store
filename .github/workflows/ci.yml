@@ -95,6 +95,13 @@ jobs:
             -v ON_ERROR_STOP=1 \
             -f migrations/004_manifest_and_run_models.sql
 
+          psql \
+            -h localhost \
+            -U postgres \
+            -d ai_artifact_store_test \
+            -v ON_ERROR_STOP=1 \
+            -f migrations/005_upload_sessions.sql
+
       - name: Configure
         run: |
           cmake \

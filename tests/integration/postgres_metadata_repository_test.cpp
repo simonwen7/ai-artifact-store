@@ -16,6 +16,7 @@ namespace {
 using aistore::metadata::Artifact;
 using aistore::metadata::ArtifactVersion;
 using aistore::metadata::ChunkingStrategy;
+using aistore::metadata::ChunkMetadata;
 using aistore::metadata::ChunkRef;
 using aistore::metadata::Manifest;
 using aistore::metadata::Object;
@@ -24,6 +25,8 @@ using aistore::metadata::ObjectLayoutDescriptor;
 using aistore::metadata::PostgresMetadataRepository;
 using aistore::metadata::StorageLocation;
 using aistore::metadata::StorageLocationState;
+using aistore::metadata::UploadSession;
+using aistore::metadata::UploadSessionState;
 using aistore::metadata::UuidV7;
 using aistore::metadata::VersionState;
 
@@ -67,6 +70,8 @@ void reset_metadata_data() {
             "    tags, "
             "    artifact_version_metadata, "
             "    storage_locations, "
+            "    upload_session_metadata, "
+            "    upload_sessions, "
             "    artifact_versions, "
             "    object_layout_chunks, "
             "    object_layouts, "
@@ -1658,6 +1663,397 @@ TEST(PostgresMetadataRepositoryTest, DuplicateRunIdIsRejected) {
     repository.create_run(first);
 
     EXPECT_THROW(repository.create_run(second), pqxx::unique_violation);
+}
+
+TEST(PostgresMetadataRepositoryTest, RegistersAndReadsIndependentChunkMetadata) {
+    reset_metadata_data();
+
+    PostgresMetadataRepository repository{
+        test_database_connection_string(),
+    };
+
+    repository.register_chunks({
+        ChunkMetadata{
+            .chunk_id = kChunkA,
+            .size_bytes = 4,
+        },
+        ChunkMetadata{
+            .chunk_id = kChunkB,
+            .size_bytes = 2,
+        },
+    });
+
+    const auto size_a = repository.get_chunk_size(kChunkA);
+    const auto size_b = repository.get_chunk_size(kChunkB);
+
+    ASSERT_TRUE(size_a.has_value());
+    ASSERT_TRUE(size_b.has_value());
+
+    EXPECT_EQ(*size_a, 4U);
+    EXPECT_EQ(*size_b, 2U);
+}
+
+TEST(PostgresMetadataRepositoryTest, ChunkRegistrationIsIdempotent) {
+    reset_metadata_data();
+
+    PostgresMetadataRepository repository{
+        test_database_connection_string(),
+    };
+
+    const ChunkMetadata chunk{
+        .chunk_id = kChunkA,
+        .size_bytes = 4,
+    };
+
+    repository.register_chunks({chunk});
+    repository.register_chunks({chunk});
+
+    const auto size = repository.get_chunk_size(kChunkA);
+
+    ASSERT_TRUE(size.has_value());
+    EXPECT_EQ(*size, 4U);
+
+    pqxx::connection connection{
+        test_database_connection_string(),
+    };
+
+    pqxx::work transaction{connection};
+
+    EXPECT_EQ(transaction.query_value<long long>("SELECT COUNT(*) "
+                                                 "FROM chunks "
+                                                 "WHERE chunk_id = $1",
+                                                 pqxx::params{
+                                                     kChunkA,
+                                                 }),
+              1);
+
+    transaction.commit();
+}
+
+TEST(PostgresMetadataRepositoryTest, ChunkRegistrationRejectsConflictingSize) {
+    reset_metadata_data();
+
+    PostgresMetadataRepository repository{
+        test_database_connection_string(),
+    };
+
+    repository.register_chunks({
+        ChunkMetadata{
+            .chunk_id = kChunkA,
+            .size_bytes = 4,
+        },
+    });
+
+    EXPECT_THROW(repository.register_chunks({
+                     ChunkMetadata{
+                         .chunk_id = kChunkA,
+                         .size_bytes = 8,
+                     },
+                 }),
+                 std::runtime_error);
+
+    const auto size = repository.get_chunk_size(kChunkA);
+
+    ASSERT_TRUE(size.has_value());
+    EXPECT_EQ(*size, 4U);
+}
+
+TEST(PostgresMetadataRepositoryTest, CreatesAndReadsUploadSession) {
+    reset_metadata_data();
+
+    PostgresMetadataRepository repository{
+        test_database_connection_string(),
+    };
+
+    const UuidV7 artifact_id = UuidV7::generate();
+    const UuidV7 session_id = UuidV7::generate();
+
+    repository.create_artifact(Artifact{
+        artifact_id,
+        "checkpoint",
+        "training-project",
+    });
+
+    constexpr std::uint64_t kFourMiB = 4ULL * 1024ULL * 1024ULL;
+
+    const UploadSession session{
+        session_id,
+        artifact_id,
+        "node-a",
+        ChunkingStrategy::FixedSize,
+        kFourMiB,
+        std::nullopt,
+        UploadSession::ImmutableMetadata{
+            {"framework", "pytorch"},
+            {"kind", "checkpoint"},
+        },
+        UploadSessionState::Open,
+        std::nullopt,
+    };
+
+    repository.create_upload_session(session);
+
+    const auto restored = repository.get_upload_session(session_id);
+
+    ASSERT_TRUE(restored.has_value());
+
+    EXPECT_EQ(restored->session_id(), session_id);
+    EXPECT_EQ(restored->artifact_id(), artifact_id);
+    EXPECT_EQ(restored->target_node_id(), "node-a");
+    EXPECT_EQ(restored->chunking_strategy(), ChunkingStrategy::FixedSize);
+    EXPECT_EQ(restored->chunk_size_bytes(), kFourMiB);
+    EXPECT_FALSE(restored->parent_version_id().has_value());
+    EXPECT_EQ(restored->immutable_metadata().at("framework"), "pytorch");
+    EXPECT_EQ(restored->immutable_metadata().at("kind"), "checkpoint");
+    EXPECT_EQ(restored->state(), UploadSessionState::Open);
+    EXPECT_FALSE(restored->finalized_version_id().has_value());
+}
+
+TEST(PostgresMetadataRepositoryTest, UploadSessionCreationIsIdempotent) {
+    reset_metadata_data();
+
+    PostgresMetadataRepository repository{
+        test_database_connection_string(),
+    };
+
+    const UuidV7 artifact_id = UuidV7::generate();
+    const UuidV7 session_id = UuidV7::generate();
+
+    repository.create_artifact(Artifact{
+        artifact_id,
+        "checkpoint",
+        "training-project",
+    });
+
+    constexpr std::uint64_t kFourMiB = 4ULL * 1024ULL * 1024ULL;
+
+    const UploadSession session{
+        session_id,
+        artifact_id,
+        "node-a",
+        ChunkingStrategy::FixedSize,
+        kFourMiB,
+        std::nullopt,
+        UploadSession::ImmutableMetadata{
+            {"framework", "pytorch"},
+        },
+        UploadSessionState::Open,
+        std::nullopt,
+    };
+
+    repository.create_upload_session(session);
+    repository.create_upload_session(session);
+
+    const auto restored = repository.get_upload_session(session_id);
+
+    ASSERT_TRUE(restored.has_value());
+    EXPECT_EQ(restored->immutable_metadata().at("framework"), "pytorch");
+    EXPECT_EQ(restored->state(), UploadSessionState::Open);
+
+    pqxx::connection connection{
+        test_database_connection_string(),
+    };
+
+    pqxx::work transaction{connection};
+
+    EXPECT_EQ(transaction.query_value<long long>("SELECT COUNT(*) "
+                                                 "FROM upload_sessions "
+                                                 "WHERE session_id = $1::uuid",
+                                                 pqxx::params{
+                                                     session_id.str(),
+                                                 }),
+              1);
+
+    EXPECT_EQ(transaction.query_value<long long>("SELECT COUNT(*) "
+                                                 "FROM upload_session_metadata "
+                                                 "WHERE session_id = $1::uuid",
+                                                 pqxx::params{
+                                                     session_id.str(),
+                                                 }),
+              1);
+
+    transaction.commit();
+}
+
+TEST(PostgresMetadataRepositoryTest, ReusedSessionIdWithDifferentPayloadIsRejected) {
+    reset_metadata_data();
+
+    PostgresMetadataRepository repository{
+        test_database_connection_string(),
+    };
+
+    const UuidV7 artifact_id = UuidV7::generate();
+    const UuidV7 session_id = UuidV7::generate();
+
+    repository.create_artifact(Artifact{
+        artifact_id,
+        "checkpoint",
+        "training-project",
+    });
+
+    constexpr std::uint64_t kFourMiB = 4ULL * 1024ULL * 1024ULL;
+
+    const UploadSession original{
+        session_id,
+        artifact_id,
+        "node-a",
+        ChunkingStrategy::FixedSize,
+        kFourMiB,
+        std::nullopt,
+        UploadSession::ImmutableMetadata{
+            {"framework", "pytorch"},
+        },
+        UploadSessionState::Open,
+        std::nullopt,
+    };
+
+    repository.create_upload_session(original);
+
+    const UploadSession conflicting{
+        session_id,
+        artifact_id,
+        "node-b",
+        ChunkingStrategy::FixedSize,
+        kFourMiB,
+        std::nullopt,
+        UploadSession::ImmutableMetadata{
+            {"framework", "pytorch"},
+        },
+        UploadSessionState::Open,
+        std::nullopt,
+    };
+
+    EXPECT_THROW(repository.create_upload_session(conflicting), std::runtime_error);
+
+    const auto restored = repository.get_upload_session(session_id);
+
+    ASSERT_TRUE(restored.has_value());
+    EXPECT_EQ(restored->target_node_id(), "node-a");
+}
+
+TEST(PostgresMetadataRepositoryTest, AbortsOpenUploadSessionIdempotently) {
+    reset_metadata_data();
+
+    PostgresMetadataRepository repository{
+        test_database_connection_string(),
+    };
+
+    const UuidV7 artifact_id = UuidV7::generate();
+    const UuidV7 session_id = UuidV7::generate();
+
+    repository.create_artifact(Artifact{
+        artifact_id,
+        "checkpoint",
+        "training-project",
+    });
+
+    constexpr std::uint64_t kFourMiB = 4ULL * 1024ULL * 1024ULL;
+
+    repository.create_upload_session(UploadSession{
+        session_id,
+        artifact_id,
+        "node-a",
+        ChunkingStrategy::FixedSize,
+        kFourMiB,
+        std::nullopt,
+        UploadSession::ImmutableMetadata{
+            {"framework", "pytorch"},
+        },
+        UploadSessionState::Open,
+        std::nullopt,
+    });
+
+    repository.abort_upload_session(session_id);
+
+    auto restored = repository.get_upload_session(session_id);
+
+    ASSERT_TRUE(restored.has_value());
+    EXPECT_EQ(restored->state(), UploadSessionState::Aborted);
+    EXPECT_EQ(restored->immutable_metadata().at("framework"), "pytorch");
+    EXPECT_FALSE(restored->finalized_version_id().has_value());
+
+    repository.abort_upload_session(session_id);
+
+    restored = repository.get_upload_session(session_id);
+
+    ASSERT_TRUE(restored.has_value());
+    EXPECT_EQ(restored->state(), UploadSessionState::Aborted);
+    EXPECT_EQ(restored->immutable_metadata().at("framework"), "pytorch");
+}
+
+TEST(PostgresMetadataRepositoryTest, DatabaseRejectsUploadSessionForMissingArtifact) {
+    reset_metadata_data();
+
+    PostgresMetadataRepository repository{
+        test_database_connection_string(),
+    };
+
+    constexpr std::uint64_t kFourMiB = 4ULL * 1024ULL * 1024ULL;
+
+    EXPECT_THROW(repository.create_upload_session(UploadSession{
+                     UuidV7::generate(),
+                     UuidV7::generate(),
+                     "node-a",
+                     ChunkingStrategy::FixedSize,
+                     kFourMiB,
+                     std::nullopt,
+                     UploadSession::ImmutableMetadata{},
+                     UploadSessionState::Open,
+                     std::nullopt,
+                 }),
+                 pqxx::foreign_key_violation);
+}
+
+TEST(PostgresMetadataRepositoryTest, DatabaseRejectsUploadSessionParentVersionFromDifferentArtifact) {
+    reset_metadata_data();
+
+    PostgresMetadataRepository repository{
+        test_database_connection_string(),
+    };
+
+    const UuidV7 artifact_a = UuidV7::generate();
+    const UuidV7 artifact_b = UuidV7::generate();
+
+    repository.create_artifact(Artifact{
+        artifact_a,
+        "checkpoint-a",
+        "training-project",
+    });
+
+    repository.create_artifact(Artifact{
+        artifact_b,
+        "checkpoint-b",
+        "training-project",
+    });
+
+    register_test_object_and_layout(repository);
+
+    const ArtifactVersion version_b{
+        artifact_b,
+        kObjectId,
+        std::nullopt,
+        ArtifactVersion::ImmutableMetadata{
+            {"epoch", "1"},
+        },
+        VersionState::Committed,
+    };
+
+    repository.create_version(version_b);
+
+    constexpr std::uint64_t kFourMiB = 4ULL * 1024ULL * 1024ULL;
+
+    EXPECT_THROW(repository.create_upload_session(UploadSession{
+                     UuidV7::generate(),
+                     artifact_a,
+                     "node-a",
+                     ChunkingStrategy::FixedSize,
+                     kFourMiB,
+                     version_b.version_id(),
+                     UploadSession::ImmutableMetadata{},
+                     UploadSessionState::Open,
+                     std::nullopt,
+                 }),
+                 pqxx::foreign_key_violation);
 }
 
 }  // namespace

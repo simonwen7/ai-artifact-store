@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <map>
 #include <optional>
 #include <pqxx/pqxx>
 #include <span>
@@ -226,6 +227,37 @@ ChunkingStrategy chunking_strategy_from_string(std::string_view strategy) {
     }
 
     throw std::runtime_error("database contains an unsupported chunking strategy");
+}
+
+std::string_view upload_session_state_to_string(UploadSessionState state) {
+    switch (state) {
+        case UploadSessionState::Open:
+            return "open";
+
+        case UploadSessionState::Committed:
+            return "committed";
+
+        case UploadSessionState::Aborted:
+            return "aborted";
+    }
+
+    throw std::logic_error("unsupported upload session state");
+}
+
+UploadSessionState upload_session_state_from_string(std::string_view state) {
+    if (state == "open") {
+        return UploadSessionState::Open;
+    }
+
+    if (state == "committed") {
+        return UploadSessionState::Committed;
+    }
+
+    if (state == "aborted") {
+        return UploadSessionState::Aborted;
+    }
+
+    throw std::runtime_error("database contains an unsupported upload session state");
 }
 
 }  // namespace
@@ -1110,7 +1142,334 @@ class PostgresMetadataRepository::Impl {
         return locations;
     }
 
+    void register_chunks(const std::vector<ChunkMetadata>& chunks) {
+        if (chunks.empty()) {
+            return;
+        }
+
+        std::map<std::string, std::uint64_t> unique_chunks;
+
+        for (const ChunkMetadata& chunk : chunks) {
+            validate_chunk_id(chunk.chunk_id);
+
+            if (chunk.size_bytes == 0U) {
+                throw std::invalid_argument("chunk size must be greater than zero");
+            }
+
+            const auto [iterator, inserted] = unique_chunks.emplace(chunk.chunk_id, chunk.size_bytes);
+
+            if (!inserted && iterator->second != chunk.size_bytes) {
+                throw std::invalid_argument(
+                    "chunk registration batch contains conflicting sizes for the same chunk ID");
+            }
+        }
+
+        pqxx::work transaction{connection_};
+
+        for (const auto& [chunk_id, size_bytes] : unique_chunks) {
+            const long long chunk_size = to_postgres_bigint(size_bytes, "chunk size");
+
+            transaction
+                .exec(
+                    "INSERT INTO chunks ("
+                    "    chunk_id, "
+                    "    size_bytes"
+                    ") "
+                    "VALUES ("
+                    "    $1, "
+                    "    $2"
+                    ") "
+                    "ON CONFLICT (chunk_id) "
+                    "DO NOTHING",
+                    pqxx::params{
+                        chunk_id,
+                        chunk_size,
+                    })
+                .no_rows();
+
+            const auto stored_chunk_size = transaction.query_value<long long>(
+                "SELECT "
+                "    size_bytes "
+                "FROM chunks "
+                "WHERE chunk_id = $1",
+                pqxx::params{
+                    chunk_id,
+                });
+
+            if (stored_chunk_size != chunk_size) {
+                throw std::runtime_error("existing chunk size does not match chunk identity");
+            }
+        }
+
+        transaction.commit();
+    }
+
+    [[nodiscard]] std::optional<std::uint64_t> get_chunk_size(std::string_view chunk_id) {
+        validate_chunk_id(chunk_id);
+
+        pqxx::work transaction{connection_};
+
+        const auto stored = transaction.query01<long long>(
+            "SELECT "
+            "    size_bytes "
+            "FROM chunks "
+            "WHERE chunk_id = $1",
+            pqxx::params{
+                chunk_id,
+            });
+
+        if (!stored.has_value()) {
+            transaction.commit();
+            return std::nullopt;
+        }
+
+        const auto [size_bytes] = *stored;
+
+        if (size_bytes <= 0) {
+            throw std::runtime_error("stored chunk contains an invalid non-positive size");
+        }
+
+        transaction.commit();
+
+        return static_cast<std::uint64_t>(size_bytes);
+    }
+
+    void create_upload_session(const UploadSession& session) {
+        if (session.state() != UploadSessionState::Open) {
+            throw std::invalid_argument("create_upload_session may only create open upload sessions");
+        }
+
+        if (session.finalized_version_id().has_value()) {
+            throw std::invalid_argument("create_upload_session requires a null finalized version ID");
+        }
+
+        pqxx::work transaction{connection_};
+
+        const pqxx::result insert_result = transaction.exec(
+            "INSERT INTO upload_sessions ("
+            "    session_id, "
+            "    artifact_id, "
+            "    target_node_id, "
+            "    chunking_strategy, "
+            "    chunk_size_bytes, "
+            "    parent_version_id, "
+            "    state, "
+            "    finalized_version_id"
+            ") "
+            "VALUES ("
+            "    $1::uuid, "
+            "    $2::uuid, "
+            "    $3, "
+            "    $4, "
+            "    $5, "
+            "    $6, "
+            "    $7, "
+            "    $8"
+            ") "
+            "ON CONFLICT (session_id) "
+            "DO NOTHING",
+            pqxx::params{
+                session.session_id().str(),
+                session.artifact_id().str(),
+                session.target_node_id(),
+                chunking_strategy_to_string(session.chunking_strategy()),
+                to_postgres_bigint(session.chunk_size_bytes(), "upload session chunk size"),
+                session.parent_version_id(),
+                upload_session_state_to_string(session.state()),
+                session.finalized_version_id(),
+            });
+
+        if (insert_result.affected_rows() == 0) {
+            const UploadSession existing = load_upload_session(transaction, session.session_id());
+
+            if (existing.state() != UploadSessionState::Open || existing.finalized_version_id().has_value() ||
+                existing.session_id() != session.session_id() || existing.artifact_id() != session.artifact_id() ||
+                existing.target_node_id() != session.target_node_id() ||
+                existing.chunking_strategy() != session.chunking_strategy() ||
+                existing.chunk_size_bytes() != session.chunk_size_bytes() ||
+                existing.parent_version_id() != session.parent_version_id() ||
+                existing.immutable_metadata() != session.immutable_metadata()) {
+                throw std::runtime_error("existing upload session does not match requested session");
+            }
+
+            transaction.commit();
+            return;
+        }
+
+        for (const auto& [key, value] : session.immutable_metadata()) {
+            transaction
+                .exec(
+                    "INSERT INTO upload_session_metadata ("
+                    "    session_id, "
+                    "    metadata_key, "
+                    "    metadata_value"
+                    ") "
+                    "VALUES ("
+                    "    $1::uuid, "
+                    "    $2, "
+                    "    $3"
+                    ")",
+                    pqxx::params{
+                        session.session_id().str(),
+                        key,
+                        value,
+                    })
+                .no_rows();
+        }
+
+        const UploadSession verified = load_upload_session(transaction, session.session_id());
+
+        if (verified.session_id() != session.session_id() || verified.artifact_id() != session.artifact_id() ||
+            verified.target_node_id() != session.target_node_id() ||
+            verified.chunking_strategy() != session.chunking_strategy() ||
+            verified.chunk_size_bytes() != session.chunk_size_bytes() ||
+            verified.parent_version_id() != session.parent_version_id() ||
+            verified.immutable_metadata() != session.immutable_metadata() ||
+            verified.state() != UploadSessionState::Open || verified.finalized_version_id().has_value()) {
+            throw std::runtime_error("persisted upload session does not match requested session");
+        }
+
+        transaction.commit();
+    }
+
+    [[nodiscard]] std::optional<UploadSession> get_upload_session(const UuidV7& session_id) {
+        pqxx::work transaction{connection_};
+
+        auto stored = transaction.query01<std::string, std::string, std::string, std::string, long long,
+                                          std::optional<std::string>, std::string, std::optional<std::string>>(
+            "SELECT "
+            "    session_id::text, "
+            "    artifact_id::text, "
+            "    target_node_id, "
+            "    chunking_strategy, "
+            "    chunk_size_bytes, "
+            "    parent_version_id, "
+            "    state, "
+            "    finalized_version_id "
+            "FROM upload_sessions "
+            "WHERE session_id = $1::uuid",
+            pqxx::params{
+                session_id.str(),
+            });
+
+        if (!stored.has_value()) {
+            transaction.commit();
+            return std::nullopt;
+        }
+
+        UploadSession session = reconstruct_upload_session(transaction, std::move(*stored));
+
+        transaction.commit();
+
+        return session;
+    }
+
+    void abort_upload_session(const UuidV7& session_id) {
+        pqxx::work transaction{connection_};
+
+        const auto stored = transaction.query01<std::string>(
+            "SELECT "
+            "    state "
+            "FROM upload_sessions "
+            "WHERE session_id = $1::uuid "
+            "FOR UPDATE",
+            pqxx::params{
+                session_id.str(),
+            });
+
+        if (!stored.has_value()) {
+            throw std::runtime_error("upload session does not exist");
+        }
+
+        const auto [state] = *stored;
+        const UploadSessionState current_state = upload_session_state_from_string(state);
+
+        if (current_state == UploadSessionState::Committed) {
+            throw std::runtime_error("committed upload session cannot be aborted");
+        }
+
+        if (current_state == UploadSessionState::Open) {
+            transaction
+                .exec(
+                    "UPDATE upload_sessions "
+                    "SET "
+                    "    state = 'aborted', "
+                    "    updated_at = CURRENT_TIMESTAMP "
+                    "WHERE session_id = $1::uuid",
+                    pqxx::params{
+                        session_id.str(),
+                    })
+                .no_rows();
+        }
+
+        transaction.commit();
+    }
+
    private:
+    using StoredUploadSessionRow = std::tuple<std::string, std::string, std::string, std::string, long long,
+                                              std::optional<std::string>, std::string, std::optional<std::string>>;
+
+    [[nodiscard]] UploadSession reconstruct_upload_session(pqxx::work& transaction, StoredUploadSessionRow stored) {
+        auto [stored_session_id, stored_artifact_id, target_node_id, stored_strategy, stored_chunk_size,
+              parent_version_id, state, finalized_version_id] = std::move(stored);
+
+        if (stored_chunk_size <= 0) {
+            throw std::runtime_error("stored upload session contains an invalid non-positive chunk size");
+        }
+
+        UploadSession::ImmutableMetadata immutable_metadata;
+
+        for (auto [metadata_key, metadata_value] :
+             transaction.query<std::string, std::string>("SELECT "
+                                                         "    metadata_key, "
+                                                         "    metadata_value "
+                                                         "FROM upload_session_metadata "
+                                                         "WHERE session_id = $1::uuid "
+                                                         "ORDER BY metadata_key",
+                                                         pqxx::params{
+                                                             stored_session_id,
+                                                         })) {
+            immutable_metadata.emplace(std::move(metadata_key), std::move(metadata_value));
+        }
+
+        return UploadSession{
+            UuidV7{std::move(stored_session_id)},
+            UuidV7{std::move(stored_artifact_id)},
+            std::move(target_node_id),
+            chunking_strategy_from_string(stored_strategy),
+            static_cast<std::uint64_t>(stored_chunk_size),
+            std::move(parent_version_id),
+            std::move(immutable_metadata),
+            upload_session_state_from_string(state),
+            std::move(finalized_version_id),
+        };
+    }
+
+    [[nodiscard]] UploadSession load_upload_session(pqxx::work& transaction, const UuidV7& session_id) {
+        auto stored = transaction.query01<std::string, std::string, std::string, std::string, long long,
+                                          std::optional<std::string>, std::string, std::optional<std::string>>(
+            "SELECT "
+            "    session_id::text, "
+            "    artifact_id::text, "
+            "    target_node_id, "
+            "    chunking_strategy, "
+            "    chunk_size_bytes, "
+            "    parent_version_id, "
+            "    state, "
+            "    finalized_version_id "
+            "FROM upload_sessions "
+            "WHERE session_id = $1::uuid",
+            pqxx::params{
+                session_id.str(),
+            });
+
+        if (!stored.has_value()) {
+            throw std::runtime_error("upload session disappeared during transaction");
+        }
+
+        return reconstruct_upload_session(transaction, std::move(*stored));
+    }
+
     [[nodiscard]] std::optional<ObjectLayoutDescriptor> load_object_layout(pqxx::work& transaction,
                                                                            std::string_view layout_id) {
         validate_layout_id(layout_id);
@@ -1413,6 +1772,26 @@ void PostgresMetadataRepository::register_storage_location(const StorageLocation
 
 std::vector<StorageLocation> PostgresMetadataRepository::get_storage_locations(std::string_view chunk_id) {
     return impl_->get_storage_locations(chunk_id);
+}
+
+void PostgresMetadataRepository::register_chunks(const std::vector<ChunkMetadata>& chunks) {
+    impl_->register_chunks(chunks);
+}
+
+std::optional<std::uint64_t> PostgresMetadataRepository::get_chunk_size(std::string_view chunk_id) {
+    return impl_->get_chunk_size(chunk_id);
+}
+
+void PostgresMetadataRepository::create_upload_session(const UploadSession& session) {
+    impl_->create_upload_session(session);
+}
+
+std::optional<UploadSession> PostgresMetadataRepository::get_upload_session(const UuidV7& session_id) {
+    return impl_->get_upload_session(session_id);
+}
+
+void PostgresMetadataRepository::abort_upload_session(const UuidV7& session_id) {
+    impl_->abort_upload_session(session_id);
 }
 
 }  // namespace aistore::metadata

@@ -136,6 +136,7 @@ add_library(
     src/metadata/artifact_model.cpp
     src/metadata/manifest_model.cpp
     src/metadata/run_model.cpp
+    src/metadata/upload_session.cpp
     src/metadata/postgres_metadata_repository.cpp
 )
 
@@ -492,6 +493,17 @@ if(BUILD_TESTING)
 
     target_link_libraries(
         aistore_artifact_model_tests
+        PRIVATE
+        aistore_metadata
+    )
+
+    aistore_add_test(
+        aistore_upload_session_tests
+        tests/unit/metadata/upload_session_test.cpp
+    )
+
+    target_link_libraries(
+        aistore_upload_session_tests
         PRIVATE
         aistore_metadata
     )

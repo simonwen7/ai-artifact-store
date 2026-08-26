@@ -8,11 +8,13 @@
 #include <vector>
 
 #include "aistore/metadata/artifact_model.hpp"
+#include "aistore/metadata/chunk_metadata.hpp"
 #include "aistore/metadata/manifest_model.hpp"
 #include "aistore/metadata/object.hpp"
 #include "aistore/metadata/object_layout_descriptor.hpp"
 #include "aistore/metadata/run_model.hpp"
 #include "aistore/metadata/storage_location.hpp"
+#include "aistore/metadata/upload_session.hpp"
 
 namespace aistore::metadata {
 
@@ -65,6 +67,16 @@ class PostgresMetadataRepository {
     void register_storage_location(const StorageLocation& location);
 
     [[nodiscard]] std::vector<StorageLocation> get_storage_locations(std::string_view chunk_id);
+
+    void register_chunks(const std::vector<ChunkMetadata>& chunks);
+
+    [[nodiscard]] std::optional<std::uint64_t> get_chunk_size(std::string_view chunk_id);
+
+    void create_upload_session(const UploadSession& session);
+
+    [[nodiscard]] std::optional<UploadSession> get_upload_session(const UuidV7& session_id);
+
+    void abort_upload_session(const UuidV7& session_id);
 
    private:
     class Impl;
