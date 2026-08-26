@@ -369,6 +369,15 @@ set_target_properties(
     CXX_EXTENSIONS OFF
 )
 
+target_link_libraries(
+    aistore
+    PRIVATE
+    aistore_push
+    aistore_client
+    aistore_metadata
+    Boost::json
+)
+
 if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
     target_compile_options(
         aistore
@@ -838,4 +847,22 @@ if(BUILD_TESTING)
         Threads::Threads
         libpqxx::pqxx
     )
+
+    if(UNIX)
+        add_test(
+            NAME aistore_cli_push_process_e2e
+            COMMAND
+                bash
+                "${PROJECT_SOURCE_DIR}/tests/e2e/aistore_cli_push_e2e.sh"
+                $<TARGET_FILE:aistore>
+                $<TARGET_FILE:aistore_metadata_service>
+                $<TARGET_FILE:aistore_storage_node>
+        )
+
+        set_tests_properties(
+            aistore_cli_push_process_e2e
+            PROPERTIES
+            TIMEOUT 60
+        )
+    endif()
 endif()
