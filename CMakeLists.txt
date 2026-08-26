@@ -307,6 +307,50 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
     )
 endif()
 
+add_library(
+    aistore_push
+    src/push/push_engine.cpp
+)
+
+target_include_directories(
+    aistore_push
+    PUBLIC
+    ${PROJECT_SOURCE_DIR}/include
+)
+
+target_compile_features(
+    aistore_push
+    PUBLIC
+    cxx_std_20
+)
+
+set_target_properties(
+    aistore_push
+    PROPERTIES
+    CXX_EXTENSIONS OFF
+)
+
+target_link_libraries(
+    aistore_push
+    PUBLIC
+    aistore_client
+    aistore_metadata
+    PRIVATE
+    aistore_hashing
+    aistore_chunking
+    Threads::Threads
+)
+
+if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+    target_compile_options(
+        aistore_push
+        PRIVATE
+        -Wall
+        -Wextra
+        -Wpedantic
+    )
+endif()
+
 add_executable(
     aistore
     apps/aistore-cli/main.cpp
@@ -726,6 +770,28 @@ if(BUILD_TESTING)
         aistore_services
         aistore_metadata
         aistore_hashing
+        Boost::json
+        Boost::headers
+        Threads::Threads
+        libpqxx::pqxx
+    )
+
+    aistore_add_test(
+        aistore_push_engine_tests
+        tests/integration/push_engine_test.cpp
+    )
+
+    target_link_libraries(
+        aistore_push_engine_tests
+        PRIVATE
+        aistore_push
+        aistore_client
+        aistore_http
+        aistore_services
+        aistore_storage
+        aistore_hashing
+        aistore_chunking
+        aistore_metadata
         Boost::json
         Boost::headers
         Threads::Threads

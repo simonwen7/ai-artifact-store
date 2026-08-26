@@ -11,6 +11,7 @@
 
 #include "aistore/client/client_error.hpp"
 #include "aistore/metadata/object_layout_descriptor.hpp"
+#include "aistore/metadata/storage_location.hpp"
 
 namespace aistore::client {
 
@@ -457,6 +458,49 @@ ChunkNegotiationResult MetadataClient::negotiate_chunks(
         .target_node_id = target_node_id,
         .chunks = std::move(negotiated_chunks),
     };
+}
+
+void MetadataClient::register_storage_location(const aistore::metadata::StorageLocation& location) const {
+    if (!is_valid_chunk_id(location.chunk_id)) {
+        throw std::invalid_argument("storage location chunk_id must be 64 lowercase hex characters");
+    }
+
+    if (!is_valid_node_id(location.node_id)) {
+        throw std::invalid_argument("storage location node_id is invalid");
+    }
+
+    if (location.storage_path.empty()) {
+        throw std::invalid_argument("storage location storage_path must not be empty");
+    }
+
+    std::string_view state_string;
+
+    switch (location.state) {
+        case aistore::metadata::StorageLocationState::Available:
+            state_string = "available";
+            break;
+
+        case aistore::metadata::StorageLocationState::Missing:
+            state_string = "missing";
+            break;
+
+        case aistore::metadata::StorageLocationState::Corrupt:
+            state_string = "corrupt";
+            break;
+    }
+
+    const std::string target = std::string{"/v1/chunks/"} + location.chunk_id + "/locations/" + location.node_id;
+    const std::string body = boost::json::serialize(boost::json::object{
+        {"storage_path", location.storage_path},
+        {"state", state_string},
+    });
+
+    const aistore::http::HttpClientResponse response =
+        http_client_.request(beast_http::verb::put, target, body, "application/json");
+
+    if (status_code_of(response) != 204U) {
+        throw_remote_api_error(response);
+    }
 }
 
 }  // namespace aistore::client

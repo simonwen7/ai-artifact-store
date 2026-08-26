@@ -433,4 +433,43 @@ TEST(MetadataClientStandaloneTest, MalformedSuccessfulResponseProducesProtocolEr
     EXPECT_THROW((void)client.get_upload_session(session_id), RemoteProtocolError);
 }
 
+TEST_F(MetadataClientFixture, RegistersStorageLocation) {
+    const std::string chunk_id = sha256_hex(std::string{"m4s3-loc-reg-"} + UuidV7::generate().str());
+    track_chunk(chunk_id);
+    repository_->register_chunks({ChunkMetadata{.chunk_id = chunk_id, .size_bytes = 3}});
+
+    const std::string storage_path = std::string{"/v1/chunks/"} + chunk_id;
+    client_->register_storage_location(StorageLocation{
+        .chunk_id = chunk_id,
+        .node_id = "m4s3-loc-node",
+        .storage_path = storage_path,
+        .state = StorageLocationState::Available,
+    });
+
+    const auto locations = repository_->get_storage_locations(chunk_id);
+    ASSERT_EQ(locations.size(), 1U);
+    EXPECT_EQ(locations[0].chunk_id, chunk_id);
+    EXPECT_EQ(locations[0].node_id, "m4s3-loc-node");
+    EXPECT_EQ(locations[0].storage_path, storage_path);
+    EXPECT_EQ(locations[0].state, StorageLocationState::Available);
+}
+
+TEST_F(MetadataClientFixture, MissingChunkLocationRegistrationProducesRemoteApiError) {
+    const std::string chunk_id = sha256_hex(std::string{"m4s3-loc-missing-"} + UuidV7::generate().str());
+    track_chunk(chunk_id);
+
+    try {
+        client_->register_storage_location(StorageLocation{
+            .chunk_id = chunk_id,
+            .node_id = "m4s3-loc-node",
+            .storage_path = std::string{"/v1/chunks/"} + chunk_id,
+            .state = StorageLocationState::Available,
+        });
+        FAIL() << "expected RemoteApiError";
+    } catch (const RemoteApiError& error) {
+        EXPECT_EQ(error.status_code(), 404U);
+        EXPECT_EQ(error.error_code(), "chunk_not_found");
+    }
+}
+
 }  // namespace

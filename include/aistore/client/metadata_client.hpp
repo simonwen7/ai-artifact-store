@@ -8,6 +8,7 @@
 
 #include "aistore/http/http_client.hpp"
 #include "aistore/metadata/chunk_metadata.hpp"
+#include "aistore/metadata/storage_location.hpp"
 #include "aistore/metadata/upload_session.hpp"
 #include "aistore/metadata/uuid_v7.hpp"
 
@@ -44,6 +45,8 @@ class MetadataClient {
 
     [[nodiscard]] ChunkNegotiationResult negotiate_chunks(const metadata::UuidV7& session_id,
                                                           const std::vector<metadata::ChunkMetadata>& chunks) const;
+
+    void register_storage_location(const metadata::StorageLocation& location) const;
 
    private:
     http::HttpClient http_client_;
