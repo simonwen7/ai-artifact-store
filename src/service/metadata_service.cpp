@@ -16,6 +16,7 @@
 #include "aistore/metadata/chunk_metadata.hpp"
 #include "aistore/metadata/chunking.hpp"
 #include "aistore/metadata/finalize_upload.hpp"
+#include "aistore/metadata/gc.hpp"
 #include "aistore/metadata/object.hpp"
 #include "aistore/metadata/object_layout.hpp"
 #include "aistore/metadata/object_layout_descriptor.hpp"
@@ -40,8 +41,13 @@ constexpr std::string_view kLocationsSuffix = "/locations";
 constexpr std::string_view kLocationsPrefix = "/locations/";
 constexpr std::string_view kArtifactVersionsPrefix = "/v1/artifact-versions/";
 constexpr std::string_view kRestorePlanInfix = "/restore-plan/";
+constexpr std::string_view kGcRunsCollection = "/v1/gc-runs";
+constexpr std::string_view kGcRunsPrefix = "/v1/gc-runs/";
+constexpr std::string_view kClassifySuffix = "/classify";
+constexpr std::string_view kCompleteSuffix = "/complete";
 constexpr std::string_view kApplicationJson = "application/json";
 constexpr std::size_t kMaxNegotiationChunks = 256U;
+constexpr std::size_t kMaxClassifyChunks = 256U;
 constexpr std::uint64_t kPostgresBigintMax = static_cast<std::uint64_t>(std::numeric_limits<long long>::max());
 
 aistore::http::HttpResponse make_json_response(const aistore::http::HttpRequest& request, beast_http::status status,
@@ -540,6 +546,413 @@ struct ParsedRestorePlanRoute {
     return parsed;
 }
 
+enum class GcRunRouteKind : std::uint8_t {
+    NotGcRun,
+    Collection,
+    Item,
+    Classify,
+    Complete,
+    InvalidGcRunId,
+    UnknownSubroute,
+};
+
+struct ParsedGcRunRoute {
+    GcRunRouteKind kind{GcRunRouteKind::NotGcRun};
+    std::string_view gc_run_id;
+};
+
+[[nodiscard]] ParsedGcRunRoute parse_gc_run_route(std::string_view path) {
+    ParsedGcRunRoute parsed;
+
+    if (path == kGcRunsCollection) {
+        parsed.kind = GcRunRouteKind::Collection;
+        return parsed;
+    }
+
+    if (!path.starts_with(kGcRunsPrefix)) {
+        return parsed;
+    }
+
+    const std::string_view remainder = path.substr(kGcRunsPrefix.size());
+
+    if (remainder.empty() || remainder.starts_with('/')) {
+        parsed.kind = GcRunRouteKind::UnknownSubroute;
+        return parsed;
+    }
+
+    const std::size_t slash = remainder.find('/');
+    const std::string_view gc_run_id = slash == std::string_view::npos ? remainder : remainder.substr(0, slash);
+
+    try {
+        (void)aistore::metadata::UuidV7{std::string{gc_run_id}};
+    } catch (const std::invalid_argument&) {
+        parsed.kind = GcRunRouteKind::InvalidGcRunId;
+        parsed.gc_run_id = gc_run_id;
+        return parsed;
+    }
+
+    parsed.gc_run_id = gc_run_id;
+
+    if (slash == std::string_view::npos) {
+        parsed.kind = GcRunRouteKind::Item;
+        return parsed;
+    }
+
+    if (remainder.substr(slash) == kClassifySuffix) {
+        parsed.kind = GcRunRouteKind::Classify;
+        return parsed;
+    }
+
+    if (remainder.substr(slash) == kCompleteSuffix) {
+        parsed.kind = GcRunRouteKind::Complete;
+        return parsed;
+    }
+
+    parsed.kind = GcRunRouteKind::UnknownSubroute;
+    return parsed;
+}
+
+[[nodiscard]] boost::json::object gc_run_to_json(const aistore::metadata::GcRun& run) {
+    return boost::json::object{
+        {"gc_run_id", run.run_id.str()},
+        {"target_node_id", run.target_node_id},
+        {"dry_run", run.mode == aistore::metadata::GcRunMode::DryRun},
+        {"state", aistore::metadata::gc_run_state_to_string(run.state)},
+        {"physical_chunks_scanned", run.physical_stats.physical_chunks_scanned},
+        {"physical_bytes_scanned", run.physical_stats.physical_bytes_scanned},
+        {"collectible_chunks", run.physical_stats.collectible_chunks},
+        {"collectible_bytes", run.physical_stats.collectible_bytes},
+        {"physically_deleted_chunks", run.physical_stats.physically_deleted_chunks},
+        {"physically_deleted_bytes", run.physical_stats.physically_deleted_bytes},
+        {"storage_locations_swept", run.metadata_stats.storage_locations_swept},
+        {"chunk_rows_swept", run.metadata_stats.chunk_rows_swept},
+        {"object_layouts_swept", run.metadata_stats.object_layouts_swept},
+        {"objects_swept", run.metadata_stats.objects_swept},
+    };
+}
+
+[[nodiscard]] aistore::http::HttpResponse make_gc_error_response(const aistore::http::HttpRequest& request,
+                                                                 aistore::metadata::GcErrorKind kind) {
+    switch (kind) {
+        case aistore::metadata::GcErrorKind::RunNotFound:
+            return make_json_response(request, beast_http::status::not_found,
+                                      boost::json::object{
+                                          {"error", "gc_run_not_found"},
+                                      });
+
+        case aistore::metadata::GcErrorKind::RunConflict:
+            return make_json_response(request, beast_http::status::conflict,
+                                      boost::json::object{
+                                          {"error", "gc_run_conflict"},
+                                      });
+
+        case aistore::metadata::GcErrorKind::AnotherRunOpen:
+            return make_json_response(request, beast_http::status::conflict,
+                                      boost::json::object{
+                                          {"error", "gc_already_in_progress"},
+                                      });
+
+        case aistore::metadata::GcErrorKind::OpenUploadSessionsPresent:
+            return make_json_response(request, beast_http::status::conflict,
+                                      boost::json::object{
+                                          {"error", "gc_blocked_by_open_upload_sessions"},
+                                      });
+
+        case aistore::metadata::GcErrorKind::RunNotOpen:
+            return make_json_response(request, beast_http::status::conflict,
+                                      boost::json::object{
+                                          {"error", "gc_run_not_open"},
+                                      });
+
+        case aistore::metadata::GcErrorKind::GcInProgress:
+            return make_json_response(request, beast_http::status::conflict,
+                                      boost::json::object{
+                                          {"error", "gc_in_progress"},
+                                      });
+    }
+
+    throw std::logic_error("unsupported GC error kind");
+}
+
+[[nodiscard]] std::optional<aistore::metadata::GcPhysicalStats> parse_gc_physical_stats_json(
+    const boost::json::object& body) {
+    if (!json_object_has_exact_keys(
+            body, {"physical_chunks_scanned", "physical_bytes_scanned", "collectible_chunks", "collectible_bytes",
+                   "physically_deleted_chunks", "physically_deleted_bytes"})) {
+        return std::nullopt;
+    }
+
+    const std::optional<std::uint64_t> physical_chunks_scanned =
+        extract_nonnegative_uint64(body.at("physical_chunks_scanned"));
+    const std::optional<std::uint64_t> physical_bytes_scanned =
+        extract_nonnegative_uint64(body.at("physical_bytes_scanned"));
+    const std::optional<std::uint64_t> collectible_chunks = extract_nonnegative_uint64(body.at("collectible_chunks"));
+    const std::optional<std::uint64_t> collectible_bytes = extract_nonnegative_uint64(body.at("collectible_bytes"));
+    const std::optional<std::uint64_t> physically_deleted_chunks =
+        extract_nonnegative_uint64(body.at("physically_deleted_chunks"));
+    const std::optional<std::uint64_t> physically_deleted_bytes =
+        extract_nonnegative_uint64(body.at("physically_deleted_bytes"));
+
+    if (!physical_chunks_scanned.has_value() || !physical_bytes_scanned.has_value() ||
+        !collectible_chunks.has_value() || !collectible_bytes.has_value() || !physically_deleted_chunks.has_value() ||
+        !physically_deleted_bytes.has_value()) {
+        return std::nullopt;
+    }
+
+    return aistore::metadata::GcPhysicalStats{
+        .physical_chunks_scanned = *physical_chunks_scanned,
+        .physical_bytes_scanned = *physical_bytes_scanned,
+        .collectible_chunks = *collectible_chunks,
+        .collectible_bytes = *collectible_bytes,
+        .physically_deleted_chunks = *physically_deleted_chunks,
+        .physically_deleted_bytes = *physically_deleted_bytes,
+    };
+}
+
+[[nodiscard]] aistore::http::HttpResponse handle_start_gc_run(const aistore::http::HttpRequest& request,
+                                                              aistore::metadata::PostgresMetadataRepository& repository,
+                                                              std::mutex& repository_mutex) {
+    if (request[beast_http::field::content_type] != kApplicationJson) {
+        return make_json_response(request, beast_http::status::unsupported_media_type,
+                                  boost::json::object{
+                                      {"error", "unsupported_media_type"},
+                                  });
+    }
+
+    boost::system::error_code parse_error;
+    const boost::json::value parsed = boost::json::parse(request.body(), parse_error);
+
+    if (parse_error) {
+        return make_json_response(request, beast_http::status::bad_request,
+                                  boost::json::object{
+                                      {"error", "invalid_json"},
+                                  });
+    }
+
+    if (!parsed.is_object()) {
+        return make_json_response(request, beast_http::status::bad_request,
+                                  boost::json::object{
+                                      {"error", "invalid_request"},
+                                  });
+    }
+
+    const boost::json::object& body = parsed.as_object();
+
+    if (body.size() != 3U || !body.contains("gc_run_id") || !body.contains("target_node_id") ||
+        !body.contains("dry_run") || !body.at("gc_run_id").is_string() || !body.at("target_node_id").is_string() ||
+        !body.at("dry_run").is_bool()) {
+        return make_json_response(request, beast_http::status::bad_request,
+                                  boost::json::object{
+                                      {"error", "invalid_request"},
+                                  });
+    }
+
+    const std::string target_node_id{body.at("target_node_id").as_string()};
+
+    if (!is_valid_node_id(target_node_id)) {
+        return make_json_response(request, beast_http::status::bad_request,
+                                  boost::json::object{
+                                      {"error", "invalid_request"},
+                                  });
+    }
+
+    try {
+        const aistore::metadata::GcRun requested_run{
+            .run_id = aistore::metadata::UuidV7{std::string{body.at("gc_run_id").as_string()}},
+            .target_node_id = target_node_id,
+            .mode = body.at("dry_run").as_bool() ? aistore::metadata::GcRunMode::DryRun
+                                                 : aistore::metadata::GcRunMode::Apply,
+            .state = aistore::metadata::GcRunState::Open,
+        };
+
+        const std::scoped_lock lock{repository_mutex};
+        const aistore::metadata::GcRun started = repository.start_gc_run(requested_run);
+        return make_json_response(request, beast_http::status::ok, gc_run_to_json(started));
+    } catch (const std::invalid_argument&) {
+        return make_json_response(request, beast_http::status::bad_request,
+                                  boost::json::object{
+                                      {"error", "invalid_request"},
+                                  });
+    } catch (const aistore::metadata::GcError& error) {
+        return make_gc_error_response(request, error.kind());
+    }
+}
+
+[[nodiscard]] aistore::http::HttpResponse handle_get_gc_run(const aistore::http::HttpRequest& request,
+                                                            aistore::metadata::PostgresMetadataRepository& repository,
+                                                            std::mutex& repository_mutex,
+                                                            std::string_view gc_run_id_text) {
+    aistore::metadata::UuidV7 gc_run_id{std::string{gc_run_id_text}};
+
+    const std::scoped_lock lock{repository_mutex};
+    const std::optional<aistore::metadata::GcRun> run = repository.get_gc_run(gc_run_id);
+
+    if (!run.has_value()) {
+        return make_json_response(request, beast_http::status::not_found,
+                                  boost::json::object{
+                                      {"error", "gc_run_not_found"},
+                                  });
+    }
+
+    return make_json_response(request, beast_http::status::ok, gc_run_to_json(*run));
+}
+
+[[nodiscard]] aistore::http::HttpResponse handle_classify_gc_chunks(
+    const aistore::http::HttpRequest& request, aistore::metadata::PostgresMetadataRepository& repository,
+    std::mutex& repository_mutex, std::string_view gc_run_id_text) {
+    if (request[beast_http::field::content_type] != kApplicationJson) {
+        return make_json_response(request, beast_http::status::unsupported_media_type,
+                                  boost::json::object{
+                                      {"error", "unsupported_media_type"},
+                                  });
+    }
+
+    boost::system::error_code parse_error;
+    const boost::json::value parsed = boost::json::parse(request.body(), parse_error);
+
+    if (parse_error) {
+        return make_json_response(request, beast_http::status::bad_request,
+                                  boost::json::object{
+                                      {"error", "invalid_json"},
+                                  });
+    }
+
+    if (!parsed.is_object()) {
+        return make_json_response(request, beast_http::status::bad_request,
+                                  boost::json::object{
+                                      {"error", "invalid_request"},
+                                  });
+    }
+
+    const boost::json::object& body = parsed.as_object();
+
+    if (body.size() != 1U || !body.contains("chunk_ids") || !body.at("chunk_ids").is_array()) {
+        return make_json_response(request, beast_http::status::bad_request,
+                                  boost::json::object{
+                                      {"error", "invalid_request"},
+                                  });
+    }
+
+    const boost::json::array& chunk_id_values = body.at("chunk_ids").as_array();
+
+    if (chunk_id_values.empty() || chunk_id_values.size() > kMaxClassifyChunks) {
+        return make_json_response(request, beast_http::status::bad_request,
+                                  boost::json::object{
+                                      {"error", "invalid_request"},
+                                  });
+    }
+
+    std::vector<std::string> chunk_ids;
+    chunk_ids.reserve(chunk_id_values.size());
+    std::map<std::string, std::size_t> seen_chunk_ids;
+
+    for (const boost::json::value& chunk_id_value : chunk_id_values) {
+        if (!chunk_id_value.is_string()) {
+            return make_json_response(request, beast_http::status::bad_request,
+                                      boost::json::object{
+                                          {"error", "invalid_request"},
+                                      });
+        }
+
+        const std::string chunk_id{chunk_id_value.as_string()};
+
+        if (!is_valid_chunk_id(chunk_id)) {
+            return make_json_response(request, beast_http::status::bad_request,
+                                      boost::json::object{
+                                          {"error", "invalid_request"},
+                                      });
+        }
+
+        if (!seen_chunk_ids.emplace(chunk_id, chunk_ids.size()).second) {
+            return make_json_response(request, beast_http::status::bad_request,
+                                      boost::json::object{
+                                          {"error", "invalid_request"},
+                                      });
+        }
+
+        chunk_ids.push_back(chunk_id);
+    }
+
+    aistore::metadata::UuidV7 gc_run_id{std::string{gc_run_id_text}};
+
+    try {
+        const std::scoped_lock lock{repository_mutex};
+        const std::vector<aistore::metadata::GcChunkDecision> decisions =
+            repository.classify_gc_chunks(gc_run_id, chunk_ids);
+
+        boost::json::array chunks;
+        chunks.reserve(decisions.size());
+
+        for (const aistore::metadata::GcChunkDecision& decision : decisions) {
+            chunks.push_back(boost::json::object{
+                {"chunk_id", decision.chunk_id},
+                {"collectible", decision.collectible},
+            });
+        }
+
+        return make_json_response(request, beast_http::status::ok,
+                                  boost::json::object{
+                                      {"gc_run_id", gc_run_id.str()},
+                                      {"chunks", std::move(chunks)},
+                                  });
+    } catch (const aistore::metadata::GcError& error) {
+        return make_gc_error_response(request, error.kind());
+    } catch (const std::invalid_argument&) {
+        return make_json_response(request, beast_http::status::bad_request,
+                                  boost::json::object{
+                                      {"error", "invalid_request"},
+                                  });
+    }
+}
+
+[[nodiscard]] aistore::http::HttpResponse handle_complete_gc_run(
+    const aistore::http::HttpRequest& request, aistore::metadata::PostgresMetadataRepository& repository,
+    std::mutex& repository_mutex, std::string_view gc_run_id_text) {
+    if (request[beast_http::field::content_type] != kApplicationJson) {
+        return make_json_response(request, beast_http::status::unsupported_media_type,
+                                  boost::json::object{
+                                      {"error", "unsupported_media_type"},
+                                  });
+    }
+
+    boost::system::error_code parse_error;
+    const boost::json::value parsed = boost::json::parse(request.body(), parse_error);
+
+    if (parse_error) {
+        return make_json_response(request, beast_http::status::bad_request,
+                                  boost::json::object{
+                                      {"error", "invalid_json"},
+                                  });
+    }
+
+    if (!parsed.is_object()) {
+        return make_json_response(request, beast_http::status::bad_request,
+                                  boost::json::object{
+                                      {"error", "invalid_request"},
+                                  });
+    }
+
+    const std::optional<aistore::metadata::GcPhysicalStats> physical_stats =
+        parse_gc_physical_stats_json(parsed.as_object());
+
+    if (!physical_stats.has_value()) {
+        return make_json_response(request, beast_http::status::bad_request,
+                                  boost::json::object{
+                                      {"error", "invalid_request"},
+                                  });
+    }
+
+    aistore::metadata::UuidV7 gc_run_id{std::string{gc_run_id_text}};
+
+    try {
+        const std::scoped_lock lock{repository_mutex};
+        const aistore::metadata::GcRun completed = repository.complete_gc_run(gc_run_id, *physical_stats);
+        return make_json_response(request, beast_http::status::ok, gc_run_to_json(completed));
+    } catch (const aistore::metadata::GcError& error) {
+        return make_gc_error_response(request, error.kind());
+    }
+}
+
 [[nodiscard]] boost::json::object restore_plan_to_json(const aistore::metadata::RestorePlan& plan) {
     const aistore::metadata::ObjectLayoutDescriptor& descriptor = plan.layout_descriptor;
     boost::json::array chunks;
@@ -787,6 +1200,15 @@ struct ParsedRestorePlanRoute {
                                   boost::json::object{
                                       {"error", "upload_session_prerequisite_not_found"},
                                   });
+    } catch (const aistore::metadata::GcError& error) {
+        if (error.kind() == aistore::metadata::GcErrorKind::GcInProgress) {
+            return make_json_response(request, beast_http::status::conflict,
+                                      boost::json::object{
+                                          {"error", "gc_in_progress"},
+                                      });
+        }
+
+        throw;
     }
 
     return make_json_response(request, beast_http::status::ok, upload_session_to_json(response_session));
@@ -1533,6 +1955,62 @@ aistore::http::HttpResponse MetadataService::handle_request(const aistore::http:
 
     if (path.starts_with(kChunkRoutePrefix)) {
         return handle_location_routes(request, repository_, repository_mutex_, path, has_query_or_fragment);
+    }
+
+    if (path == kGcRunsCollection || path.starts_with(kGcRunsPrefix)) {
+        if (has_query_or_fragment) {
+            return make_json_response(request, beast_http::status::bad_request,
+                                      boost::json::object{
+                                          {"error", "invalid_request"},
+                                      });
+        }
+
+        const ParsedGcRunRoute route = parse_gc_run_route(path);
+
+        switch (route.kind) {
+            case GcRunRouteKind::Collection:
+                if (request.method() != beast_http::verb::post) {
+                    return make_method_not_allowed(request, "POST");
+                }
+
+                return handle_start_gc_run(request, repository_, repository_mutex_);
+
+            case GcRunRouteKind::Item:
+                if (request.method() != beast_http::verb::get) {
+                    return make_method_not_allowed(request, "GET");
+                }
+
+                return handle_get_gc_run(request, repository_, repository_mutex_, route.gc_run_id);
+
+            case GcRunRouteKind::Classify:
+                if (request.method() != beast_http::verb::post) {
+                    return make_method_not_allowed(request, "POST");
+                }
+
+                return handle_classify_gc_chunks(request, repository_, repository_mutex_, route.gc_run_id);
+
+            case GcRunRouteKind::Complete:
+                if (request.method() != beast_http::verb::post) {
+                    return make_method_not_allowed(request, "POST");
+                }
+
+                return handle_complete_gc_run(request, repository_, repository_mutex_, route.gc_run_id);
+
+            case GcRunRouteKind::InvalidGcRunId:
+                return make_json_response(request, beast_http::status::bad_request,
+                                          boost::json::object{
+                                              {"error", "invalid_gc_run_id"},
+                                          });
+
+            case GcRunRouteKind::UnknownSubroute:
+                return make_json_response(request, beast_http::status::not_found,
+                                          boost::json::object{
+                                              {"error", "not_found"},
+                                          });
+
+            case GcRunRouteKind::NotGcRun:
+                break;
+        }
     }
 
     return make_json_response(request, beast_http::status::not_found,

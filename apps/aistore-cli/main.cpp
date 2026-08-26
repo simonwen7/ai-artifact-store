@@ -16,9 +16,11 @@
 #include "aistore/client/client_error.hpp"
 #include "aistore/client/metadata_client.hpp"
 #include "aistore/client/storage_node_client.hpp"
+#include "aistore/gc/gc_engine.hpp"
 #include "aistore/http/http_client.hpp"
 #include "aistore/metadata/chunking.hpp"
 #include "aistore/metadata/finalize_upload.hpp"
+#include "aistore/metadata/gc.hpp"
 #include "aistore/metadata/upload_session.hpp"
 #include "aistore/metadata/uuid_v7.hpp"
 #include "aistore/pull/pull_engine.hpp"
@@ -50,13 +52,16 @@ void print_top_level_usage(std::ostream& out) {
     out << "Usage:\n"
            "  aistore push [options]\n"
            "  aistore pull [options]\n"
+           "  aistore gc [options]\n"
            "\n"
            "Commands:\n"
            "  push\n"
            "  pull\n"
+           "  gc\n"
            "\n"
            "Run `aistore push --help` for push options.\n"
-           "Run `aistore pull --help` for pull options.\n";
+           "Run `aistore pull --help` for pull options.\n"
+           "Run `aistore gc --help` for gc options.\n";
 }
 
 void print_push_usage(std::ostream& out) {
@@ -103,6 +108,26 @@ void print_pull_usage(std::ostream& out) {
            "\n"
            "Optional:\n"
            "  --overwrite\n"
+           "  --metadata-address <numeric-ip>\n"
+           "  --metadata-port <port>\n"
+           "  --storage-address <numeric-ip>\n"
+           "  --storage-port <port>\n"
+           "\n"
+           "Defaults:\n"
+           "  metadata 127.0.0.1:8080\n"
+           "  storage  127.0.0.1:8081\n";
+}
+
+void print_gc_usage(std::ostream& out) {
+    out << "Usage:\n"
+           "  aistore gc [options]\n"
+           "\n"
+           "Required:\n"
+           "  --storage-node-id <node-id>\n"
+           "\n"
+           "Optional:\n"
+           "  --gc-run-id <uuidv7>\n"
+           "  --dry-run\n"
            "  --metadata-address <numeric-ip>\n"
            "  --metadata-port <port>\n"
            "  --storage-address <numeric-ip>\n"
@@ -630,6 +655,125 @@ struct PullOptions {
     };
 }
 
+struct GcOptions {
+    aistore::metadata::UuidV7 gc_run_id;
+    std::string storage_node_id;
+    bool dry_run = false;
+    std::string metadata_address = "127.0.0.1";
+    std::uint16_t metadata_port = 8080;
+    std::string storage_address = "127.0.0.1";
+    std::uint16_t storage_port = 8081;
+};
+
+[[nodiscard]] GcOptions parse_gc_options(int argc, char** argv) {
+    std::optional<aistore::metadata::UuidV7> gc_run_id;
+    std::string storage_node_id;
+    bool dry_run = false;
+    std::string metadata_address = "127.0.0.1";
+    std::uint16_t metadata_port = 8080;
+    std::string storage_address = "127.0.0.1";
+    std::uint16_t storage_port = 8081;
+
+    bool has_storage_node_id = false;
+    bool has_gc_run_id = false;
+    bool has_dry_run = false;
+    bool has_metadata_address = false;
+    bool has_metadata_port = false;
+    bool has_storage_address = false;
+    bool has_storage_port = false;
+
+    for (int index = 2; index < argc; ++index) {
+        const std::string_view arg{argv[index]};
+
+        if (arg == "--help") {
+            print_gc_usage(std::cout);
+            std::exit(0);
+        }
+
+        if (!arg.empty() && arg[0] != '-') {
+            throw CliUsageError{"positional arguments are not supported after gc"};
+        }
+
+        if (arg == "--storage-node-id") {
+            require_unset(has_storage_node_id, "--storage-node-id");
+            has_storage_node_id = true;
+            storage_node_id = std::string{next_arg(argc, argv, index, "--storage-node-id")};
+            continue;
+        }
+
+        if (arg == "--gc-run-id") {
+            require_unset(has_gc_run_id, "--gc-run-id");
+            has_gc_run_id = true;
+            const auto value = next_arg(argc, argv, index, "--gc-run-id");
+            try {
+                gc_run_id.emplace(std::string{value});
+            } catch (const std::invalid_argument& error) {
+                throw CliUsageError{error.what()};
+            }
+            continue;
+        }
+
+        if (arg == "--dry-run") {
+            require_unset(has_dry_run, "--dry-run");
+            has_dry_run = true;
+            dry_run = true;
+            continue;
+        }
+
+        if (arg == "--metadata-address") {
+            require_unset(has_metadata_address, "--metadata-address");
+            has_metadata_address = true;
+            metadata_address = std::string{next_arg(argc, argv, index, "--metadata-address")};
+            continue;
+        }
+
+        if (arg == "--metadata-port") {
+            require_unset(has_metadata_port, "--metadata-port");
+            has_metadata_port = true;
+            metadata_port = parse_port(next_arg(argc, argv, index, "--metadata-port"), "--metadata-port");
+            continue;
+        }
+
+        if (arg == "--storage-address") {
+            require_unset(has_storage_address, "--storage-address");
+            has_storage_address = true;
+            storage_address = std::string{next_arg(argc, argv, index, "--storage-address")};
+            continue;
+        }
+
+        if (arg == "--storage-port") {
+            require_unset(has_storage_port, "--storage-port");
+            has_storage_port = true;
+            storage_port = parse_port(next_arg(argc, argv, index, "--storage-port"), "--storage-port");
+            continue;
+        }
+
+        throw CliUsageError{std::string{"unknown option "} + std::string{arg}};
+    }
+
+    if (!has_storage_node_id) {
+        throw CliUsageError{"--storage-node-id is required"};
+    }
+
+    validate_storage_node_id(storage_node_id);
+    validate_numeric_ip(metadata_address, "--metadata-address");
+    validate_numeric_ip(storage_address, "--storage-address");
+
+    if (!gc_run_id.has_value()) {
+        gc_run_id = aistore::metadata::UuidV7::generate();
+    }
+
+    return GcOptions{
+        .gc_run_id = std::move(*gc_run_id),
+        .storage_node_id = std::move(storage_node_id),
+        .dry_run = dry_run,
+        .metadata_address = std::move(metadata_address),
+        .metadata_port = metadata_port,
+        .storage_address = std::move(storage_address),
+        .storage_port = storage_port,
+    };
+}
+
 [[nodiscard]] bool creation_identity_matches(const aistore::metadata::UploadSession& requested,
                                              const aistore::metadata::UploadSession& existing) {
     if (existing.artifact_id() != requested.artifact_id() || existing.target_node_id() != requested.target_node_id() ||
@@ -725,6 +869,28 @@ void emit_pull_success_json(const aistore::pull::PullResult& result) {
     body["chunks_downloaded"] = result.stats.chunks_downloaded;
     body["chunks_reused_from_partial"] = result.stats.chunks_reused_from_partial;
     body["bytes_received_from_storage"] = result.stats.bytes_received_from_storage;
+
+    std::cout << boost::json::serialize(body) << '\n';
+}
+
+void emit_gc_success_json(std::string_view storage_node_id, const aistore::metadata::GcRun& run) {
+    const bool is_dry_run = run.mode == aistore::metadata::GcRunMode::DryRun;
+
+    boost::json::object body;
+    body["status"] = is_dry_run ? "gc_dry_run" : "gc_completed";
+    body["gc_run_id"] = run.run_id.str();
+    body["storage_node_id"] = storage_node_id;
+    body["dry_run"] = is_dry_run;
+    body["physical_chunks_scanned"] = run.physical_stats.physical_chunks_scanned;
+    body["physical_bytes_scanned"] = run.physical_stats.physical_bytes_scanned;
+    body["collectible_chunks"] = run.physical_stats.collectible_chunks;
+    body["collectible_bytes"] = run.physical_stats.collectible_bytes;
+    body["physically_deleted_chunks"] = run.physical_stats.physically_deleted_chunks;
+    body["physically_deleted_bytes"] = run.physical_stats.physically_deleted_bytes;
+    body["storage_locations_swept"] = run.metadata_stats.storage_locations_swept;
+    body["chunk_rows_swept"] = run.metadata_stats.chunk_rows_swept;
+    body["object_layouts_swept"] = run.metadata_stats.object_layouts_swept;
+    body["objects_swept"] = run.metadata_stats.objects_swept;
 
     std::cout << boost::json::serialize(body) << '\n';
 }
@@ -846,6 +1012,48 @@ void emit_pull_success_json(const aistore::pull::PullResult& result) {
     }
 }
 
+[[nodiscard]] int run_gc(const GcOptions& options) {
+    const aistore::metadata::UuidV7& gc_run_id = options.gc_run_id;
+
+    try {
+        aistore::client::MetadataClient metadata_client{aistore::http::HttpClientConfig{
+            .endpoint =
+                aistore::http::HttpEndpoint{
+                    .address = options.metadata_address,
+                    .port = options.metadata_port,
+                },
+        }};
+
+        aistore::client::StorageNodeClient storage_client{aistore::http::HttpClientConfig{
+            .endpoint =
+                aistore::http::HttpEndpoint{
+                    .address = options.storage_address,
+                    .port = options.storage_port,
+                },
+        }};
+
+        aistore::gc::GcEngine gc_engine{metadata_client, storage_client, options.storage_node_id};
+
+        const aistore::metadata::GcRun result = gc_engine.collect(aistore::gc::GcRequest{
+            .run_id = gc_run_id,
+            .dry_run = options.dry_run,
+        });
+
+        emit_gc_success_json(options.storage_node_id, result);
+        return 0;
+    } catch (const aistore::client::RemoteApiError& error) {
+        std::cerr << "aistore gc error:\n"
+                  << "HTTP status " << error.status_code() << '\n'
+                  << "remote error_code " << error.error_code() << '\n';
+        std::cerr << "gc_run_id=" << gc_run_id.str() << '\n' << "resume with --gc-run-id " << gc_run_id.str() << '\n';
+        return 1;
+    } catch (const std::exception& error) {
+        std::cerr << "aistore gc error: " << error.what() << '\n';
+        std::cerr << "gc_run_id=" << gc_run_id.str() << '\n' << "resume with --gc-run-id " << gc_run_id.str() << '\n';
+        return 1;
+    }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -881,6 +1089,17 @@ int main(int argc, char** argv) {
             } catch (const CliUsageError& error) {
                 std::cerr << "aistore: " << error.what() << '\n';
                 print_pull_usage(std::cerr);
+                return 2;
+            }
+        }
+
+        if (command == "gc") {
+            try {
+                const GcOptions options = parse_gc_options(argc, argv);
+                return run_gc(options);
+            } catch (const CliUsageError& error) {
+                std::cerr << "aistore: " << error.what() << '\n';
+                print_gc_usage(std::cerr);
                 return 2;
             }
         }

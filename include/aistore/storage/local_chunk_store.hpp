@@ -2,12 +2,25 @@
 #define AISTORE_STORAGE_LOCAL_CHUNK_STORE_HPP
 
 #include <cstddef>
+#include <cstdint>
 #include <filesystem>
+#include <optional>
 #include <span>
+#include <string>
 #include <string_view>
 #include <vector>
 
 namespace aistore::storage {
+
+struct StoredChunkInfo {
+    std::string chunk_id;
+    std::uint64_t size_bytes;
+};
+
+struct StoredChunkPage {
+    std::vector<StoredChunkInfo> chunks;
+    std::optional<std::string> next_after;
+};
 
 class LocalChunkStore {
    public:
@@ -18,6 +31,10 @@ class LocalChunkStore {
     [[nodiscard]] std::vector<std::byte> get(std::string_view chunk_id) const;
 
     [[nodiscard]] bool contains(std::string_view chunk_id) const;
+
+    [[nodiscard]] bool remove(std::string_view chunk_id);
+
+    [[nodiscard]] StoredChunkPage list_chunks(std::optional<std::string_view> after, std::size_t limit) const;
 
     [[nodiscard]] const std::filesystem::path& root_directory() const noexcept;
 

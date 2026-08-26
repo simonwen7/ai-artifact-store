@@ -8,6 +8,7 @@
 #include <map>
 #include <optional>
 #include <pqxx/pqxx>
+#include <set>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -17,6 +18,7 @@
 #include <vector>
 
 #include "aistore/metadata/chunking.hpp"
+#include "aistore/metadata/gc.hpp"
 #include "aistore/metadata/restore_plan.hpp"
 
 namespace aistore::metadata {
@@ -286,6 +288,106 @@ UploadSessionState upload_session_state_from_string(std::string_view state) {
     }
 
     throw std::runtime_error("database contains an unsupported upload session state");
+}
+
+constexpr std::string_view kLiveLayoutPredicate = R"(
+    (
+        EXISTS (
+            SELECT 1
+            FROM artifact_versions av
+            WHERE av.root_object_id = ol.object_id
+        )
+        OR EXISTS (
+            SELECT 1
+            FROM upload_session_finalizations usf
+            WHERE usf.layout_id = ol.layout_id
+        )
+    )
+)";
+
+void acquire_gc_coordination_advisory_lock(pqxx::work& transaction) {
+    (void)transaction.exec("SELECT pg_advisory_xact_lock($1)", pqxx::params{
+                                                                   kGcCoordinationAdvisoryLockKey,
+                                                               });
+}
+
+[[nodiscard]] bool gc_run_has_zero_stats(const GcRun& run) {
+    const GcPhysicalStats& physical = run.physical_stats;
+    const GcMetadataStats& metadata = run.metadata_stats;
+
+    return physical.physical_chunks_scanned == 0U && physical.physical_bytes_scanned == 0U &&
+           physical.collectible_chunks == 0U && physical.collectible_bytes == 0U &&
+           physical.physically_deleted_chunks == 0U && physical.physically_deleted_bytes == 0U &&
+           metadata.storage_locations_swept == 0U && metadata.chunk_rows_swept == 0U &&
+           metadata.object_layouts_swept == 0U && metadata.objects_swept == 0U;
+}
+
+void validate_gc_run_start_request(const GcRun& requested_run) {
+    if (requested_run.state != GcRunState::Open) {
+        throw std::invalid_argument("start_gc_run requires an open GC run state");
+    }
+
+    validate_source_node_id(requested_run.target_node_id);
+
+    if (!gc_run_has_zero_stats(requested_run)) {
+        throw std::invalid_argument("start_gc_run requires zero stats");
+    }
+}
+
+[[nodiscard]] GcRun reconstruct_gc_run_from_row(std::string run_id, std::string target_node_id, const std::string& mode,
+                                                const std::string& state, long long physical_chunks_scanned,
+                                                long long physical_bytes_scanned, long long collectible_chunks,
+                                                long long collectible_bytes, long long physically_deleted_chunks,
+                                                long long physically_deleted_bytes, long long storage_locations_swept,
+                                                long long chunk_rows_swept, long long object_layouts_swept,
+                                                long long objects_swept) {
+    auto require_non_negative = [](long long value, std::string_view field_name) -> std::uint64_t {
+        if (value < 0) {
+            throw std::runtime_error(std::string{field_name} + " is negative in stored GC run");
+        }
+
+        return static_cast<std::uint64_t>(value);
+    };
+
+    return GcRun{
+        .run_id =
+            UuidV7{
+                std::move(run_id),
+            },
+        .target_node_id = std::move(target_node_id),
+        .mode = gc_run_mode_from_string(mode),
+        .state = gc_run_state_from_string(state),
+        .physical_stats =
+            GcPhysicalStats{
+                .physical_chunks_scanned = require_non_negative(physical_chunks_scanned, "physical_chunks_scanned"),
+                .physical_bytes_scanned = require_non_negative(physical_bytes_scanned, "physical_bytes_scanned"),
+                .collectible_chunks = require_non_negative(collectible_chunks, "collectible_chunks"),
+                .collectible_bytes = require_non_negative(collectible_bytes, "collectible_bytes"),
+                .physically_deleted_chunks =
+                    require_non_negative(physically_deleted_chunks, "physically_deleted_chunks"),
+                .physically_deleted_bytes = require_non_negative(physically_deleted_bytes, "physically_deleted_bytes"),
+            },
+        .metadata_stats =
+            GcMetadataStats{
+                .storage_locations_swept = require_non_negative(storage_locations_swept, "storage_locations_swept"),
+                .chunk_rows_swept = require_non_negative(chunk_rows_swept, "chunk_rows_swept"),
+                .object_layouts_swept = require_non_negative(object_layouts_swept, "object_layouts_swept"),
+                .objects_swept = require_non_negative(objects_swept, "objects_swept"),
+            },
+    };
+}
+
+void ensure_no_open_upload_sessions(pqxx::work& transaction) {
+    const bool open_upload_sessions_present = transaction.query_value<bool>(
+        "SELECT EXISTS ("
+        "    SELECT 1 "
+        "    FROM upload_sessions "
+        "    WHERE state = 'open'"
+        ")");
+
+    if (open_upload_sessions_present) {
+        throw GcError{GcErrorKind::OpenUploadSessionsPresent, "open upload sessions are present"};
+    }
 }
 
 }  // namespace
@@ -1355,6 +1457,19 @@ class PostgresMetadataRepository::Impl {
 
         pqxx::work transaction{connection_};
 
+        acquire_gc_coordination_advisory_lock(transaction);
+
+        const bool gc_in_progress = transaction.query_value<bool>(
+            "SELECT EXISTS ("
+            "    SELECT 1 "
+            "    FROM gc_runs "
+            "    WHERE state = 'open'"
+            ")");
+
+        if (gc_in_progress) {
+            throw GcError{GcErrorKind::GcInProgress, "garbage collection is in progress"};
+        }
+
         const std::optional<long long> chunk_size_param =
             session.fixed_chunk_size_bytes().has_value()
                 ? std::optional<long long>{to_postgres_bigint(*session.fixed_chunk_size_bytes(),
@@ -1905,6 +2020,236 @@ class PostgresMetadataRepository::Impl {
         };
     }
 
+    [[nodiscard]] GcRun start_gc_run(const GcRun& requested_run) {
+        validate_gc_run_start_request(requested_run);
+
+        pqxx::work transaction{connection_};
+
+        acquire_gc_coordination_advisory_lock(transaction);
+
+        const auto existing = load_gc_run(transaction, requested_run.run_id);
+
+        if (existing.has_value()) {
+            if (existing->target_node_id == requested_run.target_node_id && existing->mode == requested_run.mode) {
+                transaction.commit();
+                return *existing;
+            }
+
+            throw GcError{GcErrorKind::RunConflict, "GC run ID conflicts with an existing run"};
+        }
+
+        const bool another_open_run = transaction.query_value<bool>(
+            "SELECT EXISTS ("
+            "    SELECT 1 "
+            "    FROM gc_runs "
+            "    WHERE state = 'open'"
+            ")");
+
+        if (another_open_run) {
+            throw GcError{GcErrorKind::AnotherRunOpen, "another GC run is already open"};
+        }
+
+        ensure_no_open_upload_sessions(transaction);
+
+        transaction
+            .exec(
+                "INSERT INTO gc_runs ("
+                "    run_id, "
+                "    target_node_id, "
+                "    mode, "
+                "    state"
+                ") "
+                "VALUES ("
+                "    $1::uuid, "
+                "    $2, "
+                "    $3, "
+                "    $4"
+                ")",
+                pqxx::params{
+                    requested_run.run_id.str(),
+                    requested_run.target_node_id,
+                    gc_run_mode_to_string(requested_run.mode),
+                    gc_run_state_to_string(requested_run.state),
+                })
+            .no_rows();
+
+        const auto loaded = load_gc_run(transaction, requested_run.run_id);
+
+        if (!loaded.has_value()) {
+            throw std::runtime_error("GC run disappeared immediately after insert");
+        }
+
+        transaction.commit();
+
+        return *loaded;
+    }
+
+    [[nodiscard]] std::optional<GcRun> get_gc_run(const UuidV7& run_id) {
+        pqxx::work transaction{connection_};
+
+        const auto loaded = load_gc_run(transaction, run_id);
+
+        transaction.commit();
+
+        return loaded;
+    }
+
+    [[nodiscard]] std::vector<GcChunkDecision> classify_gc_chunks(const UuidV7& run_id,
+                                                                  const std::vector<std::string>& chunk_ids) {
+        if (chunk_ids.empty() || chunk_ids.size() > 256U) {
+            throw std::invalid_argument("classify_gc_chunks requires 1 to 256 chunk IDs");
+        }
+
+        std::set<std::string_view> unique_chunk_ids;
+
+        for (const std::string& chunk_id : chunk_ids) {
+            validate_chunk_id(chunk_id);
+
+            if (!unique_chunk_ids.insert(chunk_id).second) {
+                throw std::invalid_argument("classify_gc_chunks requires unique chunk IDs");
+            }
+        }
+
+        pqxx::work transaction{connection_};
+
+        const auto run = load_gc_run(transaction, run_id);
+
+        if (!run.has_value()) {
+            throw GcError{GcErrorKind::RunNotFound, "GC run does not exist"};
+        }
+
+        if (run->state != GcRunState::Open) {
+            throw GcError{GcErrorKind::RunNotOpen, "GC run is not open"};
+        }
+
+        std::vector<GcChunkDecision> decisions;
+        decisions.reserve(chunk_ids.size());
+
+        const std::string collectible_sql =
+            std::string{
+                "SELECT NOT EXISTS ("
+                "    SELECT 1 "
+                "    FROM object_layout_chunks olc "
+                "    INNER JOIN object_layouts ol ON ol.layout_id = olc.layout_id "
+                "    WHERE olc.chunk_id = $1 "
+                "      AND ",
+            } +
+            std::string{kLiveLayoutPredicate} + ")";
+
+        for (const std::string& chunk_id : chunk_ids) {
+            const bool collectible = transaction.query_value<bool>(collectible_sql, pqxx::params{chunk_id});
+
+            decisions.push_back(GcChunkDecision{
+                .chunk_id = chunk_id,
+                .collectible = collectible,
+            });
+        }
+
+        transaction.commit();
+
+        return decisions;
+    }
+
+    [[nodiscard]] GcRun complete_gc_run(const UuidV7& run_id, const GcPhysicalStats& physical_stats) {
+        pqxx::work transaction{connection_};
+
+        acquire_gc_coordination_advisory_lock(transaction);
+
+        const pqxx::result locked_run = transaction.exec(
+            "SELECT "
+            "    run_id::text, "
+            "    target_node_id, "
+            "    mode, "
+            "    state, "
+            "    physical_chunks_scanned, "
+            "    physical_bytes_scanned, "
+            "    collectible_chunks, "
+            "    collectible_bytes, "
+            "    physically_deleted_chunks, "
+            "    physically_deleted_bytes, "
+            "    storage_locations_swept, "
+            "    chunk_rows_swept, "
+            "    object_layouts_swept, "
+            "    objects_swept "
+            "FROM gc_runs "
+            "WHERE run_id = $1::uuid "
+            "FOR UPDATE",
+            pqxx::params{
+                run_id.str(),
+            });
+
+        if (locked_run.empty()) {
+            throw GcError{GcErrorKind::RunNotFound, "GC run does not exist"};
+        }
+
+        const pqxx::row row{locked_run[0]};
+
+        GcRun stored_run = reconstruct_gc_run_from_row(
+            row[0].as<std::string>(), row[1].as<std::string>(), row[2].as<std::string>(), row[3].as<std::string>(),
+            row[4].as<long long>(), row[5].as<long long>(), row[6].as<long long>(), row[7].as<long long>(),
+            row[8].as<long long>(), row[9].as<long long>(), row[10].as<long long>(), row[11].as<long long>(),
+            row[12].as<long long>(), row[13].as<long long>());
+
+        if (stored_run.state == GcRunState::Completed) {
+            transaction.commit();
+            return stored_run;
+        }
+
+        if (stored_run.state != GcRunState::Open) {
+            throw GcError{GcErrorKind::RunNotOpen, "GC run is not open"};
+        }
+
+        ensure_no_open_upload_sessions(transaction);
+
+        const GcMetadataStats metadata_stats =
+            stored_run.mode == GcRunMode::DryRun
+                ? count_gc_metadata_sweep_candidates(transaction, stored_run.target_node_id)
+                : sweep_gc_metadata(transaction, stored_run.target_node_id);
+
+        transaction
+            .exec(
+                "UPDATE gc_runs "
+                "SET "
+                "    physical_chunks_scanned = $2, "
+                "    physical_bytes_scanned = $3, "
+                "    collectible_chunks = $4, "
+                "    collectible_bytes = $5, "
+                "    physically_deleted_chunks = $6, "
+                "    physically_deleted_bytes = $7, "
+                "    storage_locations_swept = $8, "
+                "    chunk_rows_swept = $9, "
+                "    object_layouts_swept = $10, "
+                "    objects_swept = $11, "
+                "    state = 'completed', "
+                "    completed_at = CURRENT_TIMESTAMP, "
+                "    updated_at = CURRENT_TIMESTAMP "
+                "WHERE run_id = $1::uuid",
+                pqxx::params{
+                    run_id.str(),
+                    to_postgres_bigint(physical_stats.physical_chunks_scanned, "physical_chunks_scanned"),
+                    to_postgres_bigint(physical_stats.physical_bytes_scanned, "physical_bytes_scanned"),
+                    to_postgres_bigint(physical_stats.collectible_chunks, "collectible_chunks"),
+                    to_postgres_bigint(physical_stats.collectible_bytes, "collectible_bytes"),
+                    to_postgres_bigint(physical_stats.physically_deleted_chunks, "physically_deleted_chunks"),
+                    to_postgres_bigint(physical_stats.physically_deleted_bytes, "physically_deleted_bytes"),
+                    to_postgres_bigint(metadata_stats.storage_locations_swept, "storage_locations_swept"),
+                    to_postgres_bigint(metadata_stats.chunk_rows_swept, "chunk_rows_swept"),
+                    to_postgres_bigint(metadata_stats.object_layouts_swept, "object_layouts_swept"),
+                    to_postgres_bigint(metadata_stats.objects_swept, "objects_swept"),
+                })
+            .no_rows();
+
+        const auto completed = load_gc_run(transaction, run_id);
+
+        if (!completed.has_value()) {
+            throw std::runtime_error("GC run disappeared immediately after completion");
+        }
+
+        transaction.commit();
+
+        return *completed;
+    }
+
    private:
     using StoredUploadSessionRow =
         std::tuple<std::string, std::string, std::string, std::string, std::optional<long long>,
@@ -2372,6 +2717,172 @@ class PostgresMetadataRepository::Impl {
         return descriptor;
     }
 
+    [[nodiscard]] std::optional<GcRun> load_gc_run(pqxx::work& transaction, const UuidV7& run_id) {
+        auto stored =
+            transaction.query01<std::string, std::string, std::string, std::string, long long, long long, long long,
+                                long long, long long, long long, long long, long long, long long, long long>(
+                "SELECT "
+                "    run_id::text, "
+                "    target_node_id, "
+                "    mode, "
+                "    state, "
+                "    physical_chunks_scanned, "
+                "    physical_bytes_scanned, "
+                "    collectible_chunks, "
+                "    collectible_bytes, "
+                "    physically_deleted_chunks, "
+                "    physically_deleted_bytes, "
+                "    storage_locations_swept, "
+                "    chunk_rows_swept, "
+                "    object_layouts_swept, "
+                "    objects_swept "
+                "FROM gc_runs "
+                "WHERE run_id = $1::uuid",
+                pqxx::params{
+                    run_id.str(),
+                });
+
+        if (!stored.has_value()) {
+            return std::nullopt;
+        }
+
+        auto [stored_run_id, target_node_id, mode, state, physical_chunks_scanned, physical_bytes_scanned,
+              collectible_chunks, collectible_bytes, physically_deleted_chunks, physically_deleted_bytes,
+              storage_locations_swept, chunk_rows_swept, object_layouts_swept, objects_swept] = std::move(*stored);
+
+        return reconstruct_gc_run_from_row(
+            std::move(stored_run_id), std::move(target_node_id), mode, state, physical_chunks_scanned,
+            physical_bytes_scanned, collectible_chunks, collectible_bytes, physically_deleted_chunks,
+            physically_deleted_bytes, storage_locations_swept, chunk_rows_swept, object_layouts_swept, objects_swept);
+    }
+
+    [[nodiscard]] GcMetadataStats count_gc_metadata_sweep_candidates(pqxx::work& transaction,
+                                                                     std::string_view target_node_id) {
+        const auto storage_locations_swept = transaction.query_value<long long>(
+            std::string{
+                "SELECT COUNT(*) "
+                "FROM storage_locations sl "
+                "WHERE sl.node_id = $1 "
+                "  AND NOT EXISTS ("
+                "      SELECT 1 "
+                "      FROM object_layout_chunks olc "
+                "      INNER JOIN object_layouts ol ON ol.layout_id = olc.layout_id "
+                "      WHERE olc.chunk_id = sl.chunk_id "
+                "        AND ",
+            } + std::string{kLiveLayoutPredicate} +
+                "  )",
+            pqxx::params{
+                target_node_id,
+            });
+
+        const auto object_layouts_swept = transaction.query_value<long long>(std::string{
+                                                                                 "SELECT COUNT(*) "
+                                                                                 "FROM object_layouts ol "
+                                                                                 "WHERE NOT ",
+                                                                             } +
+                                                                             std::string{kLiveLayoutPredicate});
+
+        const auto objects_swept = transaction.query_value<long long>(
+            "SELECT COUNT(*) "
+            "FROM objects o "
+            "WHERE NOT EXISTS ("
+            "    SELECT 1 "
+            "    FROM artifact_versions av "
+            "    WHERE av.root_object_id = o.object_id"
+            ") "
+            "  AND NOT EXISTS ("
+            "    SELECT 1 "
+            "    FROM object_layouts ol "
+            "    WHERE ol.object_id = o.object_id"
+            ")");
+
+        const auto chunk_rows_swept = transaction.query_value<long long>(
+            "SELECT COUNT(*) "
+            "FROM chunks c "
+            "WHERE NOT EXISTS ("
+            "    SELECT 1 "
+            "    FROM object_layout_chunks olc "
+            "    WHERE olc.chunk_id = c.chunk_id"
+            ") "
+            "  AND NOT EXISTS ("
+            "    SELECT 1 "
+            "    FROM storage_locations sl "
+            "    WHERE sl.chunk_id = c.chunk_id"
+            ")");
+
+        auto require_non_negative = [](long long value, std::string_view field_name) -> std::uint64_t {
+            if (value < 0) {
+                throw std::runtime_error(std::string{field_name} + " count is negative");
+            }
+
+            return static_cast<std::uint64_t>(value);
+        };
+
+        return GcMetadataStats{
+            .storage_locations_swept = require_non_negative(storage_locations_swept, "storage_locations_swept"),
+            .chunk_rows_swept = require_non_negative(chunk_rows_swept, "chunk_rows_swept"),
+            .object_layouts_swept = require_non_negative(object_layouts_swept, "object_layouts_swept"),
+            .objects_swept = require_non_negative(objects_swept, "objects_swept"),
+        };
+    }
+
+    [[nodiscard]] GcMetadataStats sweep_gc_metadata(pqxx::work& transaction, std::string_view target_node_id) {
+        const pqxx::result storage_location_delete = transaction.exec(
+            std::string{
+                "DELETE FROM storage_locations sl "
+                "WHERE sl.node_id = $1 "
+                "  AND NOT EXISTS ("
+                "      SELECT 1 "
+                "      FROM object_layout_chunks olc "
+                "      INNER JOIN object_layouts ol ON ol.layout_id = olc.layout_id "
+                "      WHERE olc.chunk_id = sl.chunk_id "
+                "        AND ",
+            } + std::string{kLiveLayoutPredicate} +
+                "  )",
+            pqxx::params{
+                target_node_id,
+            });
+
+        const pqxx::result object_layout_delete = transaction.exec(std::string{
+                                                                       "DELETE FROM object_layouts ol "
+                                                                       "WHERE NOT ",
+                                                                   } +
+                                                                   std::string{kLiveLayoutPredicate});
+
+        const pqxx::result object_delete = transaction.exec(
+            "DELETE FROM objects o "
+            "WHERE NOT EXISTS ("
+            "    SELECT 1 "
+            "    FROM artifact_versions av "
+            "    WHERE av.root_object_id = o.object_id"
+            ") "
+            "  AND NOT EXISTS ("
+            "    SELECT 1 "
+            "    FROM object_layouts ol "
+            "    WHERE ol.object_id = o.object_id"
+            ")");
+
+        const pqxx::result chunk_delete = transaction.exec(
+            "DELETE FROM chunks c "
+            "WHERE NOT EXISTS ("
+            "    SELECT 1 "
+            "    FROM object_layout_chunks olc "
+            "    WHERE olc.chunk_id = c.chunk_id"
+            ") "
+            "  AND NOT EXISTS ("
+            "    SELECT 1 "
+            "    FROM storage_locations sl "
+            "    WHERE sl.chunk_id = c.chunk_id"
+            ")");
+
+        return GcMetadataStats{
+            .storage_locations_swept = static_cast<std::uint64_t>(storage_location_delete.affected_rows()),
+            .object_layouts_swept = static_cast<std::uint64_t>(object_layout_delete.affected_rows()),
+            .objects_swept = static_cast<std::uint64_t>(object_delete.affected_rows()),
+            .chunk_rows_swept = static_cast<std::uint64_t>(chunk_delete.affected_rows()),
+        };
+    }
+
     void verify_registered_object_layout(pqxx::work& transaction, const ObjectLayoutDescriptor& descriptor) {
         const ObjectLayout& layout = descriptor.layout();
 
@@ -2613,6 +3124,21 @@ FinalizeUploadResult PostgresMetadataRepository::finalize_upload(const UuidV7& s
 RestorePlan PostgresMetadataRepository::resolve_restore_plan(std::string_view version_id,
                                                              std::string_view source_node_id) {
     return impl_->resolve_restore_plan(version_id, source_node_id);
+}
+
+GcRun PostgresMetadataRepository::start_gc_run(const GcRun& requested_run) {
+    return impl_->start_gc_run(requested_run);
+}
+
+std::optional<GcRun> PostgresMetadataRepository::get_gc_run(const UuidV7& run_id) { return impl_->get_gc_run(run_id); }
+
+std::vector<GcChunkDecision> PostgresMetadataRepository::classify_gc_chunks(const UuidV7& run_id,
+                                                                            const std::vector<std::string>& chunk_ids) {
+    return impl_->classify_gc_chunks(run_id, chunk_ids);
+}
+
+GcRun PostgresMetadataRepository::complete_gc_run(const UuidV7& run_id, const GcPhysicalStats& physical_stats) {
+    return impl_->complete_gc_run(run_id, physical_stats);
 }
 
 }  // namespace aistore::metadata

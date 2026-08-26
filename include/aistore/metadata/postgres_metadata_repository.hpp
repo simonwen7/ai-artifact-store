@@ -10,6 +10,7 @@
 #include "aistore/metadata/artifact_model.hpp"
 #include "aistore/metadata/chunk_metadata.hpp"
 #include "aistore/metadata/finalize_upload.hpp"
+#include "aistore/metadata/gc.hpp"
 #include "aistore/metadata/manifest_model.hpp"
 #include "aistore/metadata/object.hpp"
 #include "aistore/metadata/object_layout_descriptor.hpp"
@@ -86,6 +87,15 @@ class PostgresMetadataRepository {
                                                        const ObjectLayoutDescriptor& descriptor);
 
     [[nodiscard]] RestorePlan resolve_restore_plan(std::string_view version_id, std::string_view source_node_id);
+
+    [[nodiscard]] GcRun start_gc_run(const GcRun& requested_run);
+
+    [[nodiscard]] std::optional<GcRun> get_gc_run(const UuidV7& run_id);
+
+    [[nodiscard]] std::vector<GcChunkDecision> classify_gc_chunks(const UuidV7& run_id,
+                                                                  const std::vector<std::string>& chunk_ids);
+
+    [[nodiscard]] GcRun complete_gc_run(const UuidV7& run_id, const GcPhysicalStats& physical_stats);
 
    private:
     class Impl;

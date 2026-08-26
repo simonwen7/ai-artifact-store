@@ -5,6 +5,8 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <optional>
 #include <pqxx/pqxx>
 #include <stdexcept>
@@ -12,6 +14,7 @@
 #include <vector>
 
 #include "aistore/metadata/finalize_upload.hpp"
+#include "aistore/metadata/gc.hpp"
 #include "aistore/metadata/restore_plan.hpp"
 
 namespace {
@@ -24,6 +27,12 @@ using aistore::metadata::ChunkRef;
 using aistore::metadata::FastCdcParameters;
 using aistore::metadata::FinalizeUploadError;
 using aistore::metadata::FinalizeUploadErrorKind;
+using aistore::metadata::GcError;
+using aistore::metadata::GcErrorKind;
+using aistore::metadata::GcPhysicalStats;
+using aistore::metadata::GcRun;
+using aistore::metadata::GcRunMode;
+using aistore::metadata::GcRunState;
 using aistore::metadata::Manifest;
 using aistore::metadata::Object;
 using aistore::metadata::ObjectLayout;
@@ -62,7 +71,49 @@ std::string test_database_connection_string() {
     return "dbname=ai_artifact_store_test";
 }
 
+void ensure_gc_migration_applied() {
+    pqxx::connection connection{
+        test_database_connection_string(),
+    };
+
+    {
+        pqxx::nontransaction check{connection};
+
+        const bool migration_applied = check.query_value<bool>(
+            "SELECT EXISTS ("
+            "    SELECT 1 "
+            "    FROM schema_migrations "
+            "    WHERE version = 8 "
+            "      AND name = 'garbage_collection'"
+            ")");
+
+        if (migration_applied) {
+            return;
+        }
+    }
+
+    const std::filesystem::path migration_path =
+        std::filesystem::path{__FILE__}.parent_path().parent_path().parent_path() / "migrations" /
+        "008_garbage_collection.sql";
+
+    std::ifstream migration_file{migration_path};
+
+    if (!migration_file.is_open()) {
+        throw std::runtime_error("failed to open migration 008 for garbage collection tests");
+    }
+
+    std::string migration_sql{
+        std::istreambuf_iterator<char>{migration_file},
+        std::istreambuf_iterator<char>{},
+    };
+
+    pqxx::nontransaction apply{connection};
+    apply.exec(migration_sql);
+}
+
 void reset_metadata_data() {
+    ensure_gc_migration_applied();
+
     pqxx::connection connection{
         test_database_connection_string(),
     };
@@ -82,6 +133,7 @@ void reset_metadata_data() {
             "    upload_session_finalizations, "
             "    upload_session_metadata, "
             "    upload_sessions, "
+            "    gc_runs, "
             "    artifact_versions, "
             "    object_layout_chunks, "
             "    object_layouts, "
@@ -2735,6 +2787,285 @@ TEST(PostgresMetadataRepositoryTest, FinalizeRejectsFastCdcDescriptorThatDoesNot
     register_finalize_chunks(repository, descriptor, "m6-fastcdc-target", StorageLocationState::Available);
 
     EXPECT_THROW((void)repository.finalize_upload(session_id, descriptor), std::invalid_argument);
+}
+
+GcRun make_open_gc_run(const UuidV7& run_id, std::string target_node_id, GcRunMode mode = GcRunMode::Apply) {
+    return GcRun{
+        .run_id = run_id,
+        .target_node_id = std::move(target_node_id),
+        .mode = mode,
+        .state = GcRunState::Open,
+    };
+}
+
+void register_gc_chunk(PostgresMetadataRepository& repository, std::string_view chunk_id, std::string_view node_id) {
+    if (!repository.get_chunk_size(chunk_id).has_value()) {
+        repository.register_chunks({ChunkMetadata{.chunk_id = std::string{chunk_id}, .size_bytes = 3}});
+    }
+
+    repository.register_storage_location(StorageLocation{
+        .chunk_id = std::string{chunk_id},
+        .node_id = std::string{node_id},
+        .storage_path = std::string{"/gc/"} + std::string{chunk_id},
+        .state = StorageLocationState::Available,
+    });
+}
+
+ObjectLayoutDescriptor make_gc_layout(char object_marker, char first_chunk_marker, char second_chunk_marker) {
+    return ObjectLayoutDescriptor{
+        Object{std::string(64, object_marker), 6},
+        ChunkingStrategy::FixedSize,
+        ObjectLayout{{
+            ChunkRef{.chunk_id = std::string(64, first_chunk_marker), .offset = 0, .size = 3},
+            ChunkRef{.chunk_id = std::string(64, second_chunk_marker), .offset = 3, .size = 3},
+        }},
+    };
+}
+
+const std::string kGcSharedChunk(64, 'a');
+const std::string kGcLiveOnlyChunk(64, 'b');
+const std::string kGcDeadOnlyChunk(64, 'c');
+const std::string kGcUntrackedChunk(64, 'd');
+const std::string kGcDryRunChunkA(64, 'e');
+const std::string kGcDryRunChunkB(64, 'f');
+const std::string kGcRetryChunk(64, '0');
+
+void register_live_gc_layout(PostgresMetadataRepository& repository, const UuidV7& artifact_id,
+                             const ObjectLayoutDescriptor& descriptor, std::string marker) {
+    repository.create_artifact(Artifact{artifact_id, "gc-" + marker, "gc-tests"});
+    repository.register_object(descriptor.object());
+    repository.register_object_layout(descriptor);
+    repository.create_version(ArtifactVersion{
+        artifact_id,
+        descriptor.object_id(),
+        std::nullopt,
+        ArtifactVersion::ImmutableMetadata{{"marker", std::move(marker)}},
+        VersionState::Committed,
+    });
+}
+
+void register_dead_gc_layout(PostgresMetadataRepository& repository, const ObjectLayoutDescriptor& descriptor) {
+    repository.register_object(descriptor.object());
+    repository.register_object_layout(descriptor);
+}
+
+TEST(PostgresMetadataRepositoryTest, StartsGcOnlyWhenNoOpenUploadSessions) {
+    reset_metadata_data();
+    PostgresMetadataRepository repository{test_database_connection_string()};
+    const UuidV7 artifact_id = UuidV7::generate();
+    const UuidV7 session_id = UuidV7::generate();
+    const UuidV7 gc_run_id = UuidV7::generate();
+
+    repository.create_artifact(Artifact{artifact_id, "gc-open-session-" + session_id.str(), "gc-tests"});
+    repository.create_upload_session(UploadSession{
+        session_id,
+        artifact_id,
+        "gc-node-a",
+        ChunkingStrategy::FixedSize,
+        4,
+        std::nullopt,
+        UploadSession::ImmutableMetadata{},
+        UploadSessionState::Open,
+        std::nullopt,
+    });
+
+    try {
+        (void)repository.start_gc_run(make_open_gc_run(gc_run_id, "gc-node-a"));
+        FAIL() << "expected GcError";
+    } catch (const GcError& error) {
+        EXPECT_EQ(error.kind(), GcErrorKind::OpenUploadSessionsPresent);
+    }
+
+    repository.abort_upload_session(session_id);
+
+    const GcRun started = repository.start_gc_run(make_open_gc_run(gc_run_id, "gc-node-a"));
+    EXPECT_EQ(started.run_id, gc_run_id);
+    EXPECT_EQ(started.state, GcRunState::Open);
+}
+
+TEST(PostgresMetadataRepositoryTest, CreateUploadSessionIsRejectedDuringOpenGc) {
+    reset_metadata_data();
+    PostgresMetadataRepository repository{test_database_connection_string()};
+    const UuidV7 artifact_id = UuidV7::generate();
+    const UuidV7 session_id = UuidV7::generate();
+    const UuidV7 gc_run_id = UuidV7::generate();
+
+    (void)repository.start_gc_run(make_open_gc_run(gc_run_id, "gc-node-a"));
+
+    repository.create_artifact(Artifact{artifact_id, "gc-in-progress-" + session_id.str(), "gc-tests"});
+
+    try {
+        repository.create_upload_session(UploadSession{
+            session_id,
+            artifact_id,
+            "gc-node-a",
+            ChunkingStrategy::FixedSize,
+            4,
+            std::nullopt,
+            UploadSession::ImmutableMetadata{},
+            UploadSessionState::Open,
+            std::nullopt,
+        });
+        FAIL() << "expected GcError";
+    } catch (const GcError& error) {
+        EXPECT_EQ(error.kind(), GcErrorKind::GcInProgress);
+    }
+}
+
+TEST(PostgresMetadataRepositoryTest, StartingSameGcRunIsIdempotent) {
+    reset_metadata_data();
+    PostgresMetadataRepository repository{test_database_connection_string()};
+    const UuidV7 gc_run_id = UuidV7::generate();
+
+    const GcRun first = repository.start_gc_run(make_open_gc_run(gc_run_id, "gc-node-a", GcRunMode::DryRun));
+    const GcRun second = repository.start_gc_run(make_open_gc_run(gc_run_id, "gc-node-a", GcRunMode::DryRun));
+
+    EXPECT_EQ(first.run_id, second.run_id);
+    EXPECT_EQ(first.target_node_id, second.target_node_id);
+    EXPECT_EQ(first.mode, second.mode);
+    EXPECT_EQ(first.state, second.state);
+}
+
+TEST(PostgresMetadataRepositoryTest, ClassifiesLiveSharedAndUntrackedPhysicalChunks) {
+    reset_metadata_data();
+    PostgresMetadataRepository repository{test_database_connection_string()};
+    const UuidV7 artifact_id = UuidV7::generate();
+    const UuidV7 gc_run_id = UuidV7::generate();
+    const std::string shared_chunk = kGcSharedChunk;
+    const std::string live_only_chunk = kGcLiveOnlyChunk;
+    const std::string untracked_chunk = kGcUntrackedChunk;
+    const auto live_layout = make_gc_layout('1', 'a', 'b');
+    const auto dead_layout = make_gc_layout('2', 'a', 'c');
+
+    register_live_gc_layout(repository, artifact_id, live_layout, UuidV7::generate().str());
+    register_dead_gc_layout(repository, dead_layout);
+
+    (void)repository.start_gc_run(make_open_gc_run(gc_run_id, "gc-node-a"));
+
+    const auto decisions = repository.classify_gc_chunks(gc_run_id, {live_only_chunk, shared_chunk, untracked_chunk});
+
+    ASSERT_EQ(decisions.size(), 3U);
+    EXPECT_EQ(decisions[0].chunk_id, live_only_chunk);
+    EXPECT_FALSE(decisions[0].collectible);
+    EXPECT_EQ(decisions[1].chunk_id, shared_chunk);
+    EXPECT_FALSE(decisions[1].collectible);
+    EXPECT_EQ(decisions[2].chunk_id, untracked_chunk);
+    EXPECT_TRUE(decisions[2].collectible);
+}
+
+TEST(PostgresMetadataRepositoryTest, ClassifiesChunkReferencedOnlyByDeadLayoutAsCollectible) {
+    reset_metadata_data();
+    PostgresMetadataRepository repository{test_database_connection_string()};
+    const UuidV7 gc_run_id = UuidV7::generate();
+    const std::string dead_only_chunk = kGcDeadOnlyChunk;
+    const auto dead_layout = make_gc_layout('9', 'c', 'e');
+
+    register_dead_gc_layout(repository, dead_layout);
+
+    (void)repository.start_gc_run(make_open_gc_run(gc_run_id, "gc-node-a"));
+
+    const auto decisions = repository.classify_gc_chunks(gc_run_id, {dead_only_chunk});
+
+    ASSERT_EQ(decisions.size(), 1U);
+    EXPECT_TRUE(decisions[0].collectible);
+}
+
+TEST(PostgresMetadataRepositoryTest, DryRunCompletionDoesNotSweepMetadata) {
+    reset_metadata_data();
+    PostgresMetadataRepository repository{test_database_connection_string()};
+    const UuidV7 gc_run_id = UuidV7::generate();
+    const auto dead_layout = make_gc_layout('8', 'e', 'f');
+
+    register_dead_gc_layout(repository, dead_layout);
+    register_gc_chunk(repository, kGcDryRunChunkA, "gc-node-a");
+    register_gc_chunk(repository, kGcDryRunChunkB, "gc-node-a");
+
+    (void)repository.start_gc_run(make_open_gc_run(gc_run_id, "gc-node-a", GcRunMode::DryRun));
+
+    const GcPhysicalStats physical_stats{
+        .physical_chunks_scanned = 2,
+        .physical_bytes_scanned = 8,
+        .collectible_chunks = 2,
+        .collectible_bytes = 8,
+    };
+
+    const GcRun completed = repository.complete_gc_run(gc_run_id, physical_stats);
+
+    EXPECT_EQ(completed.state, GcRunState::Completed);
+    EXPECT_EQ(completed.mode, GcRunMode::DryRun);
+    EXPECT_GT(completed.metadata_stats.storage_locations_swept, 0U);
+    EXPECT_GT(completed.metadata_stats.object_layouts_swept, 0U);
+    EXPECT_TRUE(repository.get_object_layout(dead_layout.layout_id()).has_value());
+    EXPECT_TRUE(repository.get_chunk_size(kGcDryRunChunkA).has_value());
+}
+
+TEST(PostgresMetadataRepositoryTest, ApplyCompletionSweepsDeadRepresentationsAndPreservesLiveData) {
+    reset_metadata_data();
+    PostgresMetadataRepository repository{test_database_connection_string()};
+    const UuidV7 artifact_id = UuidV7::generate();
+    const UuidV7 gc_run_id = UuidV7::generate();
+    const std::string shared_chunk = kGcSharedChunk;
+    const std::string live_only_chunk = kGcLiveOnlyChunk;
+    const std::string dead_only_chunk = kGcDeadOnlyChunk;
+    const auto live_layout = make_gc_layout('1', 'a', 'b');
+    const auto dead_layout = make_gc_layout('2', 'a', 'c');
+
+    register_live_gc_layout(repository, artifact_id, live_layout, UuidV7::generate().str());
+    register_dead_gc_layout(repository, dead_layout);
+    register_gc_chunk(repository, shared_chunk, "gc-node-a");
+    register_gc_chunk(repository, live_only_chunk, "gc-node-a");
+    register_gc_chunk(repository, dead_only_chunk, "gc-node-a");
+
+    (void)repository.start_gc_run(make_open_gc_run(gc_run_id, "gc-node-a"));
+
+    const GcRun completed = repository.complete_gc_run(gc_run_id, GcPhysicalStats{});
+
+    EXPECT_EQ(completed.state, GcRunState::Completed);
+    EXPECT_EQ(completed.mode, GcRunMode::Apply);
+    EXPECT_GE(completed.metadata_stats.storage_locations_swept, 1U);
+    EXPECT_GE(completed.metadata_stats.object_layouts_swept, 1U);
+    EXPECT_TRUE(repository.get_object_layout(live_layout.layout_id()).has_value());
+    EXPECT_FALSE(repository.get_object_layout(dead_layout.layout_id()).has_value());
+    EXPECT_TRUE(repository.get_chunk_size(shared_chunk).has_value());
+    EXPECT_TRUE(repository.get_chunk_size(live_only_chunk).has_value());
+    EXPECT_FALSE(repository.get_chunk_size(dead_only_chunk).has_value());
+
+    const auto shared_locations = repository.get_storage_locations(shared_chunk);
+    const auto dead_only_locations = repository.get_storage_locations(dead_only_chunk);
+
+    ASSERT_EQ(shared_locations.size(), 1U);
+    EXPECT_EQ(shared_locations.front().node_id, "gc-node-a");
+    EXPECT_TRUE(dead_only_locations.empty());
+}
+
+TEST(PostgresMetadataRepositoryTest, CompletedGcRetryReturnsStoredResult) {
+    reset_metadata_data();
+    PostgresMetadataRepository repository{test_database_connection_string()};
+    const UuidV7 gc_run_id = UuidV7::generate();
+    const auto dead_layout = make_gc_layout('7', '0', '1');
+
+    register_dead_gc_layout(repository, dead_layout);
+    register_gc_chunk(repository, kGcRetryChunk, "gc-node-a");
+
+    (void)repository.start_gc_run(make_open_gc_run(gc_run_id, "gc-node-a"));
+
+    const GcPhysicalStats physical_stats{
+        .physical_chunks_scanned = 1,
+        .physical_bytes_scanned = 4,
+        .collectible_chunks = 1,
+        .collectible_bytes = 4,
+        .physically_deleted_chunks = 1,
+        .physically_deleted_bytes = 4,
+    };
+
+    const GcRun first = repository.complete_gc_run(gc_run_id, physical_stats);
+    const GcRun second = repository.complete_gc_run(gc_run_id, GcPhysicalStats{});
+
+    EXPECT_EQ(first.run_id, second.run_id);
+    EXPECT_EQ(first.state, GcRunState::Completed);
+    EXPECT_EQ(second.state, GcRunState::Completed);
+    EXPECT_EQ(first.physical_stats, second.physical_stats);
+    EXPECT_EQ(first.metadata_stats, second.metadata_stats);
 }
 
 }  // namespace

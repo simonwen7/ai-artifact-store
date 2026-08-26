@@ -1,13 +1,13 @@
-#include "aistore/storage/local_chunk_store.hpp"
-
 #include <gtest/gtest.h>
 
+#include <aistore/storage/local_chunk_store.hpp>
 #include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -17,6 +17,7 @@
 namespace {
 
 using aistore::storage::LocalChunkStore;
+using aistore::storage::StoredChunkPage;
 
 constexpr std::string_view kAbcChunkId =
     "ba7816bf8f01cfea414140de5dae2223"
@@ -25,6 +26,10 @@ constexpr std::string_view kAbcChunkId =
 constexpr std::string_view kEmptyChunkId =
     "e3b0c44298fc1c149afbf4c8996fb924"
     "27ae41e4649b934ca495991b7852b855";
+
+constexpr std::string_view kDefChunkId =
+    "cb8379ac2098aa165029e3938a51da0b"
+    "cecfc008fd6795f401178647f96c5b34";
 
 std::span<const std::byte> as_bytes(std::string_view text) {
     return std::as_bytes(std::span{text.data(), text.size()});
@@ -127,6 +132,91 @@ TEST(LocalChunkStoreTest, DetectsCorruptionDuringRead) {
     }
 
     EXPECT_THROW(static_cast<void>(store.get(kAbcChunkId)), std::runtime_error);
+}
+
+TEST(LocalChunkStoreTest, RemoveDeletesExistingChunk) {
+    TemporaryDirectory temporary_directory;
+    LocalChunkStore store{temporary_directory.path()};
+
+    store.put(kAbcChunkId, as_bytes("abc"));
+
+    EXPECT_TRUE(store.contains(kAbcChunkId));
+
+    EXPECT_TRUE(store.remove(kAbcChunkId));
+
+    EXPECT_FALSE(store.contains(kAbcChunkId));
+
+    EXPECT_THROW(static_cast<void>(store.get(kAbcChunkId)), std::runtime_error);
+}
+
+TEST(LocalChunkStoreTest, RemoveMissingChunkIsIdempotent) {
+    TemporaryDirectory temporary_directory;
+    LocalChunkStore store{temporary_directory.path()};
+
+    EXPECT_FALSE(store.remove(kAbcChunkId));
+}
+
+TEST(LocalChunkStoreTest, ListsOnlyCanonicalStoredChunksInLexicalOrder) {
+    TemporaryDirectory temporary_directory;
+    LocalChunkStore store{temporary_directory.path()};
+
+    store.put(kEmptyChunkId, as_bytes(""));
+    store.put(kAbcChunkId, as_bytes("abc"));
+
+    const std::filesystem::path chunks_directory = temporary_directory.path() / "chunks";
+    const std::filesystem::path ba_fanout = chunks_directory / "ba";
+    const std::filesystem::path cb_fanout = chunks_directory / "cb";
+    std::filesystem::create_directories(cb_fanout);
+
+    std::filesystem::create_directories(ba_fanout / "nested-dir");
+    std::filesystem::create_directories(chunks_directory / "ZZ");
+    std::ofstream(ba_fanout / ".aistore-chunk-temp") << "temp";
+    std::ofstream(ba_fanout / "not-a-valid-chunk-filename") << "junk";
+    std::ofstream(ba_fanout / "BA00000000000000000000000000000000000000000000000000000000000000") << "uppercase";
+    std::ofstream(ba_fanout / "aa00000000000000000000000000000000000000000000000000000000000000") << "wrong-prefix";
+    std::ofstream(cb_fanout / "aa00000000000000000000000000000000000000000000000000000000000000") << "wrong-prefix";
+
+    std::filesystem::create_symlink(ba_fanout / std::string{kAbcChunkId}, ba_fanout / "symlink-chunk");
+
+    const StoredChunkPage page = store.list_chunks(std::nullopt, 256);
+
+    ASSERT_EQ(page.chunks.size(), 2U);
+    EXPECT_EQ(page.chunks[0].chunk_id, kAbcChunkId);
+    EXPECT_EQ(page.chunks[1].chunk_id, kEmptyChunkId);
+    EXPECT_EQ(page.chunks[0].size_bytes, 3U);
+    EXPECT_EQ(page.chunks[1].size_bytes, 0U);
+    EXPECT_FALSE(page.next_after.has_value());
+}
+
+TEST(LocalChunkStoreTest, InventoryPaginationIsExclusiveAndBounded) {
+    TemporaryDirectory temporary_directory;
+    LocalChunkStore store{temporary_directory.path()};
+
+    store.put(kAbcChunkId, as_bytes("abc"));
+    store.put(kDefChunkId, as_bytes("def"));
+    store.put(kEmptyChunkId, as_bytes(""));
+
+    const StoredChunkPage first_page = store.list_chunks(std::nullopt, 2);
+
+    ASSERT_EQ(first_page.chunks.size(), 2U);
+    EXPECT_EQ(first_page.chunks[0].chunk_id, kAbcChunkId);
+    EXPECT_EQ(first_page.chunks[1].chunk_id, kDefChunkId);
+    ASSERT_TRUE(first_page.next_after.has_value());
+    EXPECT_EQ(*first_page.next_after, kDefChunkId);
+
+    const StoredChunkPage second_page = store.list_chunks(kDefChunkId, 2);
+
+    ASSERT_EQ(second_page.chunks.size(), 1U);
+    EXPECT_EQ(second_page.chunks[0].chunk_id, kEmptyChunkId);
+    EXPECT_FALSE(second_page.next_after.has_value());
+
+    const StoredChunkPage third_page = store.list_chunks(kEmptyChunkId, 2);
+
+    EXPECT_TRUE(third_page.chunks.empty());
+    EXPECT_FALSE(third_page.next_after.has_value());
+
+    EXPECT_THROW(static_cast<void>(store.list_chunks(std::nullopt, 0)), std::invalid_argument);
+    EXPECT_THROW(static_cast<void>(store.list_chunks(std::nullopt, 257)), std::invalid_argument);
 }
 
 }  // namespace

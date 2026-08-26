@@ -11,6 +11,7 @@
 
 #include "aistore/client/client_error.hpp"
 #include "aistore/metadata/chunking.hpp"
+#include "aistore/metadata/gc.hpp"
 #include "aistore/metadata/object.hpp"
 #include "aistore/metadata/object_layout.hpp"
 #include "aistore/metadata/object_layout_descriptor.hpp"
@@ -402,6 +403,117 @@ constexpr std::uint64_t kPostgresBigintMax = static_cast<std::uint64_t>(std::num
     }
 
     return boost::json::serialize(body);
+}
+
+[[nodiscard]] aistore::metadata::GcRunState gc_run_state_from_string_strict(std::string_view state) {
+    if (state == "open") {
+        return aistore::metadata::GcRunState::Open;
+    }
+
+    if (state == "completed") {
+        return aistore::metadata::GcRunState::Completed;
+    }
+
+    throw RemoteProtocolError{"GC run state is invalid"};
+}
+
+[[nodiscard]] aistore::metadata::GcRun parse_gc_run_json(const std::string& body) {
+    boost::system::error_code parse_error;
+    const boost::json::value parsed = boost::json::parse(body, parse_error);
+
+    if (parse_error || !parsed.is_object()) {
+        throw RemoteProtocolError{"GC run response is not a JSON object"};
+    }
+
+    const boost::json::object& object = parsed.as_object();
+
+    if (!json_object_has_exact_keys(
+            object,
+            {"gc_run_id", "target_node_id", "dry_run", "state", "physical_chunks_scanned", "physical_bytes_scanned",
+             "collectible_chunks", "collectible_bytes", "physically_deleted_chunks", "physically_deleted_bytes",
+             "storage_locations_swept", "chunk_rows_swept", "object_layouts_swept", "objects_swept"})) {
+        throw RemoteProtocolError{"GC run response has unexpected fields"};
+    }
+
+    if (!object.at("gc_run_id").is_string() || !object.at("target_node_id").is_string() ||
+        !object.at("dry_run").is_bool() || !object.at("state").is_string()) {
+        throw RemoteProtocolError{"GC run response field types are invalid"};
+    }
+
+    const std::string target_node_id{object.at("target_node_id").as_string()};
+
+    if (!is_valid_node_id(target_node_id)) {
+        throw RemoteProtocolError{"GC run target_node_id is invalid"};
+    }
+
+    const std::optional<std::uint64_t> physical_chunks_scanned =
+        extract_nonnegative_uint64(object.at("physical_chunks_scanned"));
+    const std::optional<std::uint64_t> physical_bytes_scanned =
+        extract_nonnegative_uint64(object.at("physical_bytes_scanned"));
+    const std::optional<std::uint64_t> collectible_chunks = extract_nonnegative_uint64(object.at("collectible_chunks"));
+    const std::optional<std::uint64_t> collectible_bytes = extract_nonnegative_uint64(object.at("collectible_bytes"));
+    const std::optional<std::uint64_t> physically_deleted_chunks =
+        extract_nonnegative_uint64(object.at("physically_deleted_chunks"));
+    const std::optional<std::uint64_t> physically_deleted_bytes =
+        extract_nonnegative_uint64(object.at("physically_deleted_bytes"));
+    const std::optional<std::uint64_t> storage_locations_swept =
+        extract_nonnegative_uint64(object.at("storage_locations_swept"));
+    const std::optional<std::uint64_t> chunk_rows_swept = extract_nonnegative_uint64(object.at("chunk_rows_swept"));
+    const std::optional<std::uint64_t> object_layouts_swept =
+        extract_nonnegative_uint64(object.at("object_layouts_swept"));
+    const std::optional<std::uint64_t> objects_swept = extract_nonnegative_uint64(object.at("objects_swept"));
+
+    if (!physical_chunks_scanned.has_value() || !physical_bytes_scanned.has_value() ||
+        !collectible_chunks.has_value() || !collectible_bytes.has_value() || !physically_deleted_chunks.has_value() ||
+        !physically_deleted_bytes.has_value() || !storage_locations_swept.has_value() ||
+        !chunk_rows_swept.has_value() || !object_layouts_swept.has_value() || !objects_swept.has_value()) {
+        throw RemoteProtocolError{"GC run stats are invalid"};
+    }
+
+    try {
+        return aistore::metadata::GcRun{
+            .run_id = aistore::metadata::UuidV7{std::string{object.at("gc_run_id").as_string()}},
+            .target_node_id = target_node_id,
+            .mode = object.at("dry_run").as_bool() ? aistore::metadata::GcRunMode::DryRun
+                                                   : aistore::metadata::GcRunMode::Apply,
+            .state = gc_run_state_from_string_strict(std::string{object.at("state").as_string()}),
+            .physical_stats =
+                aistore::metadata::GcPhysicalStats{
+                    .physical_chunks_scanned = *physical_chunks_scanned,
+                    .physical_bytes_scanned = *physical_bytes_scanned,
+                    .collectible_chunks = *collectible_chunks,
+                    .collectible_bytes = *collectible_bytes,
+                    .physically_deleted_chunks = *physically_deleted_chunks,
+                    .physically_deleted_bytes = *physically_deleted_bytes,
+                },
+            .metadata_stats =
+                aistore::metadata::GcMetadataStats{
+                    .storage_locations_swept = *storage_locations_swept,
+                    .chunk_rows_swept = *chunk_rows_swept,
+                    .object_layouts_swept = *object_layouts_swept,
+                    .objects_swept = *objects_swept,
+                },
+        };
+    } catch (const RemoteProtocolError&) {
+        throw;
+    } catch (const std::exception&) {
+        throw RemoteProtocolError{"GC run response failed domain validation"};
+    }
+}
+
+void validate_gc_physical_stats(const aistore::metadata::GcPhysicalStats& physical_stats) {
+    const auto validate = [](std::uint64_t value, std::string_view field_name) {
+        if (value > kPostgresBigintMax) {
+            throw std::invalid_argument(std::string{field_name} + " is out of range");
+        }
+    };
+
+    validate(physical_stats.physical_chunks_scanned, "physical_chunks_scanned");
+    validate(physical_stats.physical_bytes_scanned, "physical_bytes_scanned");
+    validate(physical_stats.collectible_chunks, "collectible_chunks");
+    validate(physical_stats.collectible_bytes, "collectible_bytes");
+    validate(physical_stats.physically_deleted_chunks, "physically_deleted_chunks");
+    validate(physical_stats.physically_deleted_bytes, "physically_deleted_bytes");
 }
 
 }  // namespace
@@ -901,6 +1013,204 @@ void MetadataClient::register_storage_location(const aistore::metadata::StorageL
     if (status_code_of(response) != 204U) {
         throw_remote_api_error(response);
     }
+}
+
+aistore::metadata::GcRun MetadataClient::start_gc_run(const aistore::metadata::UuidV7& gc_run_id,
+                                                      std::string_view target_node_id, bool dry_run) const {
+    if (!is_valid_node_id(target_node_id)) {
+        throw std::invalid_argument("start_gc_run target_node_id is invalid");
+    }
+
+    const std::string body = boost::json::serialize(boost::json::object{
+        {"gc_run_id", gc_run_id.str()},
+        {"target_node_id", std::string{target_node_id}},
+        {"dry_run", dry_run},
+    });
+
+    const aistore::http::HttpClientResponse response =
+        http_client_.request(beast_http::verb::post, "/v1/gc-runs", body, "application/json");
+
+    if (status_code_of(response) != 200U) {
+        throw_remote_api_error(response);
+    }
+
+    aistore::metadata::GcRun run = parse_gc_run_json(response.body());
+
+    if (run.run_id != gc_run_id) {
+        throw RemoteProtocolError{"GC run response gc_run_id does not match request"};
+    }
+
+    if (run.target_node_id != target_node_id) {
+        throw RemoteProtocolError{"GC run response target_node_id does not match request"};
+    }
+
+    const aistore::metadata::GcRunMode expected_mode =
+        dry_run ? aistore::metadata::GcRunMode::DryRun : aistore::metadata::GcRunMode::Apply;
+
+    if (run.mode != expected_mode) {
+        throw RemoteProtocolError{"GC run response dry_run does not match request"};
+    }
+
+    return run;
+}
+
+std::optional<aistore::metadata::GcRun> MetadataClient::get_gc_run(const aistore::metadata::UuidV7& gc_run_id) const {
+    const std::string target = std::string{"/v1/gc-runs/"} + gc_run_id.str();
+    const aistore::http::HttpClientResponse response = http_client_.request(beast_http::verb::get, target);
+
+    const unsigned int status = status_code_of(response);
+
+    if (status == 200U) {
+        aistore::metadata::GcRun run = parse_gc_run_json(response.body());
+
+        if (run.run_id != gc_run_id) {
+            throw RemoteProtocolError{"GC run response gc_run_id does not match request"};
+        }
+
+        return run;
+    }
+
+    if (status == 404U && extract_error_code(response.body()) == "gc_run_not_found") {
+        return std::nullopt;
+    }
+
+    throw_remote_api_error(response);
+}
+
+std::vector<aistore::metadata::GcChunkDecision> MetadataClient::classify_gc_chunks(
+    const aistore::metadata::UuidV7& gc_run_id, const std::vector<std::string>& chunk_ids) const {
+    if (chunk_ids.empty() || chunk_ids.size() > kMaxNegotiationChunks) {
+        throw std::invalid_argument("classify_gc_chunks requires between 1 and 256 chunk IDs");
+    }
+
+    std::map<std::string, std::size_t> seen_chunk_ids;
+
+    for (const std::string& chunk_id : chunk_ids) {
+        if (!is_valid_chunk_id(chunk_id)) {
+            throw std::invalid_argument("classify_gc_chunks chunk_id must be 64 lowercase hex characters");
+        }
+
+        if (!seen_chunk_ids.emplace(chunk_id, seen_chunk_ids.size()).second) {
+            throw std::invalid_argument("classify_gc_chunks requires unique chunk IDs");
+        }
+    }
+
+    boost::json::array chunk_array;
+
+    for (const std::string& chunk_id : chunk_ids) {
+        chunk_array.emplace_back(chunk_id);
+    }
+
+    const std::string body = boost::json::serialize(boost::json::object{
+        {"chunk_ids", std::move(chunk_array)},
+    });
+    const std::string target = std::string{"/v1/gc-runs/"} + gc_run_id.str() + "/classify";
+    const aistore::http::HttpClientResponse response =
+        http_client_.request(beast_http::verb::post, target, body, "application/json");
+
+    if (status_code_of(response) != 200U) {
+        throw_remote_api_error(response);
+    }
+
+    boost::system::error_code parse_error;
+    const boost::json::value parsed = boost::json::parse(response.body(), parse_error);
+
+    if (parse_error || !parsed.is_object()) {
+        throw RemoteProtocolError{"GC classification response is not a JSON object"};
+    }
+
+    const boost::json::object& object = parsed.as_object();
+
+    if (object.size() != 2U || !object.contains("gc_run_id") || !object.contains("chunks") ||
+        !object.at("gc_run_id").is_string() || !object.at("chunks").is_array()) {
+        throw RemoteProtocolError{"GC classification response has unexpected fields"};
+    }
+
+    std::optional<aistore::metadata::UuidV7> response_gc_run_id;
+
+    try {
+        response_gc_run_id.emplace(std::string{object.at("gc_run_id").as_string()});
+    } catch (const std::invalid_argument&) {
+        throw RemoteProtocolError{"GC classification response gc_run_id is invalid"};
+    }
+
+    if (*response_gc_run_id != gc_run_id) {
+        throw RemoteProtocolError{"GC classification response gc_run_id does not match request"};
+    }
+
+    const boost::json::array& chunks = object.at("chunks").as_array();
+
+    if (chunks.size() != chunk_ids.size()) {
+        throw RemoteProtocolError{"GC classification response chunk count does not match request"};
+    }
+
+    std::vector<aistore::metadata::GcChunkDecision> decisions;
+    decisions.reserve(chunks.size());
+
+    for (std::size_t index = 0; index < chunks.size(); ++index) {
+        const boost::json::value& entry_value = chunks.at(index);
+
+        if (!entry_value.is_object()) {
+            throw RemoteProtocolError{"GC classification chunk entry is not an object"};
+        }
+
+        const boost::json::object& entry = entry_value.as_object();
+
+        if (entry.size() != 2U || !entry.contains("chunk_id") || !entry.contains("collectible") ||
+            !entry.at("chunk_id").is_string() || !entry.at("collectible").is_bool()) {
+            throw RemoteProtocolError{"GC classification chunk entry has unexpected fields"};
+        }
+
+        const std::string chunk_id{entry.at("chunk_id").as_string()};
+
+        if (chunk_id != chunk_ids.at(index)) {
+            throw RemoteProtocolError{"GC classification response chunk order does not match request"};
+        }
+
+        if (!is_valid_chunk_id(chunk_id)) {
+            throw RemoteProtocolError{"GC classification chunk_id is invalid"};
+        }
+
+        decisions.push_back(aistore::metadata::GcChunkDecision{
+            .chunk_id = chunk_id,
+            .collectible = entry.at("collectible").as_bool(),
+        });
+    }
+
+    return decisions;
+}
+
+aistore::metadata::GcRun MetadataClient::complete_gc_run(
+    const aistore::metadata::UuidV7& gc_run_id, const aistore::metadata::GcPhysicalStats& physical_stats) const {
+    validate_gc_physical_stats(physical_stats);
+
+    const std::string body = boost::json::serialize(boost::json::object{
+        {"physical_chunks_scanned", physical_stats.physical_chunks_scanned},
+        {"physical_bytes_scanned", physical_stats.physical_bytes_scanned},
+        {"collectible_chunks", physical_stats.collectible_chunks},
+        {"collectible_bytes", physical_stats.collectible_bytes},
+        {"physically_deleted_chunks", physical_stats.physically_deleted_chunks},
+        {"physically_deleted_bytes", physical_stats.physically_deleted_bytes},
+    });
+    const std::string target = std::string{"/v1/gc-runs/"} + gc_run_id.str() + "/complete";
+    const aistore::http::HttpClientResponse response =
+        http_client_.request(beast_http::verb::post, target, body, "application/json");
+
+    if (status_code_of(response) != 200U) {
+        throw_remote_api_error(response);
+    }
+
+    aistore::metadata::GcRun run = parse_gc_run_json(response.body());
+
+    if (run.run_id != gc_run_id) {
+        throw RemoteProtocolError{"GC run response gc_run_id does not match request"};
+    }
+
+    if (run.state != aistore::metadata::GcRunState::Completed) {
+        throw RemoteProtocolError{"GC run response state is not completed"};
+    }
+
+    return run;
 }
 
 }  // namespace aistore::client

@@ -3,14 +3,19 @@
 #include <fcntl.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <array>
 #include <cerrno>
 #include <cstddef>
+#include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <limits>
+#include <optional>
+#include <ranges>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <system_error>
 #include <utility>
 
@@ -158,6 +163,25 @@ std::filesystem::path create_temporary_file(const std::filesystem::path& directo
     return std::filesystem::path{mutable_pattern.data()};
 }
 
+bool is_lowercase_hex(std::string_view text) {
+    for (const char character : text) {
+        const bool is_digit = character >= '0' && character <= '9';
+        const bool is_lower_hex = character >= 'a' && character <= 'f';
+
+        if (!is_digit && !is_lower_hex) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+bool is_valid_fanout_directory_name(std::string_view name) { return name.size() == 2 && is_lowercase_hex(name); }
+
+bool is_valid_chunk_filename(std::string_view name) { return name.size() == 64 && is_lowercase_hex(name); }
+
+bool is_temporary_chunk_filename(std::string_view name) { return name.starts_with(".aistore-chunk-"); }
+
 }  // namespace
 
 LocalChunkStore::LocalChunkStore(std::filesystem::path root_directory) : root_directory_(std::move(root_directory)) {
@@ -254,6 +278,117 @@ bool LocalChunkStore::contains(std::string_view chunk_id) const {
     validate_chunk_id(chunk_id);
 
     return std::filesystem::is_regular_file(chunk_path(chunk_id));
+}
+
+bool LocalChunkStore::remove(std::string_view chunk_id) {
+    validate_chunk_id(chunk_id);
+
+    const std::filesystem::path path = chunk_path(chunk_id);
+
+    if (!std::filesystem::exists(path)) {
+        return false;
+    }
+
+    if (std::filesystem::is_symlink(path)) {
+        throw std::runtime_error("chunk path is a symlink; refusing to remove");
+    }
+
+    if (!std::filesystem::is_regular_file(path)) {
+        throw std::invalid_argument("chunk path exists but is not a regular file");
+    }
+
+    std::filesystem::remove(path);
+
+    return true;
+}
+
+StoredChunkPage LocalChunkStore::list_chunks(std::optional<std::string_view> after, std::size_t limit) const {
+    if (limit < 1 || limit > 256) {
+        throw std::invalid_argument("chunk inventory limit must be between 1 and 256");
+    }
+
+    if (after.has_value()) {
+        validate_chunk_id(*after);
+    }
+
+    StoredChunkPage page;
+
+    const std::filesystem::path chunks_directory = root_directory_ / "chunks";
+
+    if (!std::filesystem::exists(chunks_directory)) {
+        return page;
+    }
+
+    std::vector<StoredChunkInfo> discovered_chunks;
+
+    for (const std::filesystem::directory_entry& fanout_entry : std::filesystem::directory_iterator{chunks_directory}) {
+        if (!fanout_entry.is_directory() || fanout_entry.is_symlink()) {
+            continue;
+        }
+
+        const std::string fanout_name = fanout_entry.path().filename().string();
+
+        if (!is_valid_fanout_directory_name(fanout_name)) {
+            continue;
+        }
+
+        for (const std::filesystem::directory_entry& chunk_entry :
+             std::filesystem::directory_iterator{fanout_entry.path()}) {
+            const std::string filename = chunk_entry.path().filename().string();
+
+            if (is_temporary_chunk_filename(filename)) {
+                continue;
+            }
+
+            if (!is_valid_chunk_filename(filename)) {
+                continue;
+            }
+
+            if (filename.substr(0, 2) != fanout_name) {
+                continue;
+            }
+
+            if (chunk_entry.is_symlink()) {
+                continue;
+            }
+
+            if (!chunk_entry.is_regular_file()) {
+                continue;
+            }
+
+            const std::uintmax_t file_size = std::filesystem::file_size(chunk_entry.path());
+
+            if (file_size > static_cast<std::uintmax_t>(std::numeric_limits<std::uint64_t>::max())) {
+                throw std::runtime_error("chunk file size exceeds representable range");
+            }
+
+            discovered_chunks.push_back(
+                StoredChunkInfo{.chunk_id = filename, .size_bytes = static_cast<std::uint64_t>(file_size)});
+        }
+    }
+
+    std::ranges::sort(discovered_chunks, {}, &StoredChunkInfo::chunk_id);
+
+    std::size_t start_index = 0;
+
+    if (after.has_value()) {
+        const std::string after_chunk_id{*after};
+
+        while (start_index < discovered_chunks.size() && discovered_chunks[start_index].chunk_id <= after_chunk_id) {
+            ++start_index;
+        }
+    }
+
+    const std::size_t end_index = std::min(start_index + limit, discovered_chunks.size());
+
+    page.chunks.assign(discovered_chunks.begin() + static_cast<std::ptrdiff_t>(start_index),
+                       discovered_chunks.begin() + static_cast<std::ptrdiff_t>(end_index));
+
+    if (end_index < discovered_chunks.size() && !page.chunks.empty()) {
+        page.next_after = page.chunks.back().chunk_id;
+    }
+
+    return page;
 }
 
 const std::filesystem::path& LocalChunkStore::root_directory() const noexcept { return root_directory_; }

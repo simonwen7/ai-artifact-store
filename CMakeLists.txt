@@ -141,6 +141,7 @@ add_library(
     src/metadata/upload_session.cpp
     src/metadata/finalize_upload.cpp
     src/metadata/restore_plan.cpp
+    src/metadata/gc.cpp
     src/metadata/postgres_metadata_repository.cpp
 )
 
@@ -399,6 +400,46 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
     )
 endif()
 
+add_library(
+    aistore_gc
+    src/gc/gc_engine.cpp
+)
+
+target_include_directories(
+    aistore_gc
+    PUBLIC
+    ${PROJECT_SOURCE_DIR}/include
+)
+
+target_compile_features(
+    aistore_gc
+    PUBLIC
+    cxx_std_20
+)
+
+set_target_properties(
+    aistore_gc
+    PROPERTIES
+    CXX_EXTENSIONS OFF
+)
+
+target_link_libraries(
+    aistore_gc
+    PUBLIC
+    aistore_client
+    aistore_metadata
+)
+
+if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+    target_compile_options(
+        aistore_gc
+        PRIVATE
+        -Wall
+        -Wextra
+        -Wpedantic
+    )
+endif()
+
 add_executable(
     aistore
     apps/aistore-cli/main.cpp
@@ -421,6 +462,7 @@ target_link_libraries(
     PRIVATE
     aistore_push
     aistore_pull
+    aistore_gc
     aistore_client
     aistore_metadata
     Boost::json
@@ -828,6 +870,24 @@ if(BUILD_TESTING)
     )
 
     aistore_add_test(
+        aistore_metadata_service_gc_api_tests
+        tests/integration/metadata_service_gc_api_test.cpp
+    )
+
+    target_link_libraries(
+        aistore_metadata_service_gc_api_tests
+        PRIVATE
+        aistore_http
+        aistore_services
+        aistore_metadata
+        aistore_hashing
+        Boost::json
+        Boost::headers
+        Threads::Threads
+        libpqxx::pqxx
+    )
+
+    aistore_add_test(
         aistore_http_client_tests
         tests/integration/http_client_test.cpp
     )
@@ -943,6 +1003,27 @@ if(BUILD_TESTING)
         libpqxx::pqxx
     )
 
+    aistore_add_test(
+        aistore_gc_engine_tests
+        tests/integration/gc_engine_test.cpp
+    )
+
+    target_link_libraries(
+        aistore_gc_engine_tests
+        PRIVATE
+        aistore_gc
+        aistore_client
+        aistore_http
+        aistore_services
+        aistore_storage
+        aistore_hashing
+        aistore_metadata
+        Boost::json
+        Boost::headers
+        Threads::Threads
+        libpqxx::pqxx
+    )
+
     if(UNIX)
         add_test(
             NAME aistore_cli_push_process_e2e
@@ -990,6 +1071,22 @@ if(BUILD_TESTING)
             aistore_cli_fastcdc_process_e2e
             PROPERTIES
             TIMEOUT 120
+        )
+
+        add_test(
+            NAME aistore_cli_gc_process_e2e
+            COMMAND
+                bash
+                "${PROJECT_SOURCE_DIR}/tests/e2e/aistore_cli_gc_e2e.sh"
+                $<TARGET_FILE:aistore>
+                $<TARGET_FILE:aistore_metadata_service>
+                $<TARGET_FILE:aistore_storage_node>
+        )
+
+        set_tests_properties(
+            aistore_cli_gc_process_e2e
+            PROPERTIES
+            TIMEOUT 90
         )
     endif()
 endif()

@@ -38,6 +38,7 @@ using aistore::http::HttpServerConfig;
 using aistore::http::RequestHandler;
 using aistore::service::StorageNodeService;
 using aistore::storage::LocalChunkStore;
+using aistore::storage::StoredChunkPage;
 
 namespace beast_http = aistore::http::beast_http;
 
@@ -46,6 +47,14 @@ constexpr std::uint64_t kMaxBodyBytes = 8ULL * 1024ULL * 1024ULL;
 constexpr std::string_view kAbcChunkId =
     "ba7816bf8f01cfea414140de5dae2223"
     "b00361a396177a9cb410ff61f20015ad";
+
+constexpr std::string_view kEmptyChunkId =
+    "e3b0c44298fc1c149afbf4c8996fb924"
+    "27ae41e4649b934ca495991b7852b855";
+
+constexpr std::string_view kDefChunkId =
+    "cb8379ac2098aa165029e3938a51da0b"
+    "cecfc008fd6795f401178647f96c5b34";
 
 constexpr std::string_view kAbcBody = "abc";
 
@@ -257,6 +266,62 @@ TEST(StorageNodeClientTest, InvalidChunkIdIsRejectedBeforeNetwork) {
     }};
 
     EXPECT_THROW((void)client.has_chunk("not-a-chunk-id"), std::invalid_argument);
+}
+
+TEST(StorageNodeClientTest, ListChunksParsesStrictPagedInventory) {
+    StorageNodeClientFixture fixture;
+
+    fixture.client().put_chunk(kAbcChunkId, std::as_bytes(std::span{kAbcBody.data(), kAbcBody.size()}));
+    fixture.client().put_chunk(kDefChunkId, std::as_bytes(std::span{"def", 3}));
+    fixture.client().put_chunk(kEmptyChunkId, std::span<const std::byte>{});
+
+    const StoredChunkPage first_page = fixture.client().list_chunks(std::nullopt, 2);
+
+    ASSERT_EQ(first_page.chunks.size(), 2U);
+    EXPECT_EQ(first_page.chunks[0].chunk_id, kAbcChunkId);
+    EXPECT_EQ(first_page.chunks[0].size_bytes, 3U);
+    EXPECT_EQ(first_page.chunks[1].chunk_id, kDefChunkId);
+    ASSERT_TRUE(first_page.next_after.has_value());
+    EXPECT_EQ(*first_page.next_after, kDefChunkId);
+
+    const StoredChunkPage second_page = fixture.client().list_chunks(kDefChunkId, 2);
+
+    ASSERT_EQ(second_page.chunks.size(), 1U);
+    EXPECT_EQ(second_page.chunks[0].chunk_id, kEmptyChunkId);
+    EXPECT_FALSE(second_page.next_after.has_value());
+}
+
+TEST(StorageNodeClientTest, DeleteChunkReturnsServerDeletedFlag) {
+    StorageNodeClientFixture fixture;
+
+    const auto bytes = std::as_bytes(std::span{kAbcBody.data(), kAbcBody.size()});
+    fixture.client().put_chunk(kAbcChunkId, bytes);
+
+    EXPECT_TRUE(fixture.client().delete_chunk(kAbcChunkId));
+    EXPECT_FALSE(fixture.client().has_chunk(kAbcChunkId));
+
+    const std::string missing = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+    EXPECT_FALSE(fixture.client().delete_chunk(missing));
+}
+
+TEST(StorageNodeClientTest, RejectsMalformedInventorySuccessfulResponse) {
+    RunningHttpServer server{[](const HttpRequest& request) {
+        HttpResponse response{beast_http::status::ok, request.version()};
+        response.set(beast_http::field::content_type, "application/json");
+        response.body() = R"({"chunks":[],"unexpected":"field"})";
+        response.prepare_payload();
+        return response;
+    }};
+
+    StorageNodeClient client{HttpClientConfig{
+        .endpoint =
+            HttpEndpoint{
+                .address = "127.0.0.1",
+                .port = server.port(),
+            },
+    }};
+
+    EXPECT_THROW((void)client.list_chunks(std::nullopt, 128), RemoteProtocolError);
 }
 
 }  // namespace

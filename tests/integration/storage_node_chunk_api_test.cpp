@@ -51,6 +51,10 @@ constexpr std::string_view kEmptyChunkId =
     "e3b0c44298fc1c149afbf4c8996fb924"
     "27ae41e4649b934ca495991b7852b855";
 
+constexpr std::string_view kDefChunkId =
+    "cb8379ac2098aa165029e3938a51da0b"
+    "cecfc008fd6795f401178647f96c5b34";
+
 constexpr std::string_view kAbcBody = "abc";
 
 class TemporaryDirectory {
@@ -211,6 +215,21 @@ boost::json::object parse_json_object(const HttpResponse& response) {
     return parsed.as_object();
 }
 
+[[nodiscard]] std::uint64_t json_uint64(const boost::json::value& value) {
+    if (value.is_uint64()) {
+        return value.as_uint64();
+    }
+
+    if (value.is_int64()) {
+        const std::int64_t signed_value = value.as_int64();
+        EXPECT_GE(signed_value, 0);
+        return static_cast<std::uint64_t>(signed_value);
+    }
+
+    ADD_FAILURE() << "expected JSON integer";
+    return 0;
+}
+
 TEST(StorageNodeChunkApiTest, PutAndGetVerifiedChunkOverHttp) {
     StorageNodeChunkApiFixture fixture;
 
@@ -338,7 +357,7 @@ TEST(StorageNodeChunkApiTest, ChunkRouteRejectsUnsupportedMethod) {
     const HttpResponse post_response = http_exchange(fixture.port(), beast_http::verb::post, chunk_target(kAbcChunkId));
 
     EXPECT_EQ(post_response.result(), beast_http::status::method_not_allowed);
-    EXPECT_EQ(post_response[beast_http::field::allow], "GET, HEAD, PUT");
+    EXPECT_EQ(post_response[beast_http::field::allow], "GET, HEAD, PUT, DELETE");
 
     const boost::json::object body = parse_json_object(post_response);
 
@@ -397,6 +416,136 @@ TEST(StorageNodeChunkApiTest, CorruptedStoredChunkIsNeverServed) {
 
     EXPECT_EQ(get_response.result(), beast_http::status::internal_server_error);
     EXPECT_EQ(get_response.body(), "internal server error");
+}
+
+TEST(StorageNodeChunkApiTest, ListChunksReturnsPagedInventory) {
+    StorageNodeChunkApiFixture fixture;
+
+    const HttpResponse abc_put = http_exchange(fixture.port(), beast_http::verb::put, chunk_target(kAbcChunkId),
+                                               std::string{"abc"}, "application/octet-stream");
+    const HttpResponse def_put = http_exchange(fixture.port(), beast_http::verb::put, chunk_target(kDefChunkId),
+                                               std::string{"def"}, "application/octet-stream");
+    const HttpResponse empty_put = http_exchange(fixture.port(), beast_http::verb::put, chunk_target(kEmptyChunkId),
+                                                 std::string{}, "application/octet-stream");
+
+    ASSERT_EQ(abc_put.result(), beast_http::status::no_content);
+    ASSERT_EQ(def_put.result(), beast_http::status::no_content);
+    ASSERT_EQ(empty_put.result(), beast_http::status::no_content);
+
+    const HttpResponse first_page = http_exchange(fixture.port(), beast_http::verb::get, "/v1/chunks?limit=2");
+
+    ASSERT_EQ(first_page.result(), beast_http::status::ok);
+    EXPECT_NE(first_page[beast_http::field::content_type].find("application/json"), std::string_view::npos);
+
+    const boost::json::object first_body = parse_json_object(first_page);
+
+    ASSERT_TRUE(first_body.contains("chunks"));
+    ASSERT_TRUE(first_body.contains("next_after"));
+    ASSERT_TRUE(first_body.at("chunks").is_array());
+    ASSERT_TRUE(first_body.at("next_after").is_string());
+    ASSERT_EQ(first_body.at("chunks").as_array().size(), 2U);
+    EXPECT_EQ(first_body.at("chunks").as_array()[0].at("chunk_id").as_string(), kAbcChunkId);
+    EXPECT_EQ(json_uint64(first_body.at("chunks").as_array()[0].at("size_bytes")), 3U);
+    EXPECT_EQ(first_body.at("chunks").as_array()[1].at("chunk_id").as_string(), kDefChunkId);
+    EXPECT_EQ(first_body.at("next_after").as_string(), kDefChunkId);
+
+    const HttpResponse second_page =
+        http_exchange(fixture.port(), beast_http::verb::get,
+                      std::string{"/v1/chunks?after="} + std::string{kDefChunkId} + "&limit=2");
+
+    ASSERT_EQ(second_page.result(), beast_http::status::ok);
+
+    const boost::json::object second_body = parse_json_object(second_page);
+
+    ASSERT_EQ(second_body.at("chunks").as_array().size(), 1U);
+    EXPECT_EQ(second_body.at("chunks").as_array()[0].at("chunk_id").as_string(), kEmptyChunkId);
+    EXPECT_TRUE(second_body.at("next_after").is_null());
+
+    const HttpResponse default_page = http_exchange(fixture.port(), beast_http::verb::get, "/v1/chunks");
+
+    ASSERT_EQ(default_page.result(), beast_http::status::ok);
+
+    const boost::json::object default_body = parse_json_object(default_page);
+
+    ASSERT_EQ(default_body.at("chunks").as_array().size(), 3U);
+    EXPECT_TRUE(default_body.at("next_after").is_null());
+}
+
+TEST(StorageNodeChunkApiTest, DeleteChunkRemovesExistingCasFile) {
+    StorageNodeChunkApiFixture fixture;
+
+    const HttpResponse put_response = http_exchange(fixture.port(), beast_http::verb::put, chunk_target(kAbcChunkId),
+                                                    std::string{kAbcBody}, "application/octet-stream");
+
+    ASSERT_EQ(put_response.result(), beast_http::status::no_content);
+
+    const std::filesystem::path cas_path =
+        fixture.storage_root() / "chunks" / std::string{kAbcChunkId.substr(0, 2)} / std::string{kAbcChunkId};
+
+    ASSERT_TRUE(std::filesystem::exists(cas_path));
+
+    const HttpResponse delete_response =
+        http_exchange(fixture.port(), beast_http::verb::delete_, chunk_target(kAbcChunkId));
+
+    ASSERT_EQ(delete_response.result(), beast_http::status::ok);
+
+    const boost::json::object body = parse_json_object(delete_response);
+
+    EXPECT_EQ(body.at("chunk_id").as_string(), kAbcChunkId);
+    EXPECT_TRUE(body.at("deleted").as_bool());
+    EXPECT_FALSE(std::filesystem::exists(cas_path));
+    EXPECT_FALSE(fixture.chunk_store().contains(kAbcChunkId));
+}
+
+TEST(StorageNodeChunkApiTest, DeleteMissingChunkIsIdempotent) {
+    StorageNodeChunkApiFixture fixture;
+
+    const std::string missing_id(64, 'f');
+
+    const HttpResponse delete_response =
+        http_exchange(fixture.port(), beast_http::verb::delete_, chunk_target(missing_id));
+
+    ASSERT_EQ(delete_response.result(), beast_http::status::ok);
+
+    const boost::json::object body = parse_json_object(delete_response);
+
+    EXPECT_EQ(body.at("chunk_id").as_string(), missing_id);
+    EXPECT_FALSE(body.at("deleted").as_bool());
+}
+
+TEST(StorageNodeChunkApiTest, InventoryAndDeleteValidateRequestAndMethodContract) {
+    StorageNodeChunkApiFixture fixture;
+
+    const HttpResponse post_collection = http_exchange(fixture.port(), beast_http::verb::post, "/v1/chunks");
+
+    EXPECT_EQ(post_collection.result(), beast_http::status::method_not_allowed);
+    EXPECT_EQ(post_collection[beast_http::field::allow], "GET");
+
+    const boost::json::object post_body = parse_json_object(post_collection);
+
+    EXPECT_EQ(post_body.at("error").as_string(), "method_not_allowed");
+
+    const HttpResponse malformed_after =
+        http_exchange(fixture.port(), beast_http::verb::get, "/v1/chunks?after=not-a-valid-chunk-id");
+
+    EXPECT_EQ(malformed_after.result(), beast_http::status::bad_request);
+    EXPECT_EQ(parse_json_object(malformed_after).at("error").as_string(), "invalid_request");
+
+    const HttpResponse malformed_limit = http_exchange(fixture.port(), beast_http::verb::get, "/v1/chunks?limit=0");
+
+    EXPECT_EQ(malformed_limit.result(), beast_http::status::bad_request);
+    EXPECT_EQ(parse_json_object(malformed_limit).at("error").as_string(), "invalid_request");
+
+    const HttpResponse unknown_query = http_exchange(fixture.port(), beast_http::verb::get, "/v1/chunks?cursor=abc");
+
+    EXPECT_EQ(unknown_query.result(), beast_http::status::bad_request);
+    EXPECT_EQ(parse_json_object(unknown_query).at("error").as_string(), "invalid_request");
+
+    const HttpResponse malformed_delete =
+        http_exchange(fixture.port(), beast_http::verb::delete_, "/v1/chunks/not-a-valid-chunk-id");
+
+    EXPECT_EQ(malformed_delete.result(), beast_http::status::bad_request);
+    EXPECT_EQ(parse_json_object(malformed_delete).at("error").as_string(), "invalid_chunk_id");
 }
 
 }  // namespace

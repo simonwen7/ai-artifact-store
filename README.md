@@ -10,9 +10,9 @@ The project uses AI/ML workloads as the design context, while storage systems en
 
 ## Current Status
 
-**Milestone 6 — Content-Defined Chunking**
+**Milestone 7 — Garbage Collection**
 
-The local content-addressed core, metadata model, push path, pull/restore path, and FastCDC chunking dispatch are in place through M6:
+The local content-addressed core, metadata model, push path, pull/restore path, FastCDC chunking dispatch, and production garbage collection are in place through M7:
 
 - content-addressed local CAS
 - Object / immutable layout model
@@ -33,6 +33,9 @@ The local content-addressed core, metadata model, push path, pull/restore path, 
 - FixedSize chunking still supported
 - strategy-specific UploadSession identity and committed retry
 - pull without chunking flags (layout-driven restore)
+- production `aistore gc` with dry-run and resumable GC runs
+- physical CAS inventory and idempotent chunk deletion before metadata sweep
+- conservative Push-vs-GC mutual exclusion
 
 Fixed-size chunking remains the default and is fully supported. FastCDC improves deduplication when similar content shifts inside large artifacts because chunk boundaries follow content rather than fixed offsets.
 
@@ -41,6 +44,12 @@ Object IDs remain whole-object SHA-256 hashes and are independent of chunking st
 Pull does not require chunking flags; restore uses the committed layout descriptor.
 
 FastCDC CLI defaults: min 2 MiB, avg 4 MiB, max 8 MiB.
+
+M7 preserves every ArtifactVersion as a semantic GC root. GC does not implement version retention, TTL, or semantic deletion policy.
+
+GC refuses to start while any Open UploadSession exists. While a GcRun is Open, new UploadSessions are rejected; Pull and read-only restore APIs remain available.
+
+Physical collectible chunks are removed from the configured storage node before metadata orphan sweep on apply runs.
 
 Benchmarking and production performance tuning are future polish; no production benchmark claims are made here.
 
@@ -119,6 +128,50 @@ Interrupted pulls leave a resumable partial file beside the destination:
 
 Rerunning the same command resumes verified prefix bytes and continues downloading remaining chunks.
 
+### Garbage Collection
+
+`aistore gc` runs garbage collection against a configured storage node. It inventories physical CAS chunks, classifies reachability through metadata, deletes collectible physical bytes (apply mode), and sweeps orphaned metadata representations.
+
+Required flags:
+
+- `--storage-node-id` — storage node to inventory and collect from
+
+Optional flags:
+
+- `--gc-run-id` — resume a previously started GC run (UUIDv7)
+- `--dry-run` — inventory and classify without deleting physical bytes or sweeping metadata
+
+If `--gc-run-id` is omitted, a new UUIDv7 run ID is generated locally before starting.
+
+Example:
+
+```bash
+./build/aistore gc \
+  --storage-node-id node-1
+```
+
+Dry-run example:
+
+```bash
+./build/aistore gc \
+  --storage-node-id node-1 \
+  --dry-run
+```
+
+Resume after an interrupted apply run:
+
+```bash
+./build/aistore gc \
+  --storage-node-id node-1 \
+  --gc-run-id <uuidv7>
+```
+
+Every ArtifactVersion is a semantic GC root in M7. GC does not delete Artifacts, ArtifactVersions, or implement retention/TTL policy.
+
+GC refuses to start while any Open UploadSession exists. While a GcRun is Open, new UploadSessions are rejected. Pull remains available.
+
+Apply mode removes collectible physical chunks before metadata sweep.
+
 ## Technology
 
 - C++20
@@ -141,11 +194,11 @@ Additional dependencies are introduced only when required by a milestone.
 - Resumable transfers
 - Parallel data transfer
 - Content-defined chunking
-- Garbage collection
+- Garbage collection (M7)
 - Multi-node storage and replication
 - AI-workload-aware lifecycle policies
 
-Items such as GC, replication, multi-node placement, and AI lifecycle policies are planned and not claimed as implemented.
+Replication, multi-node placement, version retention/TTL, and AI lifecycle policies are planned and not claimed as implemented.
 
 ## Development Philosophy
 

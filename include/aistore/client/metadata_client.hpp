@@ -10,6 +10,7 @@
 #include "aistore/http/http_client.hpp"
 #include "aistore/metadata/chunk_metadata.hpp"
 #include "aistore/metadata/finalize_upload.hpp"
+#include "aistore/metadata/gc.hpp"
 #include "aistore/metadata/object_layout_descriptor.hpp"
 #include "aistore/metadata/restore_plan.hpp"
 #include "aistore/metadata/storage_location.hpp"
@@ -57,6 +58,17 @@ class MetadataClient {
                                                           const std::vector<metadata::ChunkMetadata>& chunks) const;
 
     void register_storage_location(const metadata::StorageLocation& location) const;
+
+    [[nodiscard]] metadata::GcRun start_gc_run(const metadata::UuidV7& gc_run_id, std::string_view target_node_id,
+                                               bool dry_run) const;
+
+    [[nodiscard]] std::optional<metadata::GcRun> get_gc_run(const metadata::UuidV7& gc_run_id) const;
+
+    [[nodiscard]] std::vector<metadata::GcChunkDecision> classify_gc_chunks(
+        const metadata::UuidV7& gc_run_id, const std::vector<std::string>& chunk_ids) const;
+
+    [[nodiscard]] metadata::GcRun complete_gc_run(const metadata::UuidV7& gc_run_id,
+                                                  const metadata::GcPhysicalStats& physical_stats) const;
 
    private:
     http::HttpClient http_client_;

@@ -24,6 +24,7 @@
 #include "aistore/metadata/chunk_metadata.hpp"
 #include "aistore/metadata/chunking.hpp"
 #include "aistore/metadata/finalize_upload.hpp"
+#include "aistore/metadata/gc.hpp"
 #include "aistore/metadata/object_layout_descriptor.hpp"
 #include "aistore/metadata/postgres_metadata_repository.hpp"
 #include "aistore/metadata/restore_plan.hpp"
@@ -50,6 +51,11 @@ using aistore::metadata::ChunkingStrategy;
 using aistore::metadata::ChunkMetadata;
 using aistore::metadata::ChunkRef;
 using aistore::metadata::FastCdcParameters;
+using aistore::metadata::GcChunkDecision;
+using aistore::metadata::GcPhysicalStats;
+using aistore::metadata::GcRun;
+using aistore::metadata::GcRunMode;
+using aistore::metadata::GcRunState;
 using aistore::metadata::Object;
 using aistore::metadata::ObjectLayout;
 using aistore::metadata::ObjectLayoutDescriptor;
@@ -140,6 +146,12 @@ class MetadataClientFixture : public ::testing::Test {
         artifact_id_ = UuidV7::generate();
         session_id_ = UuidV7::generate();
         repository_.emplace(test_database_connection_string());
+        {
+            pqxx::connection connection{test_database_connection_string()};
+            pqxx::work transaction{connection};
+            transaction.exec("DELETE FROM gc_runs WHERE target_node_id LIKE 'm4gc-%'").no_rows();
+            transaction.commit();
+        }
         repository_->create_artifact(
             Artifact{artifact_id_, std::string{"m4s3-artifact-"} + artifact_id_.str(), "m4s3-project"});
         service_.emplace(*repository_);
@@ -168,6 +180,10 @@ class MetadataClientFixture : public ::testing::Test {
         pqxx::connection connection{test_database_connection_string()};
         pqxx::work transaction{connection};
 
+        for (const UuidV7& gc_run_id : owned_gc_run_ids_) {
+            transaction.exec("DELETE FROM gc_runs WHERE run_id = $1::uuid", pqxx::params{gc_run_id.str()}).no_rows();
+        }
+
         transaction
             .exec(
                 "DELETE FROM upload_sessions "
@@ -177,6 +193,11 @@ class MetadataClientFixture : public ::testing::Test {
 
         transaction.exec("DELETE FROM artifact_versions WHERE artifact_id = $1::uuid", pqxx::params{artifact_id_.str()})
             .no_rows();
+
+        for (const std::string& object_id : owned_object_ids_) {
+            transaction.exec("DELETE FROM artifact_versions WHERE root_object_id = $1", pqxx::params{object_id})
+                .no_rows();
+        }
 
         for (const std::string& object_id : owned_object_ids_) {
             transaction
@@ -189,7 +210,8 @@ class MetadataClientFixture : public ::testing::Test {
             transaction.exec("DELETE FROM objects WHERE object_id = $1", pqxx::params{object_id}).no_rows();
         }
 
-        transaction.exec("DELETE FROM storage_locations WHERE node_id LIKE 'm4s3-%'").no_rows();
+        transaction.exec("DELETE FROM storage_locations WHERE node_id LIKE 'm4s3-%' OR node_id LIKE 'm4gc-%'")
+            .no_rows();
 
         for (const std::string& chunk_id : owned_chunk_ids_) {
             transaction
@@ -229,6 +251,8 @@ class MetadataClientFixture : public ::testing::Test {
     }
 
     void track_chunk(std::string chunk_id) { owned_chunk_ids_.push_back(std::move(chunk_id)); }
+
+    void track_gc_run(UuidV7 gc_run_id) { owned_gc_run_ids_.push_back(std::move(gc_run_id)); }
 
     [[nodiscard]] ArtifactVersion create_committed_version(const ObjectLayoutDescriptor& descriptor,
                                                            std::string_view source_node = "m4s3-target") {
@@ -302,6 +326,7 @@ class MetadataClientFixture : public ::testing::Test {
     UuidV7 session_id_{UuidV7::generate()};
     std::vector<std::string> owned_chunk_ids_;
     std::vector<std::string> owned_object_ids_;
+    std::vector<UuidV7> owned_gc_run_ids_;
     std::optional<PostgresMetadataRepository> repository_;
     std::optional<MetadataService> service_;
     std::optional<RunningHttpServer> server_;
@@ -777,6 +802,122 @@ TEST(MetadataClientStandaloneTest, GetRestorePlanValidatesArgumentsBeforeNetwork
 
     EXPECT_THROW((void)client.get_restore_plan("not-a-version-id", "m4s3-target"), std::invalid_argument);
     EXPECT_THROW((void)client.get_restore_plan(std::string(64, 'a'), "not a node"), std::invalid_argument);
+}
+
+TEST_F(MetadataClientFixture, GcLifecycleRoundTrip) {
+    const UuidV7 gc_run_id = UuidV7::generate();
+    track_gc_run(gc_run_id);
+
+    const GcRun started = client_->start_gc_run(gc_run_id, "m4gc-node-a", false);
+    EXPECT_EQ(started.run_id, gc_run_id);
+    EXPECT_EQ(started.target_node_id, "m4gc-node-a");
+    EXPECT_EQ(started.mode, GcRunMode::Apply);
+    EXPECT_EQ(started.state, GcRunState::Open);
+
+    const auto loaded = client_->get_gc_run(gc_run_id);
+    ASSERT_TRUE(loaded.has_value());
+    EXPECT_EQ(loaded->run_id, gc_run_id);
+    EXPECT_EQ(loaded->state, GcRunState::Open);
+
+    const GcPhysicalStats physical_stats{
+        .physical_chunks_scanned = 3,
+        .physical_bytes_scanned = 12,
+        .collectible_chunks = 2,
+        .collectible_bytes = 8,
+        .physically_deleted_chunks = 2,
+        .physically_deleted_bytes = 8,
+    };
+    const GcRun completed = client_->complete_gc_run(gc_run_id, physical_stats);
+
+    EXPECT_EQ(completed.run_id, gc_run_id);
+    EXPECT_EQ(completed.state, GcRunState::Completed);
+    EXPECT_EQ(completed.physical_stats, physical_stats);
+}
+
+TEST_F(MetadataClientFixture, GcClassificationParsesStrictly) {
+    const UuidV7 gc_run_id = UuidV7::generate();
+    track_gc_run(gc_run_id);
+
+    const std::string live_only_chunk(64, 'b');
+    const std::string shared_chunk(64, 'a');
+    const std::string untracked_chunk(64, 'd');
+
+    const ObjectLayoutDescriptor live_layout{
+        Object{std::string(64, '1'), 6},
+        ChunkingStrategy::FixedSize,
+        ObjectLayout{{
+            ChunkRef{.chunk_id = shared_chunk, .offset = 0, .size = 3},
+            ChunkRef{.chunk_id = live_only_chunk, .offset = 3, .size = 3},
+        }},
+    };
+    const ObjectLayoutDescriptor dead_layout{
+        Object{std::string(64, '2'), 6},
+        ChunkingStrategy::FixedSize,
+        ObjectLayout{{
+            ChunkRef{.chunk_id = shared_chunk, .offset = 0, .size = 3},
+            ChunkRef{.chunk_id = std::string(64, 'c'), .offset = 3, .size = 3},
+        }},
+    };
+
+    repository_->register_object(live_layout.object());
+    repository_->register_object_layout(live_layout);
+    repository_->create_version(ArtifactVersion{
+        artifact_id_,
+        live_layout.object_id(),
+        std::nullopt,
+        ArtifactVersion::ImmutableMetadata{{"marker", gc_run_id.str()}},
+        VersionState::Committed,
+    });
+    repository_->register_object(dead_layout.object());
+    repository_->register_object_layout(dead_layout);
+    owned_object_ids_.push_back(live_layout.object_id());
+    owned_object_ids_.push_back(dead_layout.object_id());
+
+    (void)client_->start_gc_run(gc_run_id, "m4gc-node-a", false);
+
+    const std::vector<GcChunkDecision> decisions =
+        client_->classify_gc_chunks(gc_run_id, {live_only_chunk, shared_chunk, untracked_chunk});
+
+    ASSERT_EQ(decisions.size(), 3U);
+    EXPECT_EQ(decisions[0].chunk_id, live_only_chunk);
+    EXPECT_FALSE(decisions[0].collectible);
+    EXPECT_EQ(decisions[1].chunk_id, shared_chunk);
+    EXPECT_FALSE(decisions[1].collectible);
+    EXPECT_EQ(decisions[2].chunk_id, untracked_chunk);
+    EXPECT_TRUE(decisions[2].collectible);
+}
+
+TEST(MetadataClientStandaloneTest, GcMalformedSuccessfulResponseIsRejected) {
+    const UuidV7 gc_run_id = UuidV7::generate();
+
+    RunningHttpServer server{[gc_run_id](const HttpRequest& request) {
+        if (request.target() == "/v1/gc-runs" && request.method() == beast_http::verb::post) {
+            HttpResponse response{beast_http::status::ok, request.version()};
+            response.set(beast_http::field::content_type, "application/json");
+            response.body() = boost::json::serialize(boost::json::object{
+                {"gc_run_id", gc_run_id.str()},
+                {"target_node_id", "m4gc-target"},
+                {"dry_run", false},
+                {"state", "open"},
+                {"physical_chunks_scanned", 0},
+                {"extra_field", "unexpected"},
+            });
+            response.prepare_payload();
+            return response;
+        }
+
+        HttpResponse response{beast_http::status::not_found, request.version()};
+        response.set(beast_http::field::content_type, "application/json");
+        response.body() = R"({"error":"not_found"})";
+        response.prepare_payload();
+        return response;
+    }};
+
+    MetadataClient client{HttpClientConfig{
+        .endpoint = HttpEndpoint{.address = "127.0.0.1", .port = server.port()},
+    }};
+
+    EXPECT_THROW((void)client.start_gc_run(gc_run_id, "m4gc-target", false), RemoteProtocolError);
 }
 
 }  // namespace

@@ -2,7 +2,9 @@
 
 #include <array>
 #include <boost/json.hpp>
+#include <charconv>
 #include <cstddef>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -16,8 +18,10 @@ namespace {
 
 namespace beast_http = aistore::http::beast_http;
 
+constexpr std::string_view kChunkCollectionPath = "/v1/chunks";
 constexpr std::string_view kChunkRoutePrefix = "/v1/chunks/";
 constexpr std::string_view kOctetStream = "application/octet-stream";
+constexpr std::size_t kDefaultChunkListLimit = 128U;
 
 aistore::http::HttpResponse make_json_response(const aistore::http::HttpRequest& request, beast_http::status status,
                                                const boost::json::value& body) {
@@ -83,6 +87,136 @@ aistore::http::HttpResponse make_empty_response(const aistore::http::HttpRequest
     return digest_to_hex(hasher.finalize());
 }
 
+[[nodiscard]] std::pair<std::string_view, std::string_view> split_path_and_query(std::string_view target) {
+    const std::size_t query_or_fragment = target.find_first_of("?#");
+
+    if (query_or_fragment == std::string_view::npos) {
+        return {target, {}};
+    }
+
+    return {target.substr(0, query_or_fragment), target.substr(query_or_fragment + 1U)};
+}
+
+[[nodiscard]] std::optional<std::size_t> parse_positive_size(std::string_view value) {
+    if (value.empty()) {
+        return std::nullopt;
+    }
+
+    std::size_t parsed = 0;
+    const auto [pointer, error_code] = std::from_chars(value.data(), value.data() + value.size(), parsed);
+
+    if (error_code != std::errc{} || pointer != value.data() + value.size()) {
+        return std::nullopt;
+    }
+
+    return parsed;
+}
+
+struct ChunkListQuery {
+    std::optional<std::string_view> after;
+    std::size_t limit{kDefaultChunkListLimit};
+};
+
+[[nodiscard]] std::optional<ChunkListQuery> parse_chunk_list_query(std::string_view query) {
+    ChunkListQuery parsed;
+
+    if (query.empty()) {
+        return parsed;
+    }
+
+    std::size_t start = 0;
+
+    while (start < query.size()) {
+        const std::size_t ampersand = query.find('&', start);
+        const std::string_view pair =
+            ampersand == std::string_view::npos ? query.substr(start) : query.substr(start, ampersand - start);
+
+        const std::size_t equals = pair.find('=');
+
+        if (equals == std::string_view::npos) {
+            return std::nullopt;
+        }
+
+        const std::string_view key = pair.substr(0, equals);
+        const std::string_view value = pair.substr(equals + 1U);
+
+        if (key == "after") {
+            if (parsed.after.has_value()) {
+                return std::nullopt;
+            }
+
+            if (!is_valid_chunk_id(value)) {
+                return std::nullopt;
+            }
+
+            parsed.after = value;
+        } else if (key == "limit") {
+            const std::optional<std::size_t> parsed_limit = parse_positive_size(value);
+
+            if (!parsed_limit.has_value() || *parsed_limit < 1U || *parsed_limit > 256U) {
+                return std::nullopt;
+            }
+
+            parsed.limit = *parsed_limit;
+        } else {
+            return std::nullopt;
+        }
+
+        if (ampersand == std::string_view::npos) {
+            break;
+        }
+
+        start = ampersand + 1U;
+    }
+
+    return parsed;
+}
+
+[[nodiscard]] aistore::http::HttpResponse handle_chunk_collection(const aistore::http::HttpRequest& request,
+                                                                  storage::LocalChunkStore& chunk_store,
+                                                                  std::string_view query) {
+    if (request.method() != beast_http::verb::get) {
+        aistore::http::HttpResponse response = make_json_response(request, beast_http::status::method_not_allowed,
+                                                                  boost::json::object{
+                                                                      {"error", "method_not_allowed"},
+                                                                  });
+        response.set(beast_http::field::allow, "GET");
+        return response;
+    }
+
+    const std::optional<ChunkListQuery> parsed_query = parse_chunk_list_query(query);
+
+    if (!parsed_query.has_value()) {
+        return make_json_response(request, beast_http::status::bad_request,
+                                  boost::json::object{
+                                      {"error", "invalid_request"},
+                                  });
+    }
+
+    const storage::StoredChunkPage page = chunk_store.list_chunks(parsed_query->after, parsed_query->limit);
+
+    boost::json::array chunk_array;
+
+    for (const storage::StoredChunkInfo& chunk : page.chunks) {
+        chunk_array.push_back(boost::json::object{
+            {"chunk_id", chunk.chunk_id},
+            {"size_bytes", chunk.size_bytes},
+        });
+    }
+
+    boost::json::value next_after = boost::json::value(nullptr);
+
+    if (page.next_after.has_value()) {
+        next_after = *page.next_after;
+    }
+
+    return make_json_response(request, beast_http::status::ok,
+                              boost::json::object{
+                                  {"chunks", std::move(chunk_array)},
+                                  {"next_after", std::move(next_after)},
+                              });
+}
+
 }  // namespace
 
 StorageNodeService::StorageNodeService(storage::LocalChunkStore& chunk_store) : chunk_store_(chunk_store) {}
@@ -105,9 +239,14 @@ aistore::http::HttpResponse StorageNodeService::handle_request(const aistore::ht
     }
 
     const std::string_view target = request.target();
+    const auto [path, query] = split_path_and_query(target);
 
-    if (target.starts_with(kChunkRoutePrefix)) {
-        const std::string_view chunk_id = target.substr(kChunkRoutePrefix.size());
+    if (path == kChunkCollectionPath) {
+        return handle_chunk_collection(request, chunk_store_, query);
+    }
+
+    if (path.starts_with(kChunkRoutePrefix)) {
+        const std::string_view chunk_id = path.substr(kChunkRoutePrefix.size());
 
         if (!is_valid_chunk_id(chunk_id)) {
             return make_json_response(request, beast_http::status::bad_request,
@@ -166,11 +305,21 @@ aistore::http::HttpResponse StorageNodeService::handle_request(const aistore::ht
             return response;
         }
 
+        if (request.method() == beast_http::verb::delete_) {
+            const bool deleted = chunk_store_.remove(chunk_id);
+
+            return make_json_response(request, beast_http::status::ok,
+                                      boost::json::object{
+                                          {"chunk_id", std::string{chunk_id}},
+                                          {"deleted", deleted},
+                                      });
+        }
+
         aistore::http::HttpResponse response = make_json_response(request, beast_http::status::method_not_allowed,
                                                                   boost::json::object{
                                                                       {"error", "method_not_allowed"},
                                                                   });
-        response.set(beast_http::field::allow, "GET, HEAD, PUT");
+        response.set(beast_http::field::allow, "GET, HEAD, PUT, DELETE");
         return response;
     }
 

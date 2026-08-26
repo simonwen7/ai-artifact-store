@@ -3,6 +3,7 @@
 #include <array>
 #include <boost/json.hpp>
 #include <cstddef>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -11,6 +12,7 @@
 
 #include "aistore/client/client_error.hpp"
 #include "aistore/hashing/sha256.hpp"
+#include "aistore/storage/local_chunk_store.hpp"
 
 namespace {
 
@@ -71,8 +73,146 @@ namespace beast_http = aistore::http::beast_http;
     return result;
 }
 
+[[nodiscard]] std::optional<std::uint64_t> extract_nonnegative_uint64(const boost::json::value& value) {
+    if (value.is_double()) {
+        return std::nullopt;
+    }
+
+    if (value.is_uint64()) {
+        return value.as_uint64();
+    }
+
+    if (value.is_int64()) {
+        const std::int64_t signed_number = value.as_int64();
+
+        if (signed_number < 0) {
+            return std::nullopt;
+        }
+
+        return static_cast<std::uint64_t>(signed_number);
+    }
+
+    return std::nullopt;
+}
+
 [[nodiscard]] std::string chunk_target(std::string_view chunk_id) {
     return std::string{"/v1/chunks/"} + std::string{chunk_id};
+}
+
+[[nodiscard]] bool json_object_has_exact_keys(const boost::json::object& object,
+                                              std::initializer_list<std::string_view> keys) {
+    if (object.size() != keys.size()) {
+        return false;
+    }
+
+    for (const std::string_view key : keys) {
+        if (!object.contains(key)) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+[[nodiscard]] std::string chunk_collection_target(std::optional<std::string_view> after, std::size_t limit) {
+    std::string target{"/v1/chunks?limit="};
+    target += std::to_string(limit);
+
+    if (after.has_value()) {
+        target += "&after=";
+        target += std::string{*after};
+    }
+
+    return target;
+}
+
+[[nodiscard]] aistore::storage::StoredChunkPage parse_chunk_inventory_page(const std::string& body) {
+    boost::system::error_code parse_error;
+    const boost::json::value parsed = boost::json::parse(body, parse_error);
+
+    if (parse_error || !parsed.is_object()) {
+        throw aistore::client::RemoteProtocolError{"chunk inventory response is not a JSON object"};
+    }
+
+    const boost::json::object& object = parsed.as_object();
+
+    if (!json_object_has_exact_keys(object, {"chunks", "next_after"})) {
+        throw aistore::client::RemoteProtocolError{"chunk inventory response has unexpected fields"};
+    }
+
+    if (!object.at("chunks").is_array()) {
+        throw aistore::client::RemoteProtocolError{"chunk inventory chunks must be an array"};
+    }
+
+    if (!object.at("next_after").is_string() && !object.at("next_after").is_null()) {
+        throw aistore::client::RemoteProtocolError{"chunk inventory next_after is invalid"};
+    }
+
+    aistore::storage::StoredChunkPage page;
+
+    for (const boost::json::value& entry : object.at("chunks").as_array()) {
+        if (!entry.is_object()) {
+            throw aistore::client::RemoteProtocolError{"chunk inventory entry is not an object"};
+        }
+
+        const boost::json::object& chunk_object = entry.as_object();
+
+        if (!json_object_has_exact_keys(chunk_object, {"chunk_id", "size_bytes"})) {
+            throw aistore::client::RemoteProtocolError{"chunk inventory entry has unexpected fields"};
+        }
+
+        if (!chunk_object.at("chunk_id").is_string() || !is_valid_chunk_id(chunk_object.at("chunk_id").as_string())) {
+            throw aistore::client::RemoteProtocolError{"chunk inventory chunk_id is invalid"};
+        }
+
+        const std::optional<std::uint64_t> size_bytes = extract_nonnegative_uint64(chunk_object.at("size_bytes"));
+
+        if (!size_bytes.has_value()) {
+            throw aistore::client::RemoteProtocolError{"chunk inventory size_bytes is invalid"};
+        }
+
+        page.chunks.push_back(aistore::storage::StoredChunkInfo{
+            .chunk_id = std::string{chunk_object.at("chunk_id").as_string()},
+            .size_bytes = *size_bytes,
+        });
+    }
+
+    if (object.at("next_after").is_string()) {
+        const std::string_view next_after = object.at("next_after").as_string();
+
+        if (!is_valid_chunk_id(next_after)) {
+            throw aistore::client::RemoteProtocolError{"chunk inventory next_after is invalid"};
+        }
+
+        page.next_after = std::string{next_after};
+    }
+
+    return page;
+}
+
+[[nodiscard]] bool parse_delete_chunk_response(std::string_view chunk_id, const std::string& body) {
+    boost::system::error_code parse_error;
+    const boost::json::value parsed = boost::json::parse(body, parse_error);
+
+    if (parse_error || !parsed.is_object()) {
+        throw aistore::client::RemoteProtocolError{"delete chunk response is not a JSON object"};
+    }
+
+    const boost::json::object& object = parsed.as_object();
+
+    if (!json_object_has_exact_keys(object, {"chunk_id", "deleted"})) {
+        throw aistore::client::RemoteProtocolError{"delete chunk response has unexpected fields"};
+    }
+
+    if (!object.at("chunk_id").is_string() || object.at("chunk_id").as_string() != chunk_id) {
+        throw aistore::client::RemoteProtocolError{"delete chunk response chunk_id is invalid"};
+    }
+
+    if (!object.at("deleted").is_bool()) {
+        throw aistore::client::RemoteProtocolError{"delete chunk response deleted flag is invalid"};
+    }
+
+    return object.at("deleted").as_bool();
 }
 
 }  // namespace
@@ -164,6 +304,49 @@ std::optional<std::vector<std::byte>> StorageNodeClient::get_chunk(std::string_v
     }
 
     return bytes;
+}
+
+storage::StoredChunkPage StorageNodeClient::list_chunks(std::optional<std::string_view> after,
+                                                        std::size_t limit) const {
+    if (limit < 1U || limit > 256U) {
+        throw std::invalid_argument("chunk inventory limit must be between 1 and 256");
+    }
+
+    if (after.has_value() && !is_valid_chunk_id(*after)) {
+        throw std::invalid_argument("after must be exactly 64 lowercase hexadecimal characters");
+    }
+
+    const aistore::http::HttpClientResponse response =
+        http_client_.request(beast_http::verb::get, chunk_collection_target(after, limit));
+
+    if (status_code_of(response) != 200U) {
+        throw_remote_api_error(response);
+    }
+
+    if (response[beast_http::field::content_type] != "application/json") {
+        throw RemoteProtocolError{"chunk inventory response Content-Type must be application/json"};
+    }
+
+    return parse_chunk_inventory_page(response.body());
+}
+
+bool StorageNodeClient::delete_chunk(std::string_view chunk_id) const {
+    if (!is_valid_chunk_id(chunk_id)) {
+        throw std::invalid_argument("chunk_id must be exactly 64 lowercase hexadecimal characters");
+    }
+
+    const aistore::http::HttpClientResponse response =
+        http_client_.request(beast_http::verb::delete_, chunk_target(chunk_id));
+
+    if (status_code_of(response) != 200U) {
+        throw_remote_api_error(response);
+    }
+
+    if (response[beast_http::field::content_type] != "application/json") {
+        throw RemoteProtocolError{"delete chunk response Content-Type must be application/json"};
+    }
+
+    return parse_delete_chunk_response(chunk_id, response.body());
 }
 
 }  // namespace aistore::client

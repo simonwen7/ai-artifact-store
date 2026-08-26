@@ -116,6 +116,13 @@ jobs:
             -v ON_ERROR_STOP=1 \
             -f migrations/007_fastcdc_chunking.sql
 
+          psql \
+            -h localhost \
+            -U postgres \
+            -d ai_artifact_store_test \
+            -v ON_ERROR_STOP=1 \
+            -f migrations/008_garbage_collection.sql
+
       - name: Configure
         run: |
           cmake \
@@ -132,7 +139,11 @@ jobs:
         run: ctest --test-dir build-ci --output-on-failure
 
       - name: Run CLI smoke test
-        run: ./build-ci/aistore
+        run: |
+          ./build-ci/aistore --help
+          ./build-ci/aistore push --help
+          ./build-ci/aistore pull --help
+          ./build-ci/aistore gc --help
 
       - name: Verify service binaries
         run: |
