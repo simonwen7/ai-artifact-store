@@ -421,6 +421,12 @@ aistore::http::HttpResponse make_method_not_allowed(const aistore::http::HttpReq
                                           boost::json::object{
                                               {"error", "restore_source_unavailable"},
                                           });
+
+            case aistore::metadata::RestorePlanErrorKind::VersionRetired:
+                return make_json_response(request, beast_http::status::gone,
+                                          boost::json::object{
+                                              {"error", "artifact_version_retired"},
+                                          });
         }
 
         throw std::logic_error("unsupported restore plan error kind");
@@ -505,6 +511,12 @@ aistore::http::HttpResponse make_method_not_allowed(const aistore::http::HttpReq
                 return make_json_response(request, beast_http::status::conflict,
                                           boost::json::object{
                                               {"error", "artifact_version_not_committed"},
+                                          });
+
+            case aistore::metadata::ReplicationErrorKind::VersionRetired:
+                return make_json_response(request, beast_http::status::gone,
+                                          boost::json::object{
+                                              {"error", "artifact_version_retired"},
                                           });
 
             case aistore::metadata::ReplicationErrorKind::SourceUnavailable:
@@ -912,6 +924,12 @@ std::optional<aistore::http::HttpResponse> try_handle_m8_routes(const aistore::h
                             return make_json_response(request, beast_http::status::conflict,
                                                       boost::json::object{
                                                           {"error", "restore_source_unavailable"},
+                                                      });
+
+                        case aistore::metadata::RestorePlanErrorKind::VersionRetired:
+                            return make_json_response(request, beast_http::status::gone,
+                                                      boost::json::object{
+                                                          {"error", "artifact_version_retired"},
                                                       });
                     }
 

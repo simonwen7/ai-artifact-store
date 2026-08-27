@@ -11,6 +11,7 @@
 #include "aistore/metadata/chunk_metadata.hpp"
 #include "aistore/metadata/finalize_upload.hpp"
 #include "aistore/metadata/gc.hpp"
+#include "aistore/metadata/lifecycle.hpp"
 #include "aistore/metadata/object_layout_descriptor.hpp"
 #include "aistore/metadata/replication.hpp"
 #include "aistore/metadata/restore_plan.hpp"
@@ -38,6 +39,16 @@ struct ChunkNegotiationResult {
     metadata::UuidV7 session_id;
     std::string target_node_id;
     std::vector<NegotiatedChunk> chunks;
+};
+
+struct VersionPinStatus {
+    bool pinned = false;
+    std::optional<std::string> reason;
+};
+
+struct LifecycleDecisionPage {
+    std::vector<metadata::LifecycleDecision> decisions;
+    std::optional<std::string> next_after;
 };
 
 class MetadataClient {
@@ -90,6 +101,27 @@ class MetadataClient {
 
     [[nodiscard]] metadata::GcRun complete_gc_run(const metadata::UuidV7& gc_run_id,
                                                   const metadata::GcPhysicalStats& physical_stats) const;
+
+    [[nodiscard]] metadata::LifecyclePolicy register_lifecycle_policy(const metadata::LifecyclePolicy& policy) const;
+
+    [[nodiscard]] std::optional<metadata::LifecyclePolicy> get_lifecycle_policy(
+        const metadata::UuidV7& policy_id) const;
+
+    void pin_version(std::string_view version_id, std::string_view reason) const;
+
+    void unpin_version(std::string_view version_id) const;
+
+    [[nodiscard]] VersionPinStatus get_version_pin(std::string_view version_id) const;
+
+    [[nodiscard]] metadata::LifecycleRun run_lifecycle(const metadata::UuidV7& run_id,
+                                                       const metadata::UuidV7& policy_id,
+                                                       metadata::LifecycleRunMode mode) const;
+
+    [[nodiscard]] std::optional<metadata::LifecycleRun> get_lifecycle_run(const metadata::UuidV7& run_id) const;
+
+    [[nodiscard]] LifecycleDecisionPage list_lifecycle_decisions(const metadata::UuidV7& run_id,
+                                                                 std::optional<std::string_view> after_version_id,
+                                                                 std::size_t limit) const;
 
    private:
     http::HttpClient http_client_;

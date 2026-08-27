@@ -10,9 +10,47 @@ The project uses AI/ML workloads as the design context, while storage systems en
 
 ## Current Status
 
-**Milestone 8 — Multi-Node Placement / Replication**
+**Milestone 9 — AI-Aware Lifecycle Policy**
 
-The local content-addressed core, metadata model, push path, pull/restore path, FastCDC chunking, garbage collection, and multi-node replication are in place through M8:
+M9 adds an explainable, persistent, AI-aware lifecycle policy system for committed ArtifactVersions. Lifecycle evaluation decides which semantic versions may stop protecting their stored representations. Apply mode writes semantic retirement records only; M7 garbage collection reclaims unreferenced physical bytes afterward.
+
+Reserved immutable metadata key:
+
+- `aistore.artifact_kind`
+
+Allowed values:
+
+- `generic` (default when the key is absent)
+- `model-checkpoint`
+- `dataset-snapshot`
+- `embedding-index`
+- `evaluation-output`
+
+Lifecycle capabilities:
+
+- policy files with exactly five kind-specific rules
+- keep-last-N retention per artifact kind
+- optional max-age thresholds (`null` means no age barrier)
+- operational pinning separate from version identity
+- tag and manifest reference protection
+- dry-run and explainable decisions
+- semantic retirement (terminal; no unretire)
+- lifecycle Apply does **not** delete CAS bytes — run `aistore gc` afterward
+- retired versions cannot Pull or Repair
+- shared Object/Chunk representations remain protected while any non-retired version still references them
+
+Only **non-retired** committed ArtifactVersions act as GC roots in M9.
+
+M9 does **not** implement:
+
+- automatic scheduler or background daemon
+- storage tiers or hot/cold placement
+- capacity or cost models
+- access-frequency policy
+- heartbeat or automatic rebalance
+- hard deletion of `artifact_versions` rows
+
+Prior milestones remain in place through M8:
 
 - content-addressed local CAS
 - Object / immutable layout model
@@ -34,7 +72,7 @@ The local content-addressed core, metadata model, push path, pull/restore path, 
 - strategy-specific UploadSession identity and committed retry
 - production `aistore gc` with registry-resolved storage endpoints
 - physical CAS inventory and idempotent chunk deletion before metadata sweep
-- conservative Push/GC/Replication mutual exclusion
+- conservative Push/GC/Replication/Lifecycle mutual exclusion
 - storage node registry (`aistore node register|list|set-state`)
 - deterministic per-chunk Rendezvous placement (`select_replica_nodes`, SHA-256)
 - replication runs and resumable `aistore repair` for under-replicated committed versions
@@ -47,7 +85,7 @@ Storage-node process identity:
 
 Node states: Active (placement/pull/repair), Draining (pull/repair only), Disabled (excluded from automatic pull/repair; GC may still target explicitly).
 
-Not implemented in M8: heartbeat/failure detector, capacity-aware placement, rack/zone topology, automatic background rebalance.
+Not implemented in M9: heartbeat/failure detector, capacity-aware placement, rack/zone topology, automatic background rebalance, automatic lifecycle scheduling.
 
 Fixed-size chunking remains the default and is fully supported. FastCDC improves deduplication when similar content shifts inside large artifacts because chunk boundaries follow content rather than fixed offsets.
 
@@ -57,9 +95,7 @@ Pull does not require chunking flags or a source node flag; restore uses the com
 
 FastCDC CLI defaults: min 2 MiB, avg 4 MiB, max 8 MiB.
 
-M7/M8 preserve every ArtifactVersion as a semantic GC root. GC does not implement version retention, TTL, or semantic deletion policy.
-
-GC refuses to start while any Open UploadSession or Open ReplicationRun exists. While a GcRun is Open, new UploadSessions are rejected; Pull and read-only restore APIs remain available.
+GC refuses to start while any Open UploadSession or Open ReplicationRun exists. Lifecycle runs refuse while any Open UploadSession, Open GcRun, or Open ReplicationRun exists. While a GcRun is Open, new UploadSessions are rejected; Pull and read-only restore APIs remain available.
 
 Physical collectible chunks are removed from the configured storage node before metadata orphan sweep on apply runs.
 
@@ -74,6 +110,14 @@ Default local endpoints:
 
 `--artifact-id` must already exist in metadata. Artifact creation is outside the push CLI.
 
+Assign AI artifact kind through existing push metadata flags, for example:
+
+```bash
+--metadata aistore.artifact_kind=model-checkpoint
+```
+
+Do not introduce a separate `--artifact-kind` push flag.
+
 ### Push (FixedSize)
 
 Example:
@@ -83,7 +127,8 @@ Example:
 
 ./build/aistore push \
   --file ./artifact.bin \
-  --artifact-id <uuidv7>
+  --artifact-id <uuidv7> \
+  --metadata aistore.artifact_kind=model-checkpoint
 ```
 
 Defaults: `--chunking-strategy fixed-size`, `--chunk-size 4194304`, `--replication-factor 1`.
@@ -143,6 +188,8 @@ Example:
   --output ./restored.bin
 ```
 
+Retired versions return `410 artifact_version_retired`.
+
 Interrupted pulls leave a resumable partial file beside the destination:
 
 `<output>.aistore.<version_id>.part`
@@ -189,11 +236,45 @@ Resume after an interrupted apply run:
   --gc-run-id <uuidv7>
 ```
 
-Every ArtifactVersion is a semantic GC root in M7. GC does not delete Artifacts, ArtifactVersions, or implement retention/TTL policy.
+In M9, only **non-retired** committed ArtifactVersions root their Objects for GC reachability. Semantic retirement preserves historical UploadSession and finalization records; later GC may reclaim dead representation metadata once no live version protects it. GC does not delete Artifact or ArtifactVersion metadata rows and does not implement retention policy evaluation — use lifecycle Apply first, then GC.
 
 GC refuses to start while any Open UploadSession exists. While a GcRun is Open, new UploadSessions are rejected. Pull remains available.
 
 Apply mode removes collectible physical chunks before metadata sweep.
+
+### Lifecycle
+
+`aistore lifecycle` manages lifecycle policies, pins, evaluation runs, and decision explanation. Lifecycle is metadata-only (no storage-node flags).
+
+Subcommands:
+
+```bash
+aistore lifecycle policy create --file <policy.json> [--policy-id <uuidv7>]
+aistore lifecycle policy show --policy-id <uuidv7>
+aistore lifecycle pin --version-id <64hex> --reason "<text>"
+aistore lifecycle unpin --version-id <64hex>
+aistore lifecycle run --policy-id <uuidv7> [--lifecycle-run-id <uuidv7>] [--dry-run]
+aistore lifecycle explain --lifecycle-run-id <uuidv7>
+```
+
+Example policy file shape:
+
+```json
+{
+  "name": "ai-balanced",
+  "rules": [
+    {"artifact_kind": "generic", "keep_last_n": 3, "max_age_seconds": null},
+    {"artifact_kind": "model-checkpoint", "keep_last_n": 3, "max_age_seconds": 2592000},
+    {"artifact_kind": "dataset-snapshot", "keep_last_n": 2, "max_age_seconds": 7776000},
+    {"artifact_kind": "embedding-index", "keep_last_n": 2, "max_age_seconds": 1209600},
+    {"artifact_kind": "evaluation-output", "keep_last_n": 1, "max_age_seconds": 604800}
+  ]
+}
+```
+
+Dry-run evaluates and persists decisions without writing retirement rows. Apply writes semantic retirement records for policy-retire candidates. Run `aistore gc` afterward to reclaim unreferenced physical bytes.
+
+Retirement is terminal: retired versions cannot be pinned, tagged, referenced by new manifests, pulled, or repaired.
 
 ### Storage Node Registry
 
@@ -217,6 +298,8 @@ Apply mode removes collectible physical chunks before metadata sweep.
   --version-id <64-char-hex-version-id> \
   --replication-factor 2
 ```
+
+Retired versions are rejected with `410 artifact_version_retired`.
 
 ## Technology
 
@@ -242,9 +325,9 @@ Additional dependencies are introduced only when required by a milestone.
 - Content-defined chunking
 - Garbage collection (M7)
 - Multi-node storage and replication (M8)
-- AI-workload-aware lifecycle policies
+- AI-workload-aware lifecycle policies (M9)
 
-Replication placement beyond M8 (capacity-aware / rack-aware / background rebalance), version retention/TTL, and AI lifecycle policies are planned and not claimed as implemented.
+Replication placement beyond M8 (capacity-aware / rack-aware / background rebalance) and automatic lifecycle scheduling remain future work.
 
 Heartbeat-derived node health and automatic state transitions are not implemented.
 

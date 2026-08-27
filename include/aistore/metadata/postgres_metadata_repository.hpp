@@ -11,6 +11,7 @@
 #include "aistore/metadata/chunk_metadata.hpp"
 #include "aistore/metadata/finalize_upload.hpp"
 #include "aistore/metadata/gc.hpp"
+#include "aistore/metadata/lifecycle.hpp"
 #include "aistore/metadata/manifest_model.hpp"
 #include "aistore/metadata/object.hpp"
 #include "aistore/metadata/object_layout_descriptor.hpp"
@@ -115,6 +116,23 @@ class PostgresMetadataRepository {
                                                                   const std::vector<std::string>& chunk_ids);
 
     [[nodiscard]] GcRun complete_gc_run(const UuidV7& run_id, const GcPhysicalStats& physical_stats);
+
+    void register_lifecycle_policy(const LifecyclePolicy& policy);
+
+    [[nodiscard]] std::optional<LifecyclePolicy> get_lifecycle_policy(const UuidV7& policy_id);
+
+    void pin_version(std::string_view version_id, std::string_view reason);
+
+    [[nodiscard]] bool unpin_version(std::string_view version_id);
+
+    [[nodiscard]] std::optional<std::string> get_version_pin(std::string_view version_id);
+
+    [[nodiscard]] LifecycleRun run_lifecycle(const UuidV7& run_id, const UuidV7& policy_id, LifecycleRunMode mode);
+
+    [[nodiscard]] std::optional<LifecycleRun> get_lifecycle_run(const UuidV7& run_id);
+
+    [[nodiscard]] std::vector<LifecycleDecision> list_lifecycle_decisions(
+        const UuidV7& run_id, std::optional<std::string_view> after_version_id, std::size_t limit);
 
    private:
     class Impl;

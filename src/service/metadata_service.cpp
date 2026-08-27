@@ -24,6 +24,7 @@
 #include "aistore/metadata/storage_location.hpp"
 #include "aistore/metadata/upload_session.hpp"
 #include "aistore/service/metadata_service_m8_routes.hpp"
+#include "aistore/service/metadata_service_m9_routes.hpp"
 
 namespace aistore::service {
 
@@ -1023,6 +1024,12 @@ struct ParsedGcRunRoute {
                                           boost::json::object{
                                               {"error", "restore_source_unavailable"},
                                           });
+
+            case aistore::metadata::RestorePlanErrorKind::VersionRetired:
+                return make_json_response(request, beast_http::status::gone,
+                                          boost::json::object{
+                                              {"error", "artifact_version_retired"},
+                                          });
         }
 
         throw std::logic_error("unsupported restore plan error kind");
@@ -1526,6 +1533,11 @@ struct ParsedGcRunRoute {
                     error_body["chunk_id"] = *error.chunk_id();
                 }
                 break;
+
+            case aistore::metadata::FinalizeUploadErrorKind::VersionRetired:
+                status = beast_http::status::gone;
+                error_body["error"] = "artifact_version_retired";
+                break;
         }
 
         return make_json_response(request, status, error_body);
@@ -1903,6 +1915,12 @@ aistore::http::HttpResponse MetadataService::handle_request(const aistore::http:
             try_handle_m8_routes(request, repository_, repository_mutex_);
         m8_response.has_value()) {
         return *m8_response;
+    }
+
+    if (const std::optional<aistore::http::HttpResponse> m9_response =
+            try_handle_m9_routes(request, repository_, repository_mutex_);
+        m9_response.has_value()) {
+        return *m9_response;
     }
 
     const std::string_view target = request.target();

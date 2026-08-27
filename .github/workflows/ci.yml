@@ -130,6 +130,20 @@ jobs:
             -v ON_ERROR_STOP=1 \
             -f migrations/009_multi_node_replication.sql
 
+          psql \
+            -h localhost \
+            -U postgres \
+            -d ai_artifact_store_test \
+            -v ON_ERROR_STOP=1 \
+            -f migrations/010_ai_aware_lifecycle.sql
+
+          psql \
+            -h localhost \
+            -U postgres \
+            -d ai_artifact_store_test \
+            -v ON_ERROR_STOP=1 \
+            -f migrations/011_retired_finalization_reclamation.sql
+
       - name: Configure
         run: |
           cmake \
@@ -153,6 +167,7 @@ jobs:
           ./build-ci/aistore gc --help
           ./build-ci/aistore node --help
           ./build-ci/aistore repair --help
+          ./build-ci/aistore lifecycle --help
 
       - name: Verify service binaries
         run: |

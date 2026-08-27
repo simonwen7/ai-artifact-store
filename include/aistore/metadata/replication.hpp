@@ -28,6 +28,7 @@ enum class ReplicationErrorKind : std::uint8_t {
     SourceUnavailable,
     UnderReplicated,
     TargetDisabled,
+    VersionRetired,
 };
 
 class ReplicationError : public std::runtime_error {

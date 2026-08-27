@@ -1,10 +1,12 @@
 #include <algorithm>
+#include <array>
 #include <boost/asio/ip/address.hpp>
 #include <boost/json.hpp>
 #include <boost/system/error_code.hpp>
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <map>
 #include <optional>
@@ -24,6 +26,7 @@
 #include "aistore/metadata/chunking.hpp"
 #include "aistore/metadata/finalize_upload.hpp"
 #include "aistore/metadata/gc.hpp"
+#include "aistore/metadata/lifecycle.hpp"
 #include "aistore/metadata/storage_node.hpp"
 #include "aistore/metadata/upload_session.hpp"
 #include "aistore/metadata/uuid_v7.hpp"
@@ -60,6 +63,7 @@ void print_top_level_usage(std::ostream& out) {
            "  aistore gc [options]\n"
            "  aistore node <subcommand> [options]\n"
            "  aistore repair [options]\n"
+           "  aistore lifecycle <subcommand> [options]\n"
            "\n"
            "Commands:\n"
            "  push\n"
@@ -67,12 +71,14 @@ void print_top_level_usage(std::ostream& out) {
            "  gc\n"
            "  node\n"
            "  repair\n"
+           "  lifecycle\n"
            "\n"
            "Run `aistore push --help` for push options.\n"
            "Run `aistore pull --help` for pull options.\n"
            "Run `aistore gc --help` for gc options.\n"
            "Run `aistore node --help` for node options.\n"
-           "Run `aistore repair --help` for repair options.\n";
+           "Run `aistore repair --help` for repair options.\n"
+           "Run `aistore lifecycle --help` for lifecycle options.\n";
 }
 
 void print_push_usage(std::ostream& out) {
@@ -1007,6 +1013,10 @@ void emit_gc_success_json(std::string_view storage_node_id, const aistore::metad
 
         emit_pull_success_json(result);
         return 0;
+    } catch (const aistore::client::RemoteApiError& error) {
+        std::cerr << "aistore pull error: " << error.what() << '\n'
+                  << "remote error_code " << error.error_code() << '\n';
+        return 1;
     } catch (const std::exception& error) {
         std::cerr << "aistore pull error: " << error.what() << '\n';
         return 1;
@@ -1397,11 +1407,557 @@ void print_repair_usage(std::ostream& out) {
         body["source_failovers"] = result.stats.source_failovers;
         std::cout << boost::json::serialize(body) << '\n';
         return 0;
+    } catch (const aistore::client::RemoteApiError& error) {
+        std::cerr << "aistore repair error: " << error.what() << '\n'
+                  << "remote error_code " << error.error_code() << '\n'
+                  << "resume with --repair-run-id " << repair_run_id->str() << '\n';
+        return 1;
     } catch (const std::exception& error) {
         std::cerr << "aistore repair error: " << error.what() << '\n'
                   << "resume with --repair-run-id " << repair_run_id->str() << '\n';
         return 1;
     }
+}
+
+void print_lifecycle_usage(std::ostream& out) {
+    out << "Usage:\n"
+           "  aistore lifecycle policy create [options]\n"
+           "  aistore lifecycle policy show [options]\n"
+           "  aistore lifecycle pin [options]\n"
+           "  aistore lifecycle unpin [options]\n"
+           "  aistore lifecycle run [options]\n"
+           "  aistore lifecycle explain [options]\n"
+           "\n"
+           "Optional endpoint flags (all subcommands):\n"
+           "  --metadata-address <numeric-ip>\n"
+           "  --metadata-port <port>\n"
+           "\n"
+           "Defaults:\n"
+           "  metadata 127.0.0.1:8080\n";
+}
+
+[[nodiscard]] boost::json::object lifecycle_rule_to_cli_json(const aistore::metadata::LifecycleRule& rule) {
+    boost::json::object object{
+        {"artifact_kind", std::string{aistore::metadata::artifact_kind_to_string(rule.artifact_kind)}},
+        {"keep_last_n", rule.keep_last_n},
+    };
+
+    if (rule.max_age_seconds.has_value()) {
+        object["max_age_seconds"] = *rule.max_age_seconds;
+    } else {
+        object["max_age_seconds"] = nullptr;
+    }
+
+    return object;
+}
+
+[[nodiscard]] boost::json::object lifecycle_policy_to_cli_json(const aistore::metadata::LifecyclePolicy& policy) {
+    constexpr std::array<aistore::metadata::ArtifactKind, 5> kind_order = {
+        aistore::metadata::ArtifactKind::Generic,          aistore::metadata::ArtifactKind::ModelCheckpoint,
+        aistore::metadata::ArtifactKind::DatasetSnapshot,  aistore::metadata::ArtifactKind::EmbeddingIndex,
+        aistore::metadata::ArtifactKind::EvaluationOutput,
+    };
+
+    boost::json::array rules;
+
+    for (const aistore::metadata::ArtifactKind kind : kind_order) {
+        const auto rule_it = policy.rules.find(kind);
+
+        if (rule_it == policy.rules.end()) {
+            throw std::runtime_error("lifecycle policy is missing a canonical artifact kind rule");
+        }
+
+        rules.push_back(lifecycle_rule_to_cli_json(rule_it->second));
+    }
+
+    return boost::json::object{
+        {"policy_id", policy.policy_id.str()},
+        {"name", policy.name},
+        {"rules", std::move(rules)},
+    };
+}
+
+[[nodiscard]] boost::json::object lifecycle_run_to_cli_json(const aistore::metadata::LifecycleRun& run) {
+    return boost::json::object{
+        {"run_id", run.run_id.str()},
+        {"policy_id", run.policy_id.str()},
+        {"mode", std::string{aistore::metadata::lifecycle_run_mode_to_string(run.mode)}},
+        {"evaluated_at_unix_ms", run.evaluated_at_unix_ms},
+        {"versions_scanned", run.stats.versions_scanned},
+        {"versions_protected", run.stats.versions_protected},
+        {"versions_retained_by_policy", run.stats.versions_retained_by_policy},
+        {"versions_candidates", run.stats.versions_candidates},
+        {"versions_retired", run.stats.versions_retired},
+        {"logical_bytes_candidates", run.stats.logical_bytes_candidates},
+        {"logical_bytes_retired", run.stats.logical_bytes_retired},
+    };
+}
+
+[[nodiscard]] boost::json::object lifecycle_decision_to_cli_json(const aistore::metadata::LifecycleDecision& decision) {
+    return boost::json::object{
+        {"version_id", decision.version_id},
+        {"artifact_id", decision.artifact_id.str()},
+        {"artifact_kind", std::string{aistore::metadata::artifact_kind_to_string(decision.artifact_kind)}},
+        {"decision", decision.retire ? "retire" : "retain"},
+        {"reason", std::string{aistore::metadata::lifecycle_decision_reason_to_string(decision.reason)}},
+        {"logical_size_bytes", decision.logical_size_bytes},
+    };
+}
+
+[[nodiscard]] std::uint64_t parse_policy_uint64_field(const boost::json::value& value, std::string_view field_name) {
+    if (value.is_string()) {
+        return parse_strict_u64(value.as_string(), field_name);
+    }
+
+    if (value.is_uint64()) {
+        return value.as_uint64();
+    }
+
+    if (value.is_int64()) {
+        const std::int64_t signed_value = value.as_int64();
+
+        if (signed_value < 0) {
+            throw CliUsageError{std::string{field_name} + " must be a non-negative integer"};
+        }
+
+        return static_cast<std::uint64_t>(signed_value);
+    }
+
+    throw CliUsageError{std::string{field_name} + " must be an integer"};
+}
+
+[[nodiscard]] aistore::metadata::LifecyclePolicy parse_lifecycle_policy_file(const boost::json::object& object) {
+    if (!object.contains("name") || !object.contains("rules") || !object.at("name").is_string() ||
+        !object.at("rules").is_array()) {
+        throw CliUsageError{"policy file must contain name and rules"};
+    }
+
+    const boost::json::array& rules_json = object.at("rules").as_array();
+
+    if (rules_json.size() != 5U) {
+        throw CliUsageError{"policy file rules must contain exactly five entries"};
+    }
+
+    std::map<aistore::metadata::ArtifactKind, aistore::metadata::LifecycleRule> rules;
+
+    for (const boost::json::value& entry : rules_json) {
+        if (!entry.is_object()) {
+            throw CliUsageError{"policy file rule entry must be an object"};
+        }
+
+        const boost::json::object& rule_object = entry.as_object();
+
+        if (rule_object.size() != 3U || !rule_object.contains("artifact_kind") ||
+            !rule_object.contains("keep_last_n") || !rule_object.contains("max_age_seconds") ||
+            !rule_object.at("artifact_kind").is_string()) {
+            throw CliUsageError{"policy file rule entry has invalid fields"};
+        }
+
+        const std::uint64_t keep_last_n = parse_policy_uint64_field(rule_object.at("keep_last_n"), "keep_last_n");
+
+        std::optional<std::uint64_t> max_age_seconds;
+
+        if (rule_object.at("max_age_seconds").is_null()) {
+            max_age_seconds = std::nullopt;
+        } else {
+            max_age_seconds = parse_policy_uint64_field(rule_object.at("max_age_seconds"), "max_age_seconds");
+        }
+
+        aistore::metadata::ArtifactKind artifact_kind;
+
+        try {
+            artifact_kind =
+                aistore::metadata::artifact_kind_from_string(std::string{rule_object.at("artifact_kind").as_string()});
+        } catch (const std::runtime_error&) {
+            throw CliUsageError{"policy file artifact_kind is invalid"};
+        }
+
+        if (rules.contains(artifact_kind)) {
+            throw CliUsageError{"policy file rules contain duplicate artifact kinds"};
+        }
+
+        rules.emplace(artifact_kind, aistore::metadata::LifecycleRule{
+                                         .artifact_kind = artifact_kind,
+                                         .keep_last_n = static_cast<std::uint32_t>(keep_last_n),
+                                         .max_age_seconds = max_age_seconds,
+                                     });
+    }
+
+    return aistore::metadata::LifecyclePolicy{
+        .policy_id = aistore::metadata::UuidV7::generate(),
+        .name = std::string{object.at("name").as_string()},
+        .rules = std::move(rules),
+    };
+}
+
+[[nodiscard]] int run_lifecycle(int argc, char** argv) {
+    if (argc <= 2) {
+        throw CliUsageError{"lifecycle subcommand is required"};
+    }
+
+    const std::string_view subcommand{argv[2]};
+
+    if (subcommand == "--help" || subcommand == "help") {
+        print_lifecycle_usage(std::cout);
+        return 0;
+    }
+
+    std::string metadata_address = "127.0.0.1";
+    std::uint16_t metadata_port = 8080;
+
+    auto rebuild_client = [&]() {
+        validate_numeric_ip(metadata_address, "--metadata-address");
+        return aistore::client::MetadataClient{aistore::http::HttpClientConfig{
+            .endpoint = {.address = metadata_address, .port = metadata_port},
+        }};
+    };
+
+    aistore::client::MetadataClient metadata_client = rebuild_client();
+
+    if (subcommand == "policy") {
+        if (argc <= 3) {
+            throw CliUsageError{"lifecycle policy subcommand is required"};
+        }
+
+        const std::string_view policy_command{argv[3]};
+
+        if (policy_command == "--help") {
+            print_lifecycle_usage(std::cout);
+            return 0;
+        }
+
+        if (policy_command == "create") {
+            std::filesystem::path policy_file;
+            std::optional<aistore::metadata::UuidV7> policy_id;
+
+            for (int index = 4; index < argc; ++index) {
+                const std::string_view arg{argv[index]};
+
+                if (arg == "--help") {
+                    print_lifecycle_usage(std::cout);
+                    return 0;
+                }
+
+                if (arg == "--file") {
+                    policy_file = std::filesystem::path{std::string{next_arg(argc, argv, index, "--file")}};
+                    continue;
+                }
+
+                if (arg == "--policy-id") {
+                    policy_id.emplace(std::string{next_arg(argc, argv, index, "--policy-id")});
+                    continue;
+                }
+
+                if (arg == "--metadata-address") {
+                    metadata_address = std::string{next_arg(argc, argv, index, "--metadata-address")};
+                    continue;
+                }
+
+                if (arg == "--metadata-port") {
+                    metadata_port = parse_port(next_arg(argc, argv, index, "--metadata-port"), "--metadata-port");
+                    continue;
+                }
+
+                throw CliUsageError{std::string{"unknown option "} + std::string{arg}};
+            }
+
+            if (policy_file.empty()) {
+                throw CliUsageError{"--file is required"};
+            }
+
+            if (!is_regular_file_path(policy_file)) {
+                throw std::runtime_error("policy file does not exist or is not a regular file");
+            }
+
+            std::ifstream input{policy_file};
+
+            if (!input) {
+                throw std::runtime_error("policy file could not be opened");
+            }
+
+            const std::string file_contents{std::istreambuf_iterator<char>{input}, std::istreambuf_iterator<char>{}};
+            boost::system::error_code parse_error;
+            const boost::json::value parsed = boost::json::parse(file_contents, parse_error);
+
+            if (parse_error || !parsed.is_object()) {
+                throw std::runtime_error("policy file is not valid JSON");
+            }
+
+            aistore::metadata::LifecyclePolicy policy = parse_lifecycle_policy_file(parsed.as_object());
+
+            if (!policy_id.has_value()) {
+                policy_id = aistore::metadata::UuidV7::generate();
+            }
+
+            policy.policy_id = *policy_id;
+            metadata_client = rebuild_client();
+            const aistore::metadata::LifecyclePolicy registered = metadata_client.register_lifecycle_policy(policy);
+            std::cout << boost::json::serialize(lifecycle_policy_to_cli_json(registered)) << '\n';
+            return 0;
+        }
+
+        if (policy_command == "show") {
+            std::optional<aistore::metadata::UuidV7> policy_id;
+
+            for (int index = 4; index < argc; ++index) {
+                const std::string_view arg{argv[index]};
+
+                if (arg == "--help") {
+                    print_lifecycle_usage(std::cout);
+                    return 0;
+                }
+
+                if (arg == "--policy-id") {
+                    policy_id.emplace(std::string{next_arg(argc, argv, index, "--policy-id")});
+                    continue;
+                }
+
+                if (arg == "--metadata-address") {
+                    metadata_address = std::string{next_arg(argc, argv, index, "--metadata-address")};
+                    continue;
+                }
+
+                if (arg == "--metadata-port") {
+                    metadata_port = parse_port(next_arg(argc, argv, index, "--metadata-port"), "--metadata-port");
+                    continue;
+                }
+
+                throw CliUsageError{std::string{"unknown option "} + std::string{arg}};
+            }
+
+            if (!policy_id.has_value()) {
+                throw CliUsageError{"--policy-id is required"};
+            }
+
+            metadata_client = rebuild_client();
+            const std::optional<aistore::metadata::LifecyclePolicy> policy =
+                metadata_client.get_lifecycle_policy(*policy_id);
+
+            if (!policy.has_value()) {
+                throw std::runtime_error("lifecycle policy was not found");
+            }
+
+            std::cout << boost::json::serialize(lifecycle_policy_to_cli_json(*policy)) << '\n';
+            return 0;
+        }
+
+        throw CliUsageError{std::string{"unknown lifecycle policy subcommand "} + std::string{policy_command}};
+    }
+
+    if (subcommand == "pin") {
+        std::string version_id;
+        std::string reason;
+
+        for (int index = 3; index < argc; ++index) {
+            const std::string_view arg{argv[index]};
+
+            if (arg == "--help") {
+                print_lifecycle_usage(std::cout);
+                return 0;
+            }
+
+            if (arg == "--version-id") {
+                version_id = std::string{next_arg(argc, argv, index, "--version-id")};
+                continue;
+            }
+
+            if (arg == "--reason") {
+                reason = std::string{next_arg(argc, argv, index, "--reason")};
+                continue;
+            }
+
+            if (arg == "--metadata-address") {
+                metadata_address = std::string{next_arg(argc, argv, index, "--metadata-address")};
+                continue;
+            }
+
+            if (arg == "--metadata-port") {
+                metadata_port = parse_port(next_arg(argc, argv, index, "--metadata-port"), "--metadata-port");
+                continue;
+            }
+
+            throw CliUsageError{std::string{"unknown option "} + std::string{arg}};
+        }
+
+        if (version_id.empty() || reason.empty()) {
+            throw CliUsageError{"--version-id and --reason are required"};
+        }
+
+        metadata_client = rebuild_client();
+        metadata_client.pin_version(version_id, reason);
+
+        boost::json::object body{
+            {"version_id", version_id},
+            {"pinned", true},
+            {"reason", reason},
+        };
+        std::cout << boost::json::serialize(body) << '\n';
+        return 0;
+    }
+
+    if (subcommand == "unpin") {
+        std::string version_id;
+
+        for (int index = 3; index < argc; ++index) {
+            const std::string_view arg{argv[index]};
+
+            if (arg == "--help") {
+                print_lifecycle_usage(std::cout);
+                return 0;
+            }
+
+            if (arg == "--version-id") {
+                version_id = std::string{next_arg(argc, argv, index, "--version-id")};
+                continue;
+            }
+
+            if (arg == "--metadata-address") {
+                metadata_address = std::string{next_arg(argc, argv, index, "--metadata-address")};
+                continue;
+            }
+
+            if (arg == "--metadata-port") {
+                metadata_port = parse_port(next_arg(argc, argv, index, "--metadata-port"), "--metadata-port");
+                continue;
+            }
+
+            throw CliUsageError{std::string{"unknown option "} + std::string{arg}};
+        }
+
+        if (version_id.empty()) {
+            throw CliUsageError{"--version-id is required"};
+        }
+
+        metadata_client = rebuild_client();
+        metadata_client.unpin_version(version_id);
+
+        boost::json::object body{
+            {"version_id", version_id},
+            {"pinned", false},
+        };
+        std::cout << boost::json::serialize(body) << '\n';
+        return 0;
+    }
+
+    if (subcommand == "run") {
+        std::optional<aistore::metadata::UuidV7> policy_id;
+        std::optional<aistore::metadata::UuidV7> lifecycle_run_id;
+        bool dry_run = false;
+
+        for (int index = 3; index < argc; ++index) {
+            const std::string_view arg{argv[index]};
+
+            if (arg == "--help") {
+                print_lifecycle_usage(std::cout);
+                return 0;
+            }
+
+            if (arg == "--policy-id") {
+                policy_id.emplace(std::string{next_arg(argc, argv, index, "--policy-id")});
+                continue;
+            }
+
+            if (arg == "--lifecycle-run-id") {
+                lifecycle_run_id.emplace(std::string{next_arg(argc, argv, index, "--lifecycle-run-id")});
+                continue;
+            }
+
+            if (arg == "--dry-run") {
+                dry_run = true;
+                continue;
+            }
+
+            if (arg == "--metadata-address") {
+                metadata_address = std::string{next_arg(argc, argv, index, "--metadata-address")};
+                continue;
+            }
+
+            if (arg == "--metadata-port") {
+                metadata_port = parse_port(next_arg(argc, argv, index, "--metadata-port"), "--metadata-port");
+                continue;
+            }
+
+            throw CliUsageError{std::string{"unknown option "} + std::string{arg}};
+        }
+
+        if (!policy_id.has_value()) {
+            throw CliUsageError{"--policy-id is required"};
+        }
+
+        if (!lifecycle_run_id.has_value()) {
+            lifecycle_run_id = aistore::metadata::UuidV7::generate();
+        }
+
+        metadata_client = rebuild_client();
+        const aistore::metadata::LifecycleRun run = metadata_client.run_lifecycle(
+            *lifecycle_run_id, *policy_id,
+            dry_run ? aistore::metadata::LifecycleRunMode::DryRun : aistore::metadata::LifecycleRunMode::Apply);
+        std::cout << boost::json::serialize(lifecycle_run_to_cli_json(run)) << '\n';
+        return 0;
+    }
+
+    if (subcommand == "explain") {
+        std::optional<aistore::metadata::UuidV7> lifecycle_run_id;
+
+        for (int index = 3; index < argc; ++index) {
+            const std::string_view arg{argv[index]};
+
+            if (arg == "--help") {
+                print_lifecycle_usage(std::cout);
+                return 0;
+            }
+
+            if (arg == "--lifecycle-run-id") {
+                lifecycle_run_id.emplace(std::string{next_arg(argc, argv, index, "--lifecycle-run-id")});
+                continue;
+            }
+
+            if (arg == "--metadata-address") {
+                metadata_address = std::string{next_arg(argc, argv, index, "--metadata-address")};
+                continue;
+            }
+
+            if (arg == "--metadata-port") {
+                metadata_port = parse_port(next_arg(argc, argv, index, "--metadata-port"), "--metadata-port");
+                continue;
+            }
+
+            throw CliUsageError{std::string{"unknown option "} + std::string{arg}};
+        }
+
+        if (!lifecycle_run_id.has_value()) {
+            throw CliUsageError{"--lifecycle-run-id is required"};
+        }
+
+        metadata_client = rebuild_client();
+
+        boost::json::array decisions;
+        std::optional<std::string> after;
+
+        while (true) {
+            const aistore::client::LifecycleDecisionPage page =
+                metadata_client.list_lifecycle_decisions(*lifecycle_run_id, after, 256U);
+
+            for (const aistore::metadata::LifecycleDecision& decision : page.decisions) {
+                decisions.push_back(lifecycle_decision_to_cli_json(decision));
+            }
+
+            if (!page.next_after.has_value()) {
+                break;
+            }
+
+            after = *page.next_after;
+        }
+
+        std::cout << boost::json::serialize(boost::json::object{
+                         {"run_id", lifecycle_run_id->str()},
+                         {"decisions", std::move(decisions)},
+                     })
+                  << '\n';
+        return 0;
+    }
+
+    throw CliUsageError{std::string{"unknown lifecycle subcommand "} + std::string{subcommand}};
 }
 
 }  // namespace
@@ -1471,6 +2027,19 @@ int main(int argc, char** argv) {
                 std::cerr << "aistore: " << error.what() << '\n';
                 print_repair_usage(std::cerr);
                 return 2;
+            }
+        }
+
+        if (command == "lifecycle") {
+            try {
+                return run_lifecycle(argc, argv);
+            } catch (const CliUsageError& error) {
+                std::cerr << "aistore: " << error.what() << '\n';
+                print_lifecycle_usage(std::cerr);
+                return 2;
+            } catch (const std::exception& error) {
+                std::cerr << "aistore lifecycle error: " << error.what() << '\n';
+                return 1;
             }
         }
 

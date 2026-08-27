@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <optional>
 #include <pqxx/pqxx>
 #include <span>
@@ -26,10 +27,15 @@
 #include "aistore/metadata/artifact_model.hpp"
 #include "aistore/metadata/chunk_metadata.hpp"
 #include "aistore/metadata/chunking.hpp"
+#include "aistore/metadata/finalize_upload.hpp"
 #include "aistore/metadata/gc.hpp"
+#include "aistore/metadata/lifecycle.hpp"
+#include "aistore/metadata/manifest_model.hpp"
 #include "aistore/metadata/object_layout_descriptor.hpp"
 #include "aistore/metadata/postgres_metadata_repository.hpp"
 #include "aistore/metadata/storage_location.hpp"
+#include "aistore/metadata/storage_node.hpp"
+#include "aistore/metadata/upload_session.hpp"
 #include "aistore/metadata/uuid_v7.hpp"
 #include "aistore/service/metadata_service.hpp"
 #include "aistore/service/storage_node_service.hpp"
@@ -47,19 +53,31 @@ using aistore::http::HttpRequest;
 using aistore::http::HttpServer;
 using aistore::http::HttpServerConfig;
 using aistore::metadata::Artifact;
+using aistore::metadata::ArtifactKind;
 using aistore::metadata::ArtifactVersion;
 using aistore::metadata::ChunkingStrategy;
 using aistore::metadata::ChunkMetadata;
 using aistore::metadata::ChunkRef;
+using aistore::metadata::FinalizeUploadResult;
 using aistore::metadata::GcRun;
 using aistore::metadata::GcRunMode;
 using aistore::metadata::GcRunState;
+using aistore::metadata::kArtifactKindMetadataKey;
+using aistore::metadata::LifecyclePolicy;
+using aistore::metadata::LifecycleRule;
+using aistore::metadata::LifecycleRun;
+using aistore::metadata::LifecycleRunMode;
+using aistore::metadata::Manifest;
 using aistore::metadata::Object;
 using aistore::metadata::ObjectLayout;
 using aistore::metadata::ObjectLayoutDescriptor;
 using aistore::metadata::PostgresMetadataRepository;
 using aistore::metadata::StorageLocation;
 using aistore::metadata::StorageLocationState;
+using aistore::metadata::StorageNode;
+using aistore::metadata::StorageNodeState;
+using aistore::metadata::UploadSession;
+using aistore::metadata::UploadSessionState;
 using aistore::metadata::UuidV7;
 using aistore::metadata::VersionState;
 using aistore::service::MetadataService;
@@ -84,6 +102,68 @@ std::string test_database_connection_string() {
     }
 
     return "dbname=ai_artifact_store_test";
+}
+
+void ensure_lifecycle_migration_applied() {
+    pqxx::connection connection{test_database_connection_string()};
+
+    auto apply_migration_if_missing = [&](int version, std::string_view name, std::string_view filename) {
+        {
+            pqxx::nontransaction check{connection};
+
+            const bool migration_applied = check.query_value<bool>(
+                "SELECT EXISTS ("
+                "    SELECT 1 "
+                "    FROM schema_migrations "
+                "    WHERE version = $1 "
+                "      AND name = $2"
+                ")",
+                pqxx::params{
+                    version,
+                    std::string{name},
+                });
+
+            if (migration_applied) {
+                return;
+            }
+        }
+
+        const std::filesystem::path migration_path =
+            std::filesystem::path{__FILE__}.parent_path().parent_path().parent_path() / "migrations" / filename;
+
+        std::ifstream migration_file{migration_path};
+
+        if (!migration_file.is_open()) {
+            throw std::runtime_error(std::string{"failed to open migration "} + std::string{filename});
+        }
+
+        std::string migration_sql{
+            std::istreambuf_iterator<char>{migration_file},
+            std::istreambuf_iterator<char>{},
+        };
+
+        pqxx::nontransaction apply{connection};
+        apply.exec(migration_sql);
+    };
+
+    apply_migration_if_missing(10, "ai_aware_lifecycle", "010_ai_aware_lifecycle.sql");
+    apply_migration_if_missing(11, "retired_finalization_reclamation", "011_retired_finalization_reclamation.sql");
+}
+
+LifecyclePolicy make_retirement_lifecycle_policy(const UuidV7& policy_id) {
+    LifecyclePolicy policy{
+        .policy_id = policy_id,
+        .name = "m9-gc-retirement-policy",
+        .rules = {},
+    };
+
+    for (const ArtifactKind kind : {ArtifactKind::Generic, ArtifactKind::ModelCheckpoint, ArtifactKind::DatasetSnapshot,
+                                    ArtifactKind::EmbeddingIndex, ArtifactKind::EvaluationOutput}) {
+        policy.rules.emplace(kind,
+                             LifecycleRule{.artifact_kind = kind, .keep_last_n = 0U, .max_age_seconds = std::nullopt});
+    }
+
+    return policy;
 }
 
 class TemporaryDirectory {
@@ -184,6 +264,8 @@ ObjectLayoutDescriptor make_dead_layout(const std::string& shared_chunk_id, cons
 class GcEngineFixture : public ::testing::Test {
    protected:
     void SetUp() override {
+        ensure_lifecycle_migration_applied();
+
         shared_chunk_id_ = sha256_hex(kSharedContent);
         live_only_chunk_id_ = sha256_hex(kLiveOnlyContent);
         orphan_only_chunk_id_ = sha256_hex(kOrphanOnlyContent);
@@ -198,23 +280,41 @@ class GcEngineFixture : public ::testing::Test {
         {
             pqxx::connection connection{test_database_connection_string()};
             pqxx::work transaction{connection};
-            transaction
-                .exec(
-                    "DELETE FROM upload_session_finalizations WHERE session_id IN "
-                    "(SELECT session_id FROM upload_sessions WHERE state = 'open')")
-                .no_rows();
-            transaction
-                .exec(
-                    "DELETE FROM upload_session_metadata WHERE session_id IN "
-                    "(SELECT session_id FROM upload_sessions WHERE state = 'open')")
-                .no_rows();
-            transaction.exec("DELETE FROM upload_sessions WHERE state = 'open'").no_rows();
+            transaction.exec("DELETE FROM upload_session_finalizations").no_rows();
+            transaction.exec("DELETE FROM upload_session_metadata").no_rows();
+            transaction.exec("DELETE FROM upload_session_nodes").no_rows();
+            transaction.exec("DELETE FROM upload_sessions").no_rows();
             transaction.exec("DELETE FROM replication_runs").no_rows();
             transaction.exec("DELETE FROM gc_runs").no_rows();
+            transaction.exec("DELETE FROM lifecycle_run_decisions").no_rows();
+            transaction.exec("DELETE FROM artifact_version_retirements").no_rows();
+            transaction.exec("DELETE FROM lifecycle_runs").no_rows();
+            transaction.exec("DELETE FROM artifact_version_pins").no_rows();
+            transaction.exec("DELETE FROM lifecycle_policy_rules").no_rows();
+            transaction.exec("DELETE FROM lifecycle_policies").no_rows();
+            transaction.exec("DELETE FROM run_tags").no_rows();
+            transaction.exec("DELETE FROM runs").no_rows();
+            transaction.exec("DELETE FROM manifest_entries").no_rows();
+            transaction.exec("DELETE FROM manifests").no_rows();
+            transaction.exec("DELETE FROM tags").no_rows();
+            transaction.exec("DELETE FROM artifact_version_metadata").no_rows();
+            transaction.exec("DELETE FROM artifact_versions").no_rows();
+            transaction.exec("DELETE FROM object_layout_chunks").no_rows();
+            transaction.exec("DELETE FROM object_layouts").no_rows();
+            transaction.exec("DELETE FROM storage_locations").no_rows();
+            transaction.exec("DELETE FROM objects").no_rows();
+            transaction.exec("DELETE FROM chunks").no_rows();
+            transaction.exec("DELETE FROM artifacts").no_rows();
             transaction.commit();
         }
         repository_->create_artifact(
             Artifact{artifact_id_, std::string{"m7gc-artifact-"} + artifact_id_.str(), "m7gc-project"});
+        repository_->register_storage_node(StorageNode{
+            .node_id = std::string{kTargetNode},
+            .address = "127.0.0.1",
+            .port = 8081,
+            .state = StorageNodeState::Active,
+        });
 
         metadata_service_.emplace(*repository_);
         metadata_server_.emplace(
@@ -266,6 +366,54 @@ class GcEngineFixture : public ::testing::Test {
             transaction.exec("DELETE FROM gc_runs WHERE run_id = $1::uuid", pqxx::params{gc_run_id.str()}).no_rows();
         }
 
+        for (const UuidV7& lifecycle_run_id : owned_lifecycle_run_ids_) {
+            transaction
+                .exec("DELETE FROM artifact_version_retirements WHERE lifecycle_run_id = $1::uuid",
+                      pqxx::params{lifecycle_run_id.str()})
+                .no_rows();
+            transaction
+                .exec("DELETE FROM lifecycle_run_decisions WHERE run_id = $1::uuid",
+                      pqxx::params{lifecycle_run_id.str()})
+                .no_rows();
+            transaction.exec("DELETE FROM lifecycle_runs WHERE run_id = $1::uuid", pqxx::params{lifecycle_run_id.str()})
+                .no_rows();
+        }
+
+        for (const UuidV7& policy_id : owned_lifecycle_policy_ids_) {
+            transaction
+                .exec("DELETE FROM lifecycle_policy_rules WHERE policy_id = $1::uuid", pqxx::params{policy_id.str()})
+                .no_rows();
+            transaction.exec("DELETE FROM lifecycle_policies WHERE policy_id = $1::uuid", pqxx::params{policy_id.str()})
+                .no_rows();
+        }
+
+        transaction.exec("DELETE FROM manifest_entries").no_rows();
+        transaction.exec("DELETE FROM manifests").no_rows();
+        transaction.exec("DELETE FROM tags").no_rows();
+        transaction.exec("DELETE FROM artifact_version_pins").no_rows();
+        transaction.exec("DELETE FROM artifact_version_retirements").no_rows();
+
+        transaction
+            .exec(
+                "DELETE FROM upload_session_finalizations WHERE session_id IN "
+                "(SELECT session_id FROM upload_sessions WHERE artifact_id = $1::uuid)",
+                pqxx::params{artifact_id_.str()})
+            .no_rows();
+        transaction
+            .exec(
+                "DELETE FROM upload_session_metadata WHERE session_id IN "
+                "(SELECT session_id FROM upload_sessions WHERE artifact_id = $1::uuid)",
+                pqxx::params{artifact_id_.str()})
+            .no_rows();
+        transaction
+            .exec(
+                "DELETE FROM upload_session_nodes WHERE session_id IN "
+                "(SELECT session_id FROM upload_sessions WHERE artifact_id = $1::uuid)",
+                pqxx::params{artifact_id_.str()})
+            .no_rows();
+        transaction.exec("DELETE FROM upload_sessions WHERE artifact_id = $1::uuid", pqxx::params{artifact_id_.str()})
+            .no_rows();
+
         transaction.exec("DELETE FROM artifact_versions WHERE artifact_id = $1::uuid", pqxx::params{artifact_id_.str()})
             .no_rows();
 
@@ -290,8 +438,17 @@ class GcEngineFixture : public ::testing::Test {
 
         transaction.exec("DELETE FROM artifacts WHERE artifact_id = $1::uuid", pqxx::params{artifact_id_.str()})
             .no_rows();
+
         transaction.commit();
     }
+
+    void track_lifecycle_run(UuidV7 lifecycle_run_id) {
+        owned_lifecycle_run_ids_.push_back(std::move(lifecycle_run_id));
+    }
+
+    void track_lifecycle_policy(UuidV7 policy_id) { owned_lifecycle_policy_ids_.push_back(std::move(policy_id)); }
+
+    void track_version(std::string version_id) { owned_version_ids_.push_back(std::move(version_id)); }
 
     void track_gc_run(UuidV7 gc_run_id) { owned_gc_run_ids_.push_back(std::move(gc_run_id)); }
 
@@ -300,29 +457,35 @@ class GcEngineFixture : public ::testing::Test {
     void track_object(std::string object_id) { owned_object_ids_.push_back(std::move(object_id)); }
 
     void register_live_metadata(const ObjectLayoutDescriptor& live_layout) {
-        repository_->register_object(live_layout.object());
-        repository_->register_object_layout(live_layout);
-        repository_->create_version(ArtifactVersion{
+        register_layout_chunks(live_layout);
+        ArtifactVersion live_version{
             artifact_id_,
             live_layout.object_id(),
             std::nullopt,
-            ArtifactVersion::ImmutableMetadata{{"marker", unique_tag_}},
+            ArtifactVersion::ImmutableMetadata{
+                {"marker", unique_tag_},
+                {std::string{kArtifactKindMetadataKey}, "generic"},
+            },
             VersionState::Committed,
-        });
-        track_object(live_layout.object_id());
+        };
+        repository_->create_version(live_version);
+        track_version(live_version.version_id());
+    }
 
-        for (const ChunkRef& chunk : live_layout.layout().chunks()) {
-            if (!repository_->get_chunk_size(chunk.chunk_id).has_value()) {
-                repository_->register_chunks({ChunkMetadata{.chunk_id = chunk.chunk_id, .size_bytes = chunk.size}});
-            }
-            track_chunk(chunk.chunk_id);
-            repository_->register_storage_location(StorageLocation{
-                .chunk_id = chunk.chunk_id,
-                .node_id = std::string{kTargetNode},
-                .storage_path = std::string{"/v1/chunks/"} + chunk.chunk_id,
-                .state = StorageLocationState::Available,
-            });
-        }
+    [[nodiscard]] ArtifactVersion create_live_version(const ObjectLayoutDescriptor& live_layout) {
+        ArtifactVersion live_version{
+            artifact_id_,
+            live_layout.object_id(),
+            std::nullopt,
+            ArtifactVersion::ImmutableMetadata{
+                {"marker", unique_tag_},
+                {std::string{kArtifactKindMetadataKey}, "generic"},
+            },
+            VersionState::Committed,
+        };
+        repository_->create_version(live_version);
+        track_version(live_version.version_id());
+        return live_version;
     }
 
     void register_dead_metadata(const ObjectLayoutDescriptor& dead_layout) {
@@ -348,6 +511,147 @@ class GcEngineFixture : public ::testing::Test {
         }
     }
 
+    [[nodiscard]] ArtifactVersion register_dead_version_metadata(const ObjectLayoutDescriptor& dead_layout) {
+        register_dead_metadata(dead_layout);
+
+        ArtifactVersion dead_version{
+            artifact_id_,
+            dead_layout.object_id(),
+            std::nullopt,
+            ArtifactVersion::ImmutableMetadata{
+                {std::string{kArtifactKindMetadataKey}, "generic"},
+                {"marker", "dead"},
+            },
+            VersionState::Committed,
+        };
+        repository_->create_version(dead_version);
+        track_version(dead_version.version_id());
+
+        return dead_version;
+    }
+
+    [[nodiscard]] FinalizeUploadResult finalize_version(const ObjectLayoutDescriptor& layout,
+                                                        std::string_view marker) {
+        for (const ChunkRef& chunk : layout.layout().chunks()) {
+            if (!repository_->get_chunk_size(chunk.chunk_id).has_value()) {
+                repository_->register_chunks({ChunkMetadata{.chunk_id = chunk.chunk_id, .size_bytes = chunk.size}});
+            }
+            track_chunk(chunk.chunk_id);
+            repository_->register_storage_location(StorageLocation{
+                .chunk_id = chunk.chunk_id,
+                .node_id = std::string{kTargetNode},
+                .storage_path = std::string{"/v1/chunks/"} + chunk.chunk_id,
+                .state = StorageLocationState::Available,
+            });
+        }
+
+        const UuidV7 session_id = UuidV7::generate();
+        repository_->create_upload_session(UploadSession{
+            session_id,
+            artifact_id_,
+            std::string{kTargetNode},
+            ChunkingStrategy::FixedSize,
+            3U,
+            std::nullopt,
+            UploadSession::ImmutableMetadata{
+                {std::string{kArtifactKindMetadataKey}, "generic"},
+                {"marker", std::string{marker}},
+            },
+            UploadSessionState::Open,
+            std::nullopt,
+        });
+
+        const FinalizeUploadResult result = repository_->finalize_upload(session_id, layout);
+        track_object(result.object_id);
+        track_version(result.version_id);
+        return result;
+    }
+
+    void register_retirement_policy() {
+        lifecycle_policy_id_ = UuidV7::generate();
+        track_lifecycle_policy(lifecycle_policy_id_);
+        repository_->register_lifecycle_policy(make_retirement_lifecycle_policy(lifecycle_policy_id_));
+    }
+
+    void retire_dead_version_via_lifecycle(std::string_view dead_version_id) {
+        register_retirement_policy();
+
+        const UuidV7 lifecycle_run_id = UuidV7::generate();
+        track_lifecycle_run(lifecycle_run_id);
+
+        const LifecycleRun completed =
+            repository_->run_lifecycle(lifecycle_run_id, lifecycle_policy_id_, LifecycleRunMode::Apply);
+
+        EXPECT_GE(completed.stats.versions_retired, 1U);
+
+        pqxx::connection connection{test_database_connection_string()};
+        pqxx::work transaction{connection};
+
+        const bool retired = transaction.query_value<bool>(
+            "SELECT EXISTS ("
+            "    SELECT 1 "
+            "    FROM artifact_version_retirements "
+            "    WHERE version_id = $1"
+            ")",
+            pqxx::params{
+                dead_version_id,
+            });
+
+        transaction.commit();
+        ASSERT_TRUE(retired);
+    }
+
+    void register_layout_chunks(const ObjectLayoutDescriptor& layout) {
+        repository_->register_object(layout.object());
+        repository_->register_object_layout(layout);
+        track_object(layout.object_id());
+
+        for (const ChunkRef& chunk : layout.layout().chunks()) {
+            if (!repository_->get_chunk_size(chunk.chunk_id).has_value()) {
+                repository_->register_chunks({ChunkMetadata{.chunk_id = chunk.chunk_id, .size_bytes = chunk.size}});
+            }
+            track_chunk(chunk.chunk_id);
+            repository_->register_storage_location(StorageLocation{
+                .chunk_id = chunk.chunk_id,
+                .node_id = std::string{kTargetNode},
+                .storage_path = std::string{"/v1/chunks/"} + chunk.chunk_id,
+                .state = StorageLocationState::Available,
+            });
+        }
+    }
+
+    [[nodiscard]] ArtifactVersion register_committed_version(const UuidV7& artifact_id,
+                                                             const ObjectLayoutDescriptor& layout,
+                                                             std::string_view kind_string, std::string_view marker) {
+        register_layout_chunks(layout);
+
+        ArtifactVersion version{
+            artifact_id,
+            layout.object_id(),
+            std::nullopt,
+            ArtifactVersion::ImmutableMetadata{
+                {std::string{kArtifactKindMetadataKey}, std::string{kind_string}},
+                {"marker", std::string{marker}},
+            },
+            VersionState::Committed,
+        };
+        repository_->create_version(version);
+        track_version(version.version_id());
+
+        return version;
+    }
+
+    ObjectLayoutDescriptor make_single_chunk_layout(char object_marker, std::string_view content) const {
+        const std::string chunk_id = sha256_hex(content);
+        return ObjectLayoutDescriptor{
+            Object{std::string(63, '0') + object_marker, static_cast<std::uint64_t>(content.size())},
+            ChunkingStrategy::FixedSize,
+            ObjectLayout{{
+                ChunkRef{.chunk_id = chunk_id, .offset = 0, .size = content.size()},
+            }},
+        };
+    }
+
     void put_physical_chunk(std::string_view chunk_id, std::string_view contents) {
         track_chunk(std::string{chunk_id});
         chunk_store_->put(std::string{chunk_id}, std::as_bytes(std::span{contents.data(), contents.size()}));
@@ -361,6 +665,7 @@ class GcEngineFixture : public ::testing::Test {
     }
 
     UuidV7 artifact_id_{UuidV7::generate()};
+    UuidV7 lifecycle_policy_id_{UuidV7::generate()};
     std::string unique_tag_;
     std::string shared_chunk_id_;
     std::string live_only_chunk_id_;
@@ -369,6 +674,9 @@ class GcEngineFixture : public ::testing::Test {
     std::string retry_orphan_chunk_id_;
     std::string completed_retry_chunk_id_;
     std::vector<UuidV7> owned_gc_run_ids_;
+    std::vector<UuidV7> owned_lifecycle_run_ids_;
+    std::vector<UuidV7> owned_lifecycle_policy_ids_;
+    std::vector<std::string> owned_version_ids_;
     std::vector<std::string> owned_chunk_ids_;
     std::vector<std::string> owned_object_ids_;
 
@@ -505,6 +813,177 @@ TEST_F(GcEngineFixture, CompletedRunRetryDoesNotContactStorageNode) {
     EXPECT_EQ(retried.state, GcRunState::Completed);
     EXPECT_EQ(retried.run_id, gc_run_id);
     EXPECT_EQ(retried.physical_stats.physically_deleted_chunks, completed.physical_stats.physically_deleted_chunks);
+}
+
+TEST_F(GcEngineFixture, CollectsRepresentationAfterVersionRetirement) {
+    const ObjectLayoutDescriptor live_layout = make_live_layout(shared_chunk_id_, live_only_chunk_id_);
+    const ObjectLayoutDescriptor dead_layout = make_dead_layout(shared_chunk_id_, orphan_only_chunk_id_);
+
+    const FinalizeUploadResult dead_finalized = finalize_version(dead_layout, "dead-finalize");
+    const UuidV7 dead_session_id = dead_finalized.session_id;
+    const std::string dead_layout_id = dead_finalized.layout_id;
+    const std::string dead_version_id = dead_finalized.version_id;
+
+    {
+        pqxx::connection connection{test_database_connection_string()};
+        pqxx::work transaction{connection};
+        const bool has_finalization = transaction.query_value<bool>(
+            "SELECT EXISTS ("
+            "    SELECT 1 "
+            "    FROM upload_session_finalizations "
+            "    WHERE session_id = $1::uuid "
+            "      AND layout_id = $2"
+            ")",
+            pqxx::params{
+                dead_session_id.str(),
+                dead_layout_id,
+            });
+        transaction.commit();
+        ASSERT_TRUE(has_finalization);
+    }
+
+    retire_dead_version_via_lifecycle(dead_version_id);
+
+    const FinalizeUploadResult live_finalized = finalize_version(live_layout, "live-finalize");
+    const UuidV7 live_session_id = live_finalized.session_id;
+    const std::string live_layout_id = live_finalized.layout_id;
+
+    put_physical_chunk(shared_chunk_id_, kSharedContent);
+    put_physical_chunk(live_only_chunk_id_, kLiveOnlyContent);
+    put_physical_chunk(orphan_only_chunk_id_, kOrphanOnlyContent);
+
+    const UuidV7 gc_run_id = UuidV7::generate();
+    track_gc_run(gc_run_id);
+
+    const GcRun completed = engine().collect(GcRequest{.run_id = gc_run_id, .dry_run = false});
+
+    EXPECT_EQ(completed.mode, GcRunMode::Apply);
+    EXPECT_EQ(completed.state, GcRunState::Completed);
+    EXPECT_GE(completed.physical_stats.collectible_chunks, 1U);
+    EXPECT_GE(completed.physical_stats.physically_deleted_chunks, 1U);
+
+    EXPECT_TRUE(chunk_store_->contains(shared_chunk_id_));
+    EXPECT_TRUE(chunk_store_->contains(live_only_chunk_id_));
+    EXPECT_FALSE(chunk_store_->contains(orphan_only_chunk_id_));
+
+    pqxx::connection connection{test_database_connection_string()};
+    pqxx::work transaction{connection};
+
+    EXPECT_FALSE(transaction.query_value<bool>("SELECT EXISTS (SELECT 1 FROM storage_locations WHERE chunk_id = $1)",
+                                               pqxx::params{orphan_only_chunk_id_}));
+    EXPECT_FALSE(transaction.query_value<bool>(
+        "SELECT EXISTS (SELECT 1 FROM object_layout_chunks WHERE layout_id = $1)", pqxx::params{dead_layout_id}));
+    EXPECT_FALSE(transaction.query_value<bool>("SELECT EXISTS (SELECT 1 FROM object_layouts WHERE layout_id = $1)",
+                                               pqxx::params{dead_layout_id}));
+    EXPECT_FALSE(transaction.query_value<bool>("SELECT EXISTS (SELECT 1 FROM chunks WHERE chunk_id = $1)",
+                                               pqxx::params{orphan_only_chunk_id_}));
+
+    EXPECT_TRUE(transaction.query_value<bool>(
+        "SELECT EXISTS (SELECT 1 FROM upload_session_finalizations WHERE session_id = $1::uuid)",
+        pqxx::params{dead_session_id.str()}));
+    EXPECT_TRUE(transaction.query_value<bool>(
+        "SELECT layout_id IS NULL FROM upload_session_finalizations WHERE session_id = $1::uuid",
+        pqxx::params{dead_session_id.str()}));
+    EXPECT_TRUE(transaction.query_value<bool>(
+        "SELECT EXISTS (SELECT 1 FROM upload_sessions WHERE session_id = $1::uuid)",
+        pqxx::params{dead_session_id.str()}));
+    EXPECT_EQ(transaction.query_value<std::string>(
+                  "SELECT finalized_version_id FROM upload_sessions WHERE session_id = $1::uuid",
+                  pqxx::params{dead_session_id.str()}),
+              dead_version_id);
+    EXPECT_TRUE(transaction.query_value<bool>(
+        "SELECT EXISTS (SELECT 1 FROM artifact_versions WHERE version_id = $1)", pqxx::params{dead_version_id}));
+    EXPECT_TRUE(transaction.query_value<bool>(
+        "SELECT EXISTS (SELECT 1 FROM artifact_version_retirements WHERE version_id = $1)",
+        pqxx::params{dead_version_id}));
+
+    EXPECT_TRUE(transaction.query_value<bool>("SELECT EXISTS (SELECT 1 FROM object_layouts WHERE layout_id = $1)",
+                                              pqxx::params{live_layout_id}));
+    EXPECT_EQ(transaction.query_value<std::string>(
+                  "SELECT layout_id FROM upload_session_finalizations WHERE session_id = $1::uuid",
+                  pqxx::params{live_session_id.str()}),
+              live_layout_id);
+
+    transaction.commit();
+}
+
+TEST_F(GcEngineFixture, PreservesPinnedTaggedAndManifestProtectedRepresentations) {
+    constexpr std::string_view kPinnedContent = "pin";
+    constexpr std::string_view kTaggedContent = "tag";
+    constexpr std::string_view kManifestContent = "man";
+    constexpr std::string_view kCandidateContent = "can";
+
+    const ObjectLayoutDescriptor pinned_layout = make_single_chunk_layout('a', kPinnedContent);
+    const ObjectLayoutDescriptor tagged_layout = make_single_chunk_layout('b', kTaggedContent);
+    const ObjectLayoutDescriptor manifest_layout = make_single_chunk_layout('c', kManifestContent);
+    const ObjectLayoutDescriptor candidate_layout = make_single_chunk_layout('d', kCandidateContent);
+
+    const std::string pinned_chunk_id = sha256_hex(kPinnedContent);
+    const std::string tagged_chunk_id = sha256_hex(kTaggedContent);
+    const std::string manifest_chunk_id = sha256_hex(kManifestContent);
+    const std::string candidate_chunk_id = sha256_hex(kCandidateContent);
+
+    const ArtifactVersion pinned_version = register_committed_version(artifact_id_, pinned_layout, "generic", "pinned");
+    const ArtifactVersion tagged_version = register_committed_version(artifact_id_, tagged_layout, "generic", "tagged");
+    const ArtifactVersion manifest_version =
+        register_committed_version(artifact_id_, manifest_layout, "generic", "manifest");
+    const ArtifactVersion candidate_version =
+        register_committed_version(artifact_id_, candidate_layout, "generic", "candidate");
+
+    repository_->pin_version(pinned_version.version_id(), "golden");
+    repository_->set_tag(artifact_id_, "protected", tagged_version.version_id());
+    repository_->register_manifest(Manifest{Manifest::Entries{{"entry", manifest_version.version_id()}}});
+
+    register_retirement_policy();
+    const UuidV7 lifecycle_run_id = UuidV7::generate();
+    track_lifecycle_run(lifecycle_run_id);
+    const LifecycleRun lifecycle_completed =
+        repository_->run_lifecycle(lifecycle_run_id, lifecycle_policy_id_, LifecycleRunMode::Apply);
+
+    EXPECT_EQ(lifecycle_completed.stats.versions_protected, 3U);
+    EXPECT_EQ(lifecycle_completed.stats.versions_retired, 1U);
+
+    put_physical_chunk(pinned_chunk_id, kPinnedContent);
+    put_physical_chunk(tagged_chunk_id, kTaggedContent);
+    put_physical_chunk(manifest_chunk_id, kManifestContent);
+    put_physical_chunk(candidate_chunk_id, kCandidateContent);
+
+    const UuidV7 gc_run_id = UuidV7::generate();
+    track_gc_run(gc_run_id);
+
+    const GcRun completed = engine().collect(GcRequest{.run_id = gc_run_id, .dry_run = false});
+
+    EXPECT_EQ(completed.state, GcRunState::Completed);
+    EXPECT_TRUE(chunk_store_->contains(pinned_chunk_id));
+    EXPECT_TRUE(chunk_store_->contains(tagged_chunk_id));
+    EXPECT_TRUE(chunk_store_->contains(manifest_chunk_id));
+    EXPECT_FALSE(chunk_store_->contains(candidate_chunk_id));
+
+    (void)candidate_version;
+}
+
+TEST_F(GcEngineFixture, PreservesSharedChunkReferencedByActiveVersion) {
+    const ObjectLayoutDescriptor live_layout = make_live_layout(shared_chunk_id_, live_only_chunk_id_);
+    const ObjectLayoutDescriptor dead_layout = make_dead_layout(shared_chunk_id_, orphan_only_chunk_id_);
+
+    register_layout_chunks(live_layout);
+    const ArtifactVersion dead_version = register_dead_version_metadata(dead_layout);
+    retire_dead_version_via_lifecycle(dead_version.version_id());
+    (void)create_live_version(live_layout);
+
+    put_physical_chunk(shared_chunk_id_, kSharedContent);
+    put_physical_chunk(live_only_chunk_id_, kLiveOnlyContent);
+    put_physical_chunk(orphan_only_chunk_id_, kOrphanOnlyContent);
+
+    const UuidV7 gc_run_id = UuidV7::generate();
+    track_gc_run(gc_run_id);
+
+    const GcRun completed = engine().collect(GcRequest{.run_id = gc_run_id, .dry_run = false});
+
+    EXPECT_EQ(completed.state, GcRunState::Completed);
+    EXPECT_FALSE(chunk_store_->contains(orphan_only_chunk_id_));
+    EXPECT_TRUE(chunk_store_->contains(shared_chunk_id_));
+    EXPECT_TRUE(chunk_store_->contains(live_only_chunk_id_));
 }
 
 }  // namespace

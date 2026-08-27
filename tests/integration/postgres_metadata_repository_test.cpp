@@ -15,6 +15,7 @@
 
 #include "aistore/metadata/finalize_upload.hpp"
 #include "aistore/metadata/gc.hpp"
+#include "aistore/metadata/lifecycle.hpp"
 #include "aistore/metadata/placement.hpp"
 #include "aistore/metadata/replication.hpp"
 #include "aistore/metadata/restore_plan.hpp"
@@ -23,6 +24,7 @@
 namespace {
 
 using aistore::metadata::Artifact;
+using aistore::metadata::ArtifactKind;
 using aistore::metadata::ArtifactVersion;
 using aistore::metadata::ChunkingStrategy;
 using aistore::metadata::ChunkMetadata;
@@ -36,7 +38,17 @@ using aistore::metadata::GcPhysicalStats;
 using aistore::metadata::GcRun;
 using aistore::metadata::GcRunMode;
 using aistore::metadata::GcRunState;
+using aistore::metadata::kArtifactKindMetadataKey;
+using aistore::metadata::LifecycleDecision;
+using aistore::metadata::LifecycleDecisionReason;
+using aistore::metadata::LifecycleError;
+using aistore::metadata::LifecycleErrorKind;
+using aistore::metadata::LifecyclePolicy;
+using aistore::metadata::LifecycleRule;
+using aistore::metadata::LifecycleRun;
+using aistore::metadata::LifecycleRunMode;
 using aistore::metadata::Manifest;
+using aistore::metadata::MultiNodeRestorePlan;
 using aistore::metadata::Object;
 using aistore::metadata::ObjectLayout;
 using aistore::metadata::ObjectLayoutDescriptor;
@@ -161,9 +173,58 @@ void ensure_gc_migration_applied() {
     apply.exec(migration_sql);
 }
 
+void ensure_lifecycle_migration_applied() {
+    pqxx::connection connection{
+        test_database_connection_string(),
+    };
+
+    auto apply_migration_if_missing = [&](int version, std::string_view name, std::string_view filename) {
+        {
+            pqxx::nontransaction check{connection};
+
+            const bool migration_applied = check.query_value<bool>(
+                "SELECT EXISTS ("
+                "    SELECT 1 "
+                "    FROM schema_migrations "
+                "    WHERE version = $1 "
+                "      AND name = $2"
+                ")",
+                pqxx::params{
+                    version,
+                    std::string{name},
+                });
+
+            if (migration_applied) {
+                return;
+            }
+        }
+
+        const std::filesystem::path migration_path =
+            std::filesystem::path{__FILE__}.parent_path().parent_path().parent_path() / "migrations" / filename;
+
+        std::ifstream migration_file{migration_path};
+
+        if (!migration_file.is_open()) {
+            throw std::runtime_error(std::string{"failed to open migration "} + std::string{filename});
+        }
+
+        std::string migration_sql{
+            std::istreambuf_iterator<char>{migration_file},
+            std::istreambuf_iterator<char>{},
+        };
+
+        pqxx::nontransaction apply{connection};
+        apply.exec(migration_sql);
+    };
+
+    apply_migration_if_missing(10, "ai_aware_lifecycle", "010_ai_aware_lifecycle.sql");
+    apply_migration_if_missing(11, "retired_finalization_reclamation", "011_retired_finalization_reclamation.sql");
+}
+
 void reset_metadata_data() {
     ensure_gc_migration_applied();
     ensure_replication_migration_applied();
+    ensure_lifecycle_migration_applied();
 
     pqxx::connection connection{
         test_database_connection_string(),
@@ -188,6 +249,12 @@ void reset_metadata_data() {
             "    replication_run_nodes, "
             "    replication_runs, "
             "    gc_runs, "
+            "    lifecycle_run_decisions, "
+            "    artifact_version_retirements, "
+            "    lifecycle_runs, "
+            "    lifecycle_policy_rules, "
+            "    artifact_version_pins, "
+            "    lifecycle_policies, "
             "    artifact_versions, "
             "    object_layout_chunks, "
             "    object_layouts, "
@@ -383,6 +450,125 @@ ArtifactVersion register_replication_version(PostgresMetadataRepository& reposit
     repository.create_version(version);
 
     return version;
+}
+
+LifecyclePolicy make_uniform_lifecycle_policy(const UuidV7& policy_id, std::uint32_t keep_last_n,
+                                              std::optional<std::uint64_t> max_age_seconds = std::nullopt) {
+    LifecyclePolicy policy{
+        .policy_id = policy_id,
+        .name = "m9-lifecycle-policy",
+        .rules = {},
+    };
+
+    for (const ArtifactKind kind : {ArtifactKind::Generic, ArtifactKind::ModelCheckpoint, ArtifactKind::DatasetSnapshot,
+                                    ArtifactKind::EmbeddingIndex, ArtifactKind::EvaluationOutput}) {
+        policy.rules.emplace(
+            kind, LifecycleRule{.artifact_kind = kind, .keep_last_n = keep_last_n, .max_age_seconds = max_age_seconds});
+    }
+
+    return policy;
+}
+
+std::string make_lifecycle_hex_id(char marker, char role) {
+    const unsigned value = (static_cast<unsigned char>(marker) << 8U) | static_cast<unsigned char>(role);
+
+    constexpr char kHex[] = "0123456789abcdef";
+    std::string id(62, '0');
+    id.push_back(kHex[(value >> 4U) & 0x0fU]);
+    id.push_back(kHex[value & 0x0fU]);
+
+    return id;
+}
+
+ObjectLayoutDescriptor make_lifecycle_descriptor(char object_marker) {
+    return ObjectLayoutDescriptor{
+        Object{make_lifecycle_hex_id(object_marker, 'o'), 6},
+        ChunkingStrategy::FixedSize,
+        ObjectLayout{{
+            ChunkRef{.chunk_id = make_lifecycle_hex_id(object_marker, 'a'), .offset = 0, .size = 4},
+            ChunkRef{.chunk_id = make_lifecycle_hex_id(object_marker, 'b'), .offset = 4, .size = 2},
+        }},
+    };
+}
+
+ArtifactVersion create_committed_version_with_kind(PostgresMetadataRepository& repository, const UuidV7& artifact_id,
+                                                   char object_marker, std::string_view kind_string,
+                                                   std::optional<std::string> parent = std::nullopt) {
+    const auto descriptor = make_lifecycle_descriptor(object_marker);
+
+    repository.register_object(descriptor.object());
+    repository.register_object_layout(descriptor);
+
+    ArtifactVersion version{
+        artifact_id,
+        descriptor.object_id(),
+        std::move(parent),
+        ArtifactVersion::ImmutableMetadata{
+            {"marker", std::string(1, object_marker)},
+            {std::string{kArtifactKindMetadataKey}, std::string{kind_string}},
+        },
+        VersionState::Committed,
+    };
+
+    repository.create_version(version);
+
+    return version;
+}
+
+void retire_version_via_lifecycle(PostgresMetadataRepository& repository, std::string_view version_id,
+                                  const UuidV7& policy_id) {
+    const UuidV7 run_id = UuidV7::generate();
+    const LifecycleRun run = repository.run_lifecycle(run_id, policy_id, LifecycleRunMode::Apply);
+
+    pqxx::connection connection{test_database_connection_string()};
+    pqxx::work transaction{connection};
+
+    const bool retired = transaction.query_value<bool>(
+        "SELECT EXISTS ("
+        "    SELECT 1 "
+        "    FROM artifact_version_retirements "
+        "    WHERE version_id = $1"
+        ")",
+        pqxx::params{
+            version_id,
+        });
+
+    transaction.commit();
+
+    if (!retired) {
+        throw std::runtime_error("lifecycle apply did not retire version: " + std::string{version_id});
+    }
+
+    (void)run;
+}
+
+[[nodiscard]] const LifecycleDecision* find_lifecycle_decision(const std::vector<LifecycleDecision>& decisions,
+                                                               std::string_view version_id) {
+    for (const LifecycleDecision& decision : decisions) {
+        if (decision.version_id == version_id) {
+            return &decision;
+        }
+    }
+
+    return nullptr;
+}
+
+void set_version_created_at(std::string_view version_id, const std::string& timestamp) {
+    pqxx::connection connection{test_database_connection_string()};
+    pqxx::work transaction{connection};
+
+    transaction
+        .exec(
+            "UPDATE artifact_versions "
+            "SET created_at = $2::timestamptz "
+            "WHERE version_id = $1",
+            pqxx::params{
+                version_id,
+                timestamp,
+            })
+        .no_rows();
+
+    transaction.commit();
 }
 
 TEST(PostgresMetadataRepositoryTest, CreatesAndReadsArtifact) {
@@ -3491,6 +3677,594 @@ TEST(PostgresMetadataRepositoryTest, GcAndReplicationRunsAreMutuallyExclusive) {
         FAIL() << "expected ReplicationError";
     } catch (const ReplicationError& error) {
         EXPECT_EQ(error.kind(), ReplicationErrorKind::GcInProgress);
+    }
+}
+
+TEST(PostgresMetadataRepositoryTest, PersistsAndLoadsLifecyclePolicy) {
+    reset_metadata_data();
+    PostgresMetadataRepository repository{test_database_connection_string()};
+    const UuidV7 policy_id = UuidV7::generate();
+    const LifecyclePolicy policy = make_uniform_lifecycle_policy(policy_id, 3U, 86400ULL);
+
+    repository.register_lifecycle_policy(policy);
+
+    const auto loaded = repository.get_lifecycle_policy(policy_id);
+
+    ASSERT_TRUE(loaded.has_value());
+    EXPECT_EQ(loaded->policy_id, policy_id);
+    EXPECT_EQ(loaded->name, policy.name);
+    EXPECT_EQ(loaded->rules, policy.rules);
+}
+
+TEST(PostgresMetadataRepositoryTest, LifecyclePolicyRegistrationIsIdempotentAndConflictsOnMismatch) {
+    reset_metadata_data();
+    PostgresMetadataRepository repository{test_database_connection_string()};
+    const UuidV7 policy_id = UuidV7::generate();
+    const LifecyclePolicy policy = make_uniform_lifecycle_policy(policy_id, 2U);
+
+    repository.register_lifecycle_policy(policy);
+    EXPECT_NO_THROW(repository.register_lifecycle_policy(policy));
+
+    LifecyclePolicy conflicting = policy;
+    conflicting.rules.at(ArtifactKind::Generic).keep_last_n = 5U;
+
+    try {
+        repository.register_lifecycle_policy(conflicting);
+        FAIL() << "expected LifecycleError";
+    } catch (const LifecycleError& error) {
+        EXPECT_EQ(error.kind(), LifecycleErrorKind::PolicyConflict);
+    }
+}
+
+TEST(PostgresMetadataRepositoryTest, PinsAndUnpinsCommittedVersion) {
+    reset_metadata_data();
+    PostgresMetadataRepository repository{test_database_connection_string()};
+    const UuidV7 artifact_id = UuidV7::generate();
+
+    repository.create_artifact(Artifact{artifact_id, "lifecycle-pin", "m9"});
+    const ArtifactVersion version = create_committed_version_with_kind(repository, artifact_id, 'p', "generic");
+
+    repository.pin_version(version.version_id(), "hold for eval");
+
+    const auto pin = repository.get_version_pin(version.version_id());
+
+    ASSERT_TRUE(pin.has_value());
+    EXPECT_EQ(*pin, "hold for eval");
+    EXPECT_TRUE(repository.unpin_version(version.version_id()));
+    EXPECT_FALSE(repository.get_version_pin(version.version_id()).has_value());
+}
+
+TEST(PostgresMetadataRepositoryTest, RejectsPinningMissingOrRetiredVersion) {
+    reset_metadata_data();
+    PostgresMetadataRepository repository{test_database_connection_string()};
+    const UuidV7 artifact_id = UuidV7::generate();
+    const UuidV7 policy_id = UuidV7::generate();
+
+    repository.create_artifact(Artifact{artifact_id, "lifecycle-pin-reject", "m9"});
+    const ArtifactVersion version = create_committed_version_with_kind(repository, artifact_id, 'r', "generic");
+    repository.register_lifecycle_policy(make_uniform_lifecycle_policy(policy_id, 0U, 0ULL));
+
+    try {
+        repository.pin_version(std::string(64, 'f'), "reason");
+        FAIL() << "expected LifecycleError";
+    } catch (const LifecycleError& error) {
+        EXPECT_EQ(error.kind(), LifecycleErrorKind::VersionNotFound);
+    }
+
+    retire_version_via_lifecycle(repository, version.version_id(), policy_id);
+
+    try {
+        repository.pin_version(version.version_id(), "reason");
+        FAIL() << "expected LifecycleError";
+    } catch (const LifecycleError& error) {
+        EXPECT_EQ(error.kind(), LifecycleErrorKind::VersionRetired);
+    }
+}
+
+TEST(PostgresMetadataRepositoryTest, DryRunAppliesKindSpecificKeepLastAndAgeRules) {
+    reset_metadata_data();
+    PostgresMetadataRepository repository{test_database_connection_string()};
+    const UuidV7 artifact_id = UuidV7::generate();
+    const UuidV7 policy_id = UuidV7::generate();
+    const UuidV7 run_id = UuidV7::generate();
+
+    repository.create_artifact(Artifact{artifact_id, "lifecycle-dry-run", "m9"});
+
+    LifecyclePolicy policy = make_uniform_lifecycle_policy(policy_id, 0U, 0ULL);
+    policy.rules.at(ArtifactKind::Generic).keep_last_n = 1U;
+    policy.rules.at(ArtifactKind::ModelCheckpoint).keep_last_n = 2U;
+    policy.rules.at(ArtifactKind::DatasetSnapshot).max_age_seconds = 86400ULL;
+    repository.register_lifecycle_policy(policy);
+
+    const ArtifactVersion generic_old = create_committed_version_with_kind(repository, artifact_id, '1', "generic");
+    const ArtifactVersion generic_new = create_committed_version_with_kind(repository, artifact_id, '2', "generic");
+    const ArtifactVersion checkpoint_old =
+        create_committed_version_with_kind(repository, artifact_id, '3', "model-checkpoint");
+    const ArtifactVersion checkpoint_mid =
+        create_committed_version_with_kind(repository, artifact_id, '4', "model-checkpoint");
+    const ArtifactVersion checkpoint_new =
+        create_committed_version_with_kind(repository, artifact_id, '5', "model-checkpoint");
+    const ArtifactVersion dataset_old =
+        create_committed_version_with_kind(repository, artifact_id, '6', "dataset-snapshot");
+    const ArtifactVersion dataset_new =
+        create_committed_version_with_kind(repository, artifact_id, '7', "dataset-snapshot");
+
+    set_version_created_at(dataset_old.version_id(), "2020-01-01T00:00:00Z");
+
+    const LifecycleRun run = repository.run_lifecycle(run_id, policy_id, LifecycleRunMode::DryRun);
+    const std::vector<LifecycleDecision> decisions = repository.list_lifecycle_decisions(run_id, std::nullopt, 256U);
+
+    EXPECT_EQ(run.mode, LifecycleRunMode::DryRun);
+    EXPECT_EQ(run.stats.versions_scanned, 7U);
+    EXPECT_EQ(run.stats.versions_retired, 0U);
+
+    const LifecycleDecision* generic_kept = find_lifecycle_decision(decisions, generic_new.version_id());
+    const LifecycleDecision* generic_retire = find_lifecycle_decision(decisions, generic_old.version_id());
+    ASSERT_NE(generic_kept, nullptr);
+    ASSERT_NE(generic_retire, nullptr);
+    EXPECT_FALSE(generic_kept->retire);
+    EXPECT_EQ(generic_kept->reason, LifecycleDecisionReason::KeepLastN);
+    EXPECT_TRUE(generic_retire->retire);
+    EXPECT_EQ(generic_retire->reason, LifecycleDecisionReason::PolicyRetire);
+
+    const LifecycleDecision* checkpoint_mid_decision = find_lifecycle_decision(decisions, checkpoint_mid.version_id());
+    const LifecycleDecision* checkpoint_old_decision = find_lifecycle_decision(decisions, checkpoint_old.version_id());
+    ASSERT_NE(checkpoint_mid_decision, nullptr);
+    ASSERT_NE(checkpoint_old_decision, nullptr);
+    EXPECT_FALSE(checkpoint_mid_decision->retire);
+    EXPECT_EQ(checkpoint_mid_decision->reason, LifecycleDecisionReason::KeepLastN);
+    EXPECT_TRUE(checkpoint_old_decision->retire);
+    EXPECT_EQ(checkpoint_old_decision->reason, LifecycleDecisionReason::PolicyRetire);
+
+    const LifecycleDecision* dataset_old_decision = find_lifecycle_decision(decisions, dataset_old.version_id());
+    const LifecycleDecision* dataset_new_decision = find_lifecycle_decision(decisions, dataset_new.version_id());
+    ASSERT_NE(dataset_old_decision, nullptr);
+    ASSERT_NE(dataset_new_decision, nullptr);
+    EXPECT_TRUE(dataset_old_decision->retire);
+    EXPECT_EQ(dataset_old_decision->reason, LifecycleDecisionReason::PolicyRetire);
+    EXPECT_FALSE(dataset_new_decision->retire);
+    EXPECT_EQ(dataset_new_decision->reason, LifecycleDecisionReason::AgeNotReached);
+}
+
+TEST(PostgresMetadataRepositoryTest, TagsAndManifestsProtectLifecycleCandidates) {
+    reset_metadata_data();
+    PostgresMetadataRepository repository{test_database_connection_string()};
+    const UuidV7 artifact_id = UuidV7::generate();
+    const UuidV7 policy_id = UuidV7::generate();
+    const UuidV7 run_id = UuidV7::generate();
+
+    repository.create_artifact(Artifact{artifact_id, "lifecycle-protect", "m9"});
+    repository.register_lifecycle_policy(make_uniform_lifecycle_policy(policy_id, 0U, 0ULL));
+
+    const ArtifactVersion tagged = create_committed_version_with_kind(repository, artifact_id, 't', "generic");
+    const ArtifactVersion manifest_version =
+        create_committed_version_with_kind(repository, artifact_id, 'm', "generic");
+    const ArtifactVersion retire_candidate =
+        create_committed_version_with_kind(repository, artifact_id, 'c', "generic");
+
+    repository.set_tag(artifact_id, "protected", tagged.version_id());
+
+    const Manifest manifest{
+        Manifest::Entries{
+            {"entry", manifest_version.version_id()},
+        },
+    };
+    repository.register_manifest(manifest);
+
+    const LifecycleRun run = repository.run_lifecycle(run_id, policy_id, LifecycleRunMode::Apply);
+    const std::vector<LifecycleDecision> decisions = repository.list_lifecycle_decisions(run_id, std::nullopt, 256U);
+
+    const LifecycleDecision* tagged_decision = find_lifecycle_decision(decisions, tagged.version_id());
+    const LifecycleDecision* manifest_decision = find_lifecycle_decision(decisions, manifest_version.version_id());
+    const LifecycleDecision* retire_decision = find_lifecycle_decision(decisions, retire_candidate.version_id());
+    ASSERT_NE(tagged_decision, nullptr);
+    ASSERT_NE(manifest_decision, nullptr);
+    ASSERT_NE(retire_decision, nullptr);
+
+    EXPECT_FALSE(tagged_decision->retire);
+    EXPECT_EQ(tagged_decision->reason, LifecycleDecisionReason::Tagged);
+    EXPECT_FALSE(manifest_decision->retire);
+    EXPECT_EQ(manifest_decision->reason, LifecycleDecisionReason::ManifestReferenced);
+    EXPECT_TRUE(retire_decision->retire);
+    EXPECT_EQ(retire_decision->reason, LifecycleDecisionReason::PolicyRetire);
+    EXPECT_EQ(run.stats.versions_protected, 2U);
+    EXPECT_EQ(run.stats.versions_retired, 1U);
+}
+
+TEST(PostgresMetadataRepositoryTest, LifecycleDecisionReasonsUseDeterministicPriority) {
+    reset_metadata_data();
+    PostgresMetadataRepository repository{test_database_connection_string()};
+    const UuidV7 artifact_id = UuidV7::generate();
+    const UuidV7 policy_id = UuidV7::generate();
+    const UuidV7 run_id = UuidV7::generate();
+
+    repository.create_artifact(Artifact{artifact_id, "lifecycle-priority", "m9"});
+
+    LifecyclePolicy policy = make_uniform_lifecycle_policy(policy_id, 1U, 0ULL);
+    repository.register_lifecycle_policy(policy);
+
+    const ArtifactVersion retire_candidate =
+        create_committed_version_with_kind(repository, artifact_id, 'c', "generic");
+    const ArtifactVersion pinned = create_committed_version_with_kind(repository, artifact_id, 'p', "generic");
+    const ArtifactVersion tagged = create_committed_version_with_kind(repository, artifact_id, 't', "generic");
+    const ArtifactVersion manifest_version =
+        create_committed_version_with_kind(repository, artifact_id, 'm', "generic");
+    const ArtifactVersion keep_last = create_committed_version_with_kind(repository, artifact_id, 'k', "generic");
+
+    repository.pin_version(pinned.version_id(), "priority-test");
+    repository.set_tag(artifact_id, "priority-tag", tagged.version_id());
+
+    const Manifest manifest{
+        Manifest::Entries{
+            {"priority", manifest_version.version_id()},
+        },
+    };
+    repository.register_manifest(manifest);
+
+    repository.pin_version(manifest_version.version_id(), "also-pinned");
+
+    const LifecycleRun run = repository.run_lifecycle(run_id, policy_id, LifecycleRunMode::DryRun);
+    const std::vector<LifecycleDecision> decisions = repository.list_lifecycle_decisions(run_id, std::nullopt, 256U);
+
+    const LifecycleDecision* pinned_decision = find_lifecycle_decision(decisions, pinned.version_id());
+    const LifecycleDecision* tagged_decision = find_lifecycle_decision(decisions, tagged.version_id());
+    const LifecycleDecision* manifest_decision = find_lifecycle_decision(decisions, manifest_version.version_id());
+    const LifecycleDecision* keep_last_decision = find_lifecycle_decision(decisions, keep_last.version_id());
+    const LifecycleDecision* retire_decision = find_lifecycle_decision(decisions, retire_candidate.version_id());
+    ASSERT_NE(pinned_decision, nullptr);
+    ASSERT_NE(tagged_decision, nullptr);
+    ASSERT_NE(manifest_decision, nullptr);
+    ASSERT_NE(keep_last_decision, nullptr);
+    ASSERT_NE(retire_decision, nullptr);
+
+    EXPECT_EQ(pinned_decision->reason, LifecycleDecisionReason::Pinned);
+    EXPECT_EQ(tagged_decision->reason, LifecycleDecisionReason::Tagged);
+    EXPECT_EQ(manifest_decision->reason, LifecycleDecisionReason::Pinned);
+    EXPECT_EQ(keep_last_decision->reason, LifecycleDecisionReason::KeepLastN);
+    EXPECT_EQ(retire_decision->reason, LifecycleDecisionReason::PolicyRetire);
+    EXPECT_TRUE(retire_decision->retire);
+    EXPECT_EQ(run.stats.versions_protected, 3U);
+    EXPECT_EQ(run.stats.versions_retained_by_policy, 1U);
+}
+
+TEST(PostgresMetadataRepositoryTest, ApplyRetiresCandidatesAtomicallyAndPersistsDecisions) {
+    reset_metadata_data();
+    PostgresMetadataRepository repository{test_database_connection_string()};
+    const UuidV7 artifact_id = UuidV7::generate();
+    const UuidV7 policy_id = UuidV7::generate();
+    const UuidV7 run_id = UuidV7::generate();
+
+    repository.create_artifact(Artifact{artifact_id, "lifecycle-apply", "m9"});
+    repository.register_lifecycle_policy(make_uniform_lifecycle_policy(policy_id, 1U, 0ULL));
+
+    const ArtifactVersion retired = create_committed_version_with_kind(repository, artifact_id, 'r', "generic");
+    const ArtifactVersion kept = create_committed_version_with_kind(repository, artifact_id, 'k', "generic");
+
+    const LifecycleRun run = repository.run_lifecycle(run_id, policy_id, LifecycleRunMode::Apply);
+    const std::vector<LifecycleDecision> decisions = repository.list_lifecycle_decisions(run_id, std::nullopt, 256U);
+
+    const LifecycleDecision* kept_decision = find_lifecycle_decision(decisions, kept.version_id());
+    const LifecycleDecision* retired_decision = find_lifecycle_decision(decisions, retired.version_id());
+    ASSERT_NE(kept_decision, nullptr);
+    ASSERT_NE(retired_decision, nullptr);
+
+    EXPECT_FALSE(kept_decision->retire);
+    EXPECT_TRUE(retired_decision->retire);
+    EXPECT_EQ(run.stats.versions_retired, 1U);
+    EXPECT_EQ(run.stats.logical_bytes_retired, retired_decision->logical_size_bytes);
+
+    pqxx::connection connection{test_database_connection_string()};
+    pqxx::work transaction{connection};
+
+    EXPECT_EQ(transaction.query_value<long long>("SELECT COUNT(*) FROM lifecycle_run_decisions WHERE run_id = $1::uuid",
+                                                 pqxx::params{run_id.str()}),
+              2);
+    EXPECT_EQ(
+        transaction.query_value<long long>("SELECT COUNT(*) FROM artifact_version_retirements WHERE version_id = $1",
+                                           pqxx::params{retired.version_id()}),
+        1);
+    EXPECT_EQ(transaction.query_value<std::string>(
+                  "SELECT lifecycle_run_id::text FROM artifact_version_retirements WHERE version_id = $1",
+                  pqxx::params{retired.version_id()}),
+              run_id.str());
+
+    transaction.commit();
+}
+
+TEST(PostgresMetadataRepositoryTest, LifecycleRunRetryIsIdempotent) {
+    reset_metadata_data();
+    PostgresMetadataRepository repository{test_database_connection_string()};
+    const UuidV7 artifact_id = UuidV7::generate();
+    const UuidV7 policy_id = UuidV7::generate();
+    const UuidV7 run_id = UuidV7::generate();
+    const UuidV7 other_policy_id = UuidV7::generate();
+
+    repository.create_artifact(Artifact{artifact_id, "lifecycle-idempotent", "m9"});
+    repository.register_lifecycle_policy(make_uniform_lifecycle_policy(policy_id, 1U, 0ULL));
+    repository.register_lifecycle_policy(make_uniform_lifecycle_policy(other_policy_id, 2U, 0ULL));
+    (void)create_committed_version_with_kind(repository, artifact_id, 'i', "generic");
+
+    const LifecycleRun first = repository.run_lifecycle(run_id, policy_id, LifecycleRunMode::DryRun);
+    const LifecycleRun second = repository.run_lifecycle(run_id, policy_id, LifecycleRunMode::DryRun);
+
+    EXPECT_EQ(second.run_id, first.run_id);
+    EXPECT_EQ(second.policy_id, first.policy_id);
+    EXPECT_EQ(second.mode, first.mode);
+    EXPECT_EQ(second.stats, first.stats);
+
+    try {
+        (void)repository.run_lifecycle(run_id, other_policy_id, LifecycleRunMode::DryRun);
+        FAIL() << "expected LifecycleError";
+    } catch (const LifecycleError& error) {
+        EXPECT_EQ(error.kind(), LifecycleErrorKind::RunConflict);
+    }
+}
+
+TEST(PostgresMetadataRepositoryTest, LifecycleRunRejectsOpenUploadSession) {
+    reset_metadata_data();
+    PostgresMetadataRepository repository{test_database_connection_string()};
+    const UuidV7 artifact_id = UuidV7::generate();
+    const UuidV7 session_id = UuidV7::generate();
+    const UuidV7 policy_id = UuidV7::generate();
+    const UuidV7 run_id = UuidV7::generate();
+
+    repository.create_artifact(Artifact{artifact_id, "lifecycle-open-session", "m9"});
+    repository.register_lifecycle_policy(make_uniform_lifecycle_policy(policy_id, 1U, 0ULL));
+    register_storage_node(repository, "m9-node", "127.0.0.1", 9201);
+    create_verified_upload_session(repository, UploadSession{
+                                                   session_id,
+                                                   artifact_id,
+                                                   "m9-node",
+                                                   ChunkingStrategy::FixedSize,
+                                                   4,
+                                                   std::nullopt,
+                                                   UploadSession::ImmutableMetadata{},
+                                                   UploadSessionState::Open,
+                                                   std::nullopt,
+                                               });
+
+    try {
+        (void)repository.run_lifecycle(run_id, policy_id, LifecycleRunMode::DryRun);
+        FAIL() << "expected LifecycleError";
+    } catch (const LifecycleError& error) {
+        EXPECT_EQ(error.kind(), LifecycleErrorKind::BlockedByOpenUploadSessions);
+    }
+}
+
+TEST(PostgresMetadataRepositoryTest, LifecycleRunRejectsOpenGcAndReplicationRun) {
+    reset_metadata_data();
+    PostgresMetadataRepository repository{test_database_connection_string()};
+    const UuidV7 marker = UuidV7::generate();
+    const UuidV7 artifact_id = UuidV7::generate();
+    const UuidV7 policy_id = UuidV7::generate();
+    const UuidV7 lifecycle_run_id = UuidV7::generate();
+    const UuidV7 gc_run_id = UuidV7::generate();
+    const UuidV7 replication_run_id = UuidV7::generate();
+    const auto descriptor = make_finalize_descriptor('a', 'b', 'c');
+
+    register_storage_node(repository, "m8-node-a", "127.0.0.1", 9101);
+    register_storage_node(repository, "m8-node-b", "127.0.0.2", 9102);
+    register_storage_node(repository, "m8-node-c", "127.0.0.3", 9103);
+
+    repository.create_artifact(Artifact{artifact_id, "lifecycle-gc-repl-" + marker.str(), "m9"});
+    repository.register_lifecycle_policy(make_uniform_lifecycle_policy(policy_id, 1U, 0ULL));
+    const ArtifactVersion version = register_replication_version(repository, artifact_id, descriptor, marker.str());
+
+    (void)repository.start_gc_run(make_open_gc_run(gc_run_id, "m8-node-a"));
+
+    try {
+        (void)repository.run_lifecycle(lifecycle_run_id, policy_id, LifecycleRunMode::DryRun);
+        FAIL() << "expected LifecycleError";
+    } catch (const LifecycleError& error) {
+        EXPECT_EQ(error.kind(), LifecycleErrorKind::BlockedByGc);
+    }
+
+    reset_metadata_data();
+    register_storage_node(repository, "m8-node-a", "127.0.0.1", 9101);
+    register_storage_node(repository, "m8-node-b", "127.0.0.2", 9102);
+    register_storage_node(repository, "m8-node-c", "127.0.0.3", 9103);
+    repository.create_artifact(Artifact{artifact_id, "lifecycle-gc-repl-" + marker.str(), "m9"});
+    repository.register_lifecycle_policy(make_uniform_lifecycle_policy(policy_id, 1U, 0ULL));
+    const ArtifactVersion version_after_reset =
+        register_replication_version(repository, artifact_id, descriptor, marker.str());
+    (void)repository.start_replication_run(replication_run_id, version_after_reset.version_id(), 2U);
+
+    try {
+        (void)repository.run_lifecycle(lifecycle_run_id, policy_id, LifecycleRunMode::DryRun);
+        FAIL() << "expected LifecycleError";
+    } catch (const LifecycleError& error) {
+        EXPECT_EQ(error.kind(), LifecycleErrorKind::BlockedByReplication);
+    }
+
+    (void)version;
+}
+
+TEST(PostgresMetadataRepositoryTest, PolicyRankingIsDeterministicAcrossTimestampTies) {
+    reset_metadata_data();
+    PostgresMetadataRepository repository{test_database_connection_string()};
+    const UuidV7 artifact_id = UuidV7::generate();
+    const UuidV7 policy_id = UuidV7::generate();
+    const UuidV7 run_id = UuidV7::generate();
+
+    repository.create_artifact(Artifact{artifact_id, "lifecycle-ranking", "m9"});
+    repository.register_lifecycle_policy(make_uniform_lifecycle_policy(policy_id, 1U, 0ULL));
+
+    const ArtifactVersion first = create_committed_version_with_kind(repository, artifact_id, 'a', "generic");
+    const ArtifactVersion second = create_committed_version_with_kind(repository, artifact_id, 'b', "generic");
+
+    set_version_created_at(first.version_id(), "2024-06-01T12:00:00Z");
+    set_version_created_at(second.version_id(), "2024-06-01T12:00:00Z");
+
+    const std::string_view kept_version_id =
+        first.version_id() < second.version_id() ? first.version_id() : second.version_id();
+    const std::string_view retired_version_id =
+        first.version_id() < second.version_id() ? second.version_id() : first.version_id();
+
+    const LifecycleRun run = repository.run_lifecycle(run_id, policy_id, LifecycleRunMode::DryRun);
+    const std::vector<LifecycleDecision> decisions = repository.list_lifecycle_decisions(run_id, std::nullopt, 256U);
+
+    const LifecycleDecision* kept_decision = find_lifecycle_decision(decisions, kept_version_id);
+    const LifecycleDecision* retired_decision = find_lifecycle_decision(decisions, retired_version_id);
+    ASSERT_NE(kept_decision, nullptr);
+    ASSERT_NE(retired_decision, nullptr);
+
+    EXPECT_FALSE(kept_decision->retire);
+    EXPECT_EQ(kept_decision->reason, LifecycleDecisionReason::KeepLastN);
+    EXPECT_TRUE(retired_decision->retire);
+    EXPECT_EQ(retired_decision->reason, LifecycleDecisionReason::PolicyRetire);
+    EXPECT_EQ(run.stats.versions_retained_by_policy, 1U);
+}
+
+TEST(PostgresMetadataRepositoryTest, FinalizeRejectsExistingRetiredVersion) {
+    reset_metadata_data();
+    PostgresMetadataRepository repository{test_database_connection_string()};
+    const UuidV7 marker = UuidV7::generate();
+    const UuidV7 artifact_id = UuidV7::generate();
+    const UuidV7 session_id = UuidV7::generate();
+    const UuidV7 policy_id = UuidV7::generate();
+    const auto descriptor = make_finalize_descriptor('a', 'b', 'c');
+
+    repository.create_artifact(Artifact{artifact_id, "lifecycle-finalize-" + marker.str(), "m9"});
+    repository.register_lifecycle_policy(make_uniform_lifecycle_policy(policy_id, 0U, 0ULL));
+    register_storage_node(repository, "m9-finalize", "127.0.0.1", 9201);
+    create_verified_upload_session(repository,
+                                   make_finalize_session(session_id, artifact_id, "m9-finalize", marker.str()));
+    register_finalize_chunks(repository, descriptor, "m9-finalize", StorageLocationState::Available);
+
+    const auto result = repository.finalize_upload(session_id, descriptor);
+    retire_version_via_lifecycle(repository, result.version_id, policy_id);
+
+    {
+        pqxx::connection connection{test_database_connection_string()};
+        pqxx::work transaction{connection};
+        transaction.exec("DELETE FROM object_layouts WHERE layout_id = $1", pqxx::params{result.layout_id}).no_rows();
+        transaction.commit();
+    }
+
+    {
+        pqxx::connection connection{test_database_connection_string()};
+        pqxx::work transaction{connection};
+        EXPECT_TRUE(transaction.query_value<bool>(
+            "SELECT EXISTS (SELECT 1 FROM upload_session_finalizations WHERE session_id = $1::uuid)",
+            pqxx::params{session_id.str()}));
+        EXPECT_TRUE(transaction.query_value<bool>(
+            "SELECT layout_id IS NULL FROM upload_session_finalizations WHERE session_id = $1::uuid",
+            pqxx::params{session_id.str()}));
+        transaction.commit();
+    }
+
+    try {
+        (void)repository.finalize_upload(session_id, descriptor);
+        FAIL() << "expected FinalizeUploadError";
+    } catch (const FinalizeUploadError& error) {
+        EXPECT_EQ(error.kind(), FinalizeUploadErrorKind::VersionRetired);
+    }
+}
+
+TEST(PostgresMetadataRepositoryTest, SetTagAndRegisterManifestRejectRetiredVersion) {
+    reset_metadata_data();
+    PostgresMetadataRepository repository{test_database_connection_string()};
+    const UuidV7 artifact_id = UuidV7::generate();
+    const UuidV7 policy_id = UuidV7::generate();
+    const UuidV7 run_id = UuidV7::generate();
+
+    repository.create_artifact(Artifact{artifact_id, "lifecycle-tag-manifest", "m9"});
+    repository.register_lifecycle_policy(make_uniform_lifecycle_policy(policy_id, 0U, 0ULL));
+
+    const ArtifactVersion tagged_target = create_committed_version_with_kind(repository, artifact_id, 't', "generic");
+    const ArtifactVersion manifest_target = create_committed_version_with_kind(repository, artifact_id, 'm', "generic");
+
+    (void)repository.run_lifecycle(run_id, policy_id, LifecycleRunMode::Apply);
+
+    try {
+        repository.set_tag(artifact_id, "latest", tagged_target.version_id());
+        FAIL() << "expected LifecycleError";
+    } catch (const LifecycleError& error) {
+        EXPECT_EQ(error.kind(), LifecycleErrorKind::VersionRetired);
+    }
+
+    const Manifest manifest{
+        Manifest::Entries{
+            {"model", manifest_target.version_id()},
+        },
+    };
+
+    try {
+        repository.register_manifest(manifest);
+        FAIL() << "expected LifecycleError";
+    } catch (const LifecycleError& error) {
+        EXPECT_EQ(error.kind(), LifecycleErrorKind::VersionRetired);
+    }
+}
+
+TEST(PostgresMetadataRepositoryTest, RestorePlansRejectRetiredVersion) {
+    reset_metadata_data();
+    PostgresMetadataRepository repository{test_database_connection_string()};
+    const UuidV7 marker = UuidV7::generate();
+    const UuidV7 artifact_id = UuidV7::generate();
+    const UuidV7 policy_id = UuidV7::generate();
+    const std::string source_node = "m9-restore";
+
+    register_storage_node(repository, source_node, "127.0.0.1", 9201);
+    register_storage_node(repository, "m9-restore-b", "127.0.0.2", 9202);
+
+    repository.create_artifact(Artifact{artifact_id, "lifecycle-restore-" + marker.str(), "m9"});
+    repository.register_lifecycle_policy(make_uniform_lifecycle_policy(policy_id, 0U, 0ULL));
+    repository.register_object(make_object());
+
+    const auto layout = make_object_layout_descriptor();
+    repository.register_object_layout(layout);
+    register_finalize_chunks(repository, layout, source_node, StorageLocationState::Available);
+    register_finalize_chunks(repository, layout, "m9-restore-b", StorageLocationState::Available);
+
+    const ArtifactVersion version{
+        artifact_id,
+        kObjectId,
+        std::nullopt,
+        ArtifactVersion::ImmutableMetadata{{"marker", marker.str()}},
+        VersionState::Committed,
+    };
+    repository.create_version(version);
+    retire_version_via_lifecycle(repository, version.version_id(), policy_id);
+
+    try {
+        (void)repository.resolve_restore_plan(version.version_id(), source_node);
+        FAIL() << "expected RestorePlanError";
+    } catch (const RestorePlanError& error) {
+        EXPECT_EQ(error.kind(), RestorePlanErrorKind::VersionRetired);
+    }
+
+    try {
+        (void)repository.resolve_multi_node_restore_plan(version.version_id());
+        FAIL() << "expected RestorePlanError";
+    } catch (const RestorePlanError& error) {
+        EXPECT_EQ(error.kind(), RestorePlanErrorKind::VersionRetired);
+    }
+}
+
+TEST(PostgresMetadataRepositoryTest, ReplicationRunRejectsRetiredVersion) {
+    reset_metadata_data();
+    PostgresMetadataRepository repository{test_database_connection_string()};
+    const UuidV7 marker = UuidV7::generate();
+    const UuidV7 artifact_id = UuidV7::generate();
+    const UuidV7 policy_id = UuidV7::generate();
+    const UuidV7 replication_run_id = UuidV7::generate();
+    const auto descriptor = make_finalize_descriptor('d', 'e', 'f');
+
+    register_storage_node(repository, "m8-node-a", "127.0.0.1", 9101);
+    register_storage_node(repository, "m8-node-b", "127.0.0.2", 9102);
+    register_storage_node(repository, "m8-node-c", "127.0.0.3", 9103);
+
+    repository.create_artifact(Artifact{artifact_id, "lifecycle-replication-" + marker.str(), "m9"});
+    repository.register_lifecycle_policy(make_uniform_lifecycle_policy(policy_id, 0U, 0ULL));
+    const ArtifactVersion version = register_replication_version(repository, artifact_id, descriptor, marker.str());
+    retire_version_via_lifecycle(repository, version.version_id(), policy_id);
+
+    try {
+        (void)repository.start_replication_run(replication_run_id, version.version_id(), 2U);
+        FAIL() << "expected ReplicationError";
+    } catch (const ReplicationError& error) {
+        EXPECT_EQ(error.kind(), ReplicationErrorKind::VersionRetired);
     }
 }
 

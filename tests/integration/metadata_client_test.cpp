@@ -2,11 +2,15 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <array>
 #include <boost/json.hpp>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <map>
 #include <optional>
 #include <pqxx/pqxx>
 #include <span>
@@ -25,6 +29,7 @@
 #include "aistore/metadata/chunking.hpp"
 #include "aistore/metadata/finalize_upload.hpp"
 #include "aistore/metadata/gc.hpp"
+#include "aistore/metadata/lifecycle.hpp"
 #include "aistore/metadata/object_layout_descriptor.hpp"
 #include "aistore/metadata/placement.hpp"
 #include "aistore/metadata/postgres_metadata_repository.hpp"
@@ -47,9 +52,11 @@ void ensure_active_node(aistore::metadata::PostgresMetadataRepository& repositor
 }
 
 using aistore::client::ChunkAvailability;
+using aistore::client::LifecycleDecisionPage;
 using aistore::client::MetadataClient;
 using aistore::client::RemoteApiError;
 using aistore::client::RemoteProtocolError;
+using aistore::client::VersionPinStatus;
 using aistore::http::HttpClientConfig;
 using aistore::http::HttpEndpoint;
 using aistore::http::HttpRequest;
@@ -57,6 +64,7 @@ using aistore::http::HttpResponse;
 using aistore::http::HttpServer;
 using aistore::http::HttpServerConfig;
 using aistore::metadata::Artifact;
+using aistore::metadata::ArtifactKind;
 using aistore::metadata::ArtifactVersion;
 using aistore::metadata::ChunkingStrategy;
 using aistore::metadata::ChunkMetadata;
@@ -67,6 +75,12 @@ using aistore::metadata::GcPhysicalStats;
 using aistore::metadata::GcRun;
 using aistore::metadata::GcRunMode;
 using aistore::metadata::GcRunState;
+using aistore::metadata::LifecycleDecision;
+using aistore::metadata::LifecycleDecisionReason;
+using aistore::metadata::LifecyclePolicy;
+using aistore::metadata::LifecycleRule;
+using aistore::metadata::LifecycleRun;
+using aistore::metadata::LifecycleRunMode;
 using aistore::metadata::MultiNodeRestorePlan;
 using aistore::metadata::Object;
 using aistore::metadata::ObjectLayout;
@@ -100,6 +114,68 @@ std::string test_database_connection_string() {
     }
 
     return "dbname=ai_artifact_store_test";
+}
+
+void ensure_lifecycle_migration_applied() {
+    pqxx::connection connection{test_database_connection_string()};
+
+    auto apply_migration_if_missing = [&](int version, std::string_view name, std::string_view filename) {
+        {
+            pqxx::nontransaction check{connection};
+
+            const bool migration_applied = check.query_value<bool>(
+                "SELECT EXISTS ("
+                "    SELECT 1 "
+                "    FROM schema_migrations "
+                "    WHERE version = $1 "
+                "      AND name = $2"
+                ")",
+                pqxx::params{
+                    version,
+                    std::string{name},
+                });
+
+            if (migration_applied) {
+                return;
+            }
+        }
+
+        const std::filesystem::path migration_path =
+            std::filesystem::path{__FILE__}.parent_path().parent_path().parent_path() / "migrations" / filename;
+
+        std::ifstream migration_file{migration_path};
+
+        if (!migration_file.is_open()) {
+            throw std::runtime_error(std::string{"failed to open migration "} + std::string{filename});
+        }
+
+        std::string migration_sql{
+            std::istreambuf_iterator<char>{migration_file},
+            std::istreambuf_iterator<char>{},
+        };
+
+        pqxx::nontransaction apply{connection};
+        apply.exec(migration_sql);
+    };
+
+    apply_migration_if_missing(10, "ai_aware_lifecycle", "010_ai_aware_lifecycle.sql");
+    apply_migration_if_missing(11, "retired_finalization_reclamation", "011_retired_finalization_reclamation.sql");
+}
+
+LifecyclePolicy make_complete_lifecycle_policy(std::string_view name, std::uint32_t keep_last_n = 1U) {
+    LifecyclePolicy policy{
+        .policy_id = UuidV7::generate(),
+        .name = std::string{name},
+        .rules = {},
+    };
+
+    for (const ArtifactKind kind : {ArtifactKind::Generic, ArtifactKind::ModelCheckpoint, ArtifactKind::DatasetSnapshot,
+                                    ArtifactKind::EmbeddingIndex, ArtifactKind::EvaluationOutput}) {
+        policy.rules.emplace(
+            kind, LifecycleRule{.artifact_kind = kind, .keep_last_n = keep_last_n, .max_age_seconds = std::nullopt});
+    }
+
+    return policy;
 }
 
 std::string digest_to_hex(const aistore::hashing::Sha256::Digest& digest) {
@@ -161,6 +237,7 @@ class RunningHttpServer {
 class MetadataClientFixture : public ::testing::Test {
    protected:
     void SetUp() override {
+        ensure_lifecycle_migration_applied();
         artifact_id_ = UuidV7::generate();
         session_id_ = UuidV7::generate();
         repository_.emplace(test_database_connection_string());
@@ -180,6 +257,12 @@ class MetadataClientFixture : public ::testing::Test {
             transaction.exec("DELETE FROM upload_sessions WHERE state = 'open'").no_rows();
             transaction.exec("DELETE FROM gc_runs").no_rows();
             transaction.exec("DELETE FROM replication_runs").no_rows();
+            transaction.exec("DELETE FROM lifecycle_run_decisions").no_rows();
+            transaction.exec("DELETE FROM artifact_version_retirements").no_rows();
+            transaction.exec("DELETE FROM artifact_version_pins").no_rows();
+            transaction.exec("DELETE FROM lifecycle_runs").no_rows();
+            transaction.exec("DELETE FROM lifecycle_policy_rules").no_rows();
+            transaction.exec("DELETE FROM lifecycle_policies").no_rows();
             transaction.commit();
         }
         repository_->create_artifact(
@@ -212,6 +295,25 @@ class MetadataClientFixture : public ::testing::Test {
 
         for (const UuidV7& gc_run_id : owned_gc_run_ids_) {
             transaction.exec("DELETE FROM gc_runs WHERE run_id = $1::uuid", pqxx::params{gc_run_id.str()}).no_rows();
+        }
+
+        for (const UuidV7& run_id : owned_lifecycle_run_ids_) {
+            transaction.exec("DELETE FROM lifecycle_run_decisions WHERE run_id = $1::uuid", pqxx::params{run_id.str()})
+                .no_rows();
+            transaction
+                .exec("DELETE FROM artifact_version_retirements WHERE lifecycle_run_id = $1::uuid",
+                      pqxx::params{run_id.str()})
+                .no_rows();
+            transaction.exec("DELETE FROM lifecycle_runs WHERE run_id = $1::uuid", pqxx::params{run_id.str()})
+                .no_rows();
+        }
+
+        for (const UuidV7& policy_id : owned_lifecycle_policy_ids_) {
+            transaction
+                .exec("DELETE FROM lifecycle_policy_rules WHERE policy_id = $1::uuid", pqxx::params{policy_id.str()})
+                .no_rows();
+            transaction.exec("DELETE FROM lifecycle_policies WHERE policy_id = $1::uuid", pqxx::params{policy_id.str()})
+                .no_rows();
         }
 
         transaction.exec("DELETE FROM replication_runs").no_rows();
@@ -292,6 +394,10 @@ class MetadataClientFixture : public ::testing::Test {
 
     void track_gc_run(UuidV7 gc_run_id) { owned_gc_run_ids_.push_back(std::move(gc_run_id)); }
 
+    void track_lifecycle_policy(UuidV7 policy_id) { owned_lifecycle_policy_ids_.push_back(std::move(policy_id)); }
+
+    void track_lifecycle_run(UuidV7 run_id) { owned_lifecycle_run_ids_.push_back(std::move(run_id)); }
+
     [[nodiscard]] ArtifactVersion create_committed_version(const ObjectLayoutDescriptor& descriptor,
                                                            std::string_view source_node = "m4s3-target") {
         ensure_active_node(*repository_, std::string{source_node});
@@ -367,6 +473,8 @@ class MetadataClientFixture : public ::testing::Test {
     std::vector<std::string> owned_chunk_ids_;
     std::vector<std::string> owned_object_ids_;
     std::vector<UuidV7> owned_gc_run_ids_;
+    std::vector<UuidV7> owned_lifecycle_policy_ids_;
+    std::vector<UuidV7> owned_lifecycle_run_ids_;
     std::optional<PostgresMetadataRepository> repository_;
     std::optional<MetadataService> service_;
     std::optional<RunningHttpServer> server_;
@@ -1143,6 +1251,118 @@ TEST_F(MetadataClientFixture, ReplicationLifecycleAndPlanRoundTrip) {
     };
     const ReplicationRun completed = client_->complete_replication_run(run_id, stats);
     EXPECT_EQ(completed.state, ReplicationRunState::Completed);
+}
+
+TEST_F(MetadataClientFixture, LifecyclePolicyRoundTrip) {
+    LifecyclePolicy policy = make_complete_lifecycle_policy("m9-client-policy", 2U);
+    track_lifecycle_policy(policy.policy_id);
+
+    const LifecyclePolicy registered = client_->register_lifecycle_policy(policy);
+    EXPECT_EQ(registered.policy_id, policy.policy_id);
+    EXPECT_EQ(registered.name, policy.name);
+    EXPECT_EQ(registered.rules, policy.rules);
+
+    const std::optional<LifecyclePolicy> loaded = client_->get_lifecycle_policy(policy.policy_id);
+    ASSERT_TRUE(loaded.has_value());
+    EXPECT_EQ(loaded->policy_id, registered.policy_id);
+    EXPECT_EQ(loaded->name, registered.name);
+    EXPECT_EQ(loaded->rules, registered.rules);
+
+    EXPECT_FALSE(client_->get_lifecycle_policy(UuidV7::generate()).has_value());
+}
+
+TEST_F(MetadataClientFixture, LifecyclePinRoundTrip) {
+    const ObjectLayoutDescriptor descriptor = make_descriptor();
+    const ArtifactVersion version = create_committed_version(descriptor);
+
+    client_->pin_version(version.version_id(), "m9-client-retention");
+
+    const VersionPinStatus pinned = client_->get_version_pin(version.version_id());
+    EXPECT_TRUE(pinned.pinned);
+    ASSERT_TRUE(pinned.reason.has_value());
+    EXPECT_EQ(*pinned.reason, "m9-client-retention");
+
+    client_->unpin_version(version.version_id());
+
+    const VersionPinStatus cleared = client_->get_version_pin(version.version_id());
+    EXPECT_FALSE(cleared.pinned);
+    EXPECT_FALSE(cleared.reason.has_value());
+}
+
+TEST_F(MetadataClientFixture, LifecycleRunRoundTrip) {
+    LifecyclePolicy policy = make_complete_lifecycle_policy("m9-client-run-policy", 1U);
+    track_lifecycle_policy(policy.policy_id);
+    (void)client_->register_lifecycle_policy(policy);
+
+    const ObjectLayoutDescriptor descriptor = make_descriptor();
+    const ArtifactVersion version = create_committed_version(descriptor);
+
+    const UuidV7 run_id = UuidV7::generate();
+    track_lifecycle_run(run_id);
+
+    const LifecycleRun started = client_->run_lifecycle(run_id, policy.policy_id, LifecycleRunMode::DryRun);
+    EXPECT_EQ(started.run_id, run_id);
+    EXPECT_EQ(started.policy_id, policy.policy_id);
+    EXPECT_EQ(started.mode, LifecycleRunMode::DryRun);
+    EXPECT_GE(started.stats.versions_scanned, 1U);
+
+    const std::optional<LifecycleRun> loaded = client_->get_lifecycle_run(run_id);
+    ASSERT_TRUE(loaded.has_value());
+    EXPECT_EQ(loaded->run_id, run_id);
+    EXPECT_EQ(loaded->policy_id, policy.policy_id);
+    EXPECT_EQ(loaded->mode, LifecycleRunMode::DryRun);
+
+    const LifecycleDecisionPage page = client_->list_lifecycle_decisions(run_id, std::nullopt, 128U);
+    EXPECT_FALSE(page.decisions.empty());
+    const auto version_decision_it =
+        std::find_if(page.decisions.begin(), page.decisions.end(),
+                     [&](const LifecycleDecision& decision) { return decision.version_id == version.version_id(); });
+    ASSERT_NE(version_decision_it, page.decisions.end());
+    EXPECT_EQ(version_decision_it->artifact_id, artifact_id_);
+    EXPECT_EQ(version_decision_it->artifact_kind, ArtifactKind::Generic);
+    EXPECT_FALSE(version_decision_it->retire);
+    EXPECT_EQ(version_decision_it->reason, LifecycleDecisionReason::KeepLastN);
+    EXPECT_EQ(version_decision_it->logical_size_bytes, 4U);
+}
+
+TEST_F(MetadataClientFixture, LifecycleDecisionParsingAndRetiredErrors) {
+    LifecyclePolicy retire_policy = make_complete_lifecycle_policy("m9-client-retire-policy", 0U);
+    track_lifecycle_policy(retire_policy.policy_id);
+    (void)client_->register_lifecycle_policy(retire_policy);
+
+    const ObjectLayoutDescriptor descriptor = make_descriptor();
+    const ArtifactVersion version = create_committed_version(descriptor);
+
+    const UuidV7 retire_run_id = UuidV7::generate();
+    track_lifecycle_run(retire_run_id);
+    const LifecycleRun retired_run =
+        client_->run_lifecycle(retire_run_id, retire_policy.policy_id, LifecycleRunMode::Apply);
+    EXPECT_GE(retired_run.stats.versions_retired, 1U);
+
+    const LifecycleDecisionPage page = client_->list_lifecycle_decisions(retire_run_id, std::nullopt, 128U);
+    ASSERT_FALSE(page.decisions.empty());
+    const auto retired_it =
+        std::find_if(page.decisions.begin(), page.decisions.end(),
+                     [&](const LifecycleDecision& decision) { return decision.version_id == version.version_id(); });
+    ASSERT_NE(retired_it, page.decisions.end());
+    EXPECT_TRUE(retired_it->retire);
+    EXPECT_EQ(retired_it->reason, LifecycleDecisionReason::PolicyRetire);
+
+    try {
+        client_->pin_version(version.version_id(), "blocked-on-retired");
+        FAIL() << "expected RemoteApiError";
+    } catch (const RemoteApiError& error) {
+        EXPECT_EQ(error.status_code(), 410U);
+        EXPECT_EQ(error.error_code(), "artifact_version_retired");
+    }
+
+    try {
+        (void)client_->get_restore_plan(version.version_id(), "m4s3-target");
+        FAIL() << "expected RemoteApiError";
+    } catch (const RemoteApiError& error) {
+        EXPECT_EQ(error.status_code(), 410U);
+        EXPECT_EQ(error.error_code(), "artifact_version_retired");
+    }
 }
 
 }  // namespace

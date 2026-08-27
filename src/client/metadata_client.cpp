@@ -1,5 +1,6 @@
 #include "aistore/client/metadata_client.hpp"
 
+#include <array>
 #include <boost/json.hpp>
 #include <limits>
 #include <map>
@@ -12,6 +13,7 @@
 #include "aistore/client/client_error.hpp"
 #include "aistore/metadata/chunking.hpp"
 #include "aistore/metadata/gc.hpp"
+#include "aistore/metadata/lifecycle.hpp"
 #include "aistore/metadata/object.hpp"
 #include "aistore/metadata/object_layout.hpp"
 #include "aistore/metadata/object_layout_descriptor.hpp"
@@ -26,7 +28,14 @@ namespace {
 namespace beast_http = aistore::http::beast_http;
 
 constexpr std::size_t kMaxNegotiationChunks = 256U;
+constexpr std::size_t kExpectedLifecycleRuleCount = 5U;
 constexpr std::uint64_t kPostgresBigintMax = static_cast<std::uint64_t>(std::numeric_limits<long long>::max());
+
+constexpr std::array<aistore::metadata::ArtifactKind, kExpectedLifecycleRuleCount> kCanonicalArtifactKindOrder = {
+    aistore::metadata::ArtifactKind::Generic,          aistore::metadata::ArtifactKind::ModelCheckpoint,
+    aistore::metadata::ArtifactKind::DatasetSnapshot,  aistore::metadata::ArtifactKind::EmbeddingIndex,
+    aistore::metadata::ArtifactKind::EvaluationOutput,
+};
 
 [[nodiscard]] unsigned int status_code_of(const aistore::http::HttpClientResponse& response) {
     return static_cast<unsigned int>(response.result_int());
@@ -1801,6 +1810,521 @@ aistore::metadata::ReplicationRun MetadataClient::complete_replication_run(
     }
 
     return run;
+}
+
+[[nodiscard]] std::optional<std::int64_t> extract_signed_int64(const boost::json::value& value) {
+    if (value.is_double()) {
+        return std::nullopt;
+    }
+
+    if (value.is_int64()) {
+        return value.as_int64();
+    }
+
+    if (value.is_uint64()) {
+        const std::uint64_t unsigned_value = value.as_uint64();
+
+        if (unsigned_value > static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max())) {
+            return std::nullopt;
+        }
+
+        return static_cast<std::int64_t>(unsigned_value);
+    }
+
+    return std::nullopt;
+}
+
+[[nodiscard]] aistore::metadata::LifecycleRule parse_lifecycle_rule_json(const boost::json::object& object) {
+    if (!json_object_has_exact_keys(object, {"artifact_kind", "keep_last_n", "max_age_seconds"}) ||
+        !object.at("artifact_kind").is_string()) {
+        throw RemoteProtocolError{"lifecycle policy rule has unexpected fields"};
+    }
+
+    const std::optional<std::uint64_t> keep_last_n = extract_nonnegative_uint64(object.at("keep_last_n"));
+
+    if (!keep_last_n.has_value()) {
+        throw RemoteProtocolError{"lifecycle policy keep_last_n is invalid"};
+    }
+
+    std::optional<std::uint64_t> max_age_seconds;
+
+    if (object.at("max_age_seconds").is_null()) {
+        max_age_seconds = std::nullopt;
+    } else {
+        max_age_seconds = extract_nonnegative_uint64(object.at("max_age_seconds"));
+
+        if (!max_age_seconds.has_value()) {
+            throw RemoteProtocolError{"lifecycle policy max_age_seconds is invalid"};
+        }
+    }
+
+    try {
+        return aistore::metadata::LifecycleRule{
+            .artifact_kind =
+                aistore::metadata::artifact_kind_from_string(std::string{object.at("artifact_kind").as_string()}),
+            .keep_last_n = static_cast<std::uint32_t>(*keep_last_n),
+            .max_age_seconds = max_age_seconds,
+        };
+    } catch (const std::runtime_error&) {
+        throw RemoteProtocolError{"lifecycle policy artifact_kind is invalid"};
+    }
+}
+
+[[nodiscard]] aistore::metadata::LifecyclePolicy parse_lifecycle_policy_json(const boost::json::object& object) {
+    if (!json_object_has_exact_keys(object, {"policy_id", "name", "rules"}) || !object.at("policy_id").is_string() ||
+        !object.at("name").is_string() || !object.at("rules").is_array()) {
+        throw RemoteProtocolError{"lifecycle policy response has unexpected fields"};
+    }
+
+    const boost::json::array& rules_json = object.at("rules").as_array();
+
+    if (rules_json.size() != kExpectedLifecycleRuleCount) {
+        throw RemoteProtocolError{"lifecycle policy rules count is invalid"};
+    }
+
+    std::map<aistore::metadata::ArtifactKind, aistore::metadata::LifecycleRule> rules;
+
+    for (const boost::json::value& entry : rules_json) {
+        if (!entry.is_object()) {
+            throw RemoteProtocolError{"lifecycle policy rule is not an object"};
+        }
+
+        const aistore::metadata::LifecycleRule rule = parse_lifecycle_rule_json(entry.as_object());
+
+        if (rules.contains(rule.artifact_kind)) {
+            throw RemoteProtocolError{"lifecycle policy rules contain duplicate artifact kinds"};
+        }
+
+        rules.emplace(rule.artifact_kind, rule);
+    }
+
+    for (const aistore::metadata::ArtifactKind kind : kCanonicalArtifactKindOrder) {
+        if (!rules.contains(kind)) {
+            throw RemoteProtocolError{"lifecycle policy rules are missing a canonical artifact kind"};
+        }
+    }
+
+    try {
+        return aistore::metadata::LifecyclePolicy{
+            .policy_id = aistore::metadata::UuidV7{std::string{object.at("policy_id").as_string()}},
+            .name = std::string{object.at("name").as_string()},
+            .rules = std::move(rules),
+        };
+    } catch (const std::invalid_argument&) {
+        throw RemoteProtocolError{"lifecycle policy policy_id is invalid"};
+    }
+}
+
+[[nodiscard]] aistore::metadata::LifecyclePolicy parse_lifecycle_policy_body(const std::string& body) {
+    boost::system::error_code parse_error;
+    const boost::json::value parsed = boost::json::parse(body, parse_error);
+
+    if (parse_error || !parsed.is_object()) {
+        throw RemoteProtocolError{"lifecycle policy response is not a JSON object"};
+    }
+
+    return parse_lifecycle_policy_json(parsed.as_object());
+}
+
+[[nodiscard]] aistore::metadata::LifecycleRun parse_lifecycle_run_json(const boost::json::object& object) {
+    if (!json_object_has_exact_keys(
+            object, {"run_id", "policy_id", "mode", "evaluated_at_unix_ms", "versions_scanned", "versions_protected",
+                     "versions_retained_by_policy", "versions_candidates", "versions_retired",
+                     "logical_bytes_candidates", "logical_bytes_retired"}) ||
+        !object.at("run_id").is_string() || !object.at("policy_id").is_string() || !object.at("mode").is_string()) {
+        throw RemoteProtocolError{"lifecycle run response has unexpected fields"};
+    }
+
+    const std::optional<std::int64_t> evaluated_at_unix_ms = extract_signed_int64(object.at("evaluated_at_unix_ms"));
+
+    if (!evaluated_at_unix_ms.has_value()) {
+        throw RemoteProtocolError{"lifecycle run evaluated_at_unix_ms is invalid"};
+    }
+
+    const std::optional<std::uint64_t> versions_scanned = extract_nonnegative_uint64(object.at("versions_scanned"));
+    const std::optional<std::uint64_t> versions_protected = extract_nonnegative_uint64(object.at("versions_protected"));
+    const std::optional<std::uint64_t> versions_retained_by_policy =
+        extract_nonnegative_uint64(object.at("versions_retained_by_policy"));
+    const std::optional<std::uint64_t> versions_candidates =
+        extract_nonnegative_uint64(object.at("versions_candidates"));
+    const std::optional<std::uint64_t> versions_retired = extract_nonnegative_uint64(object.at("versions_retired"));
+    const std::optional<std::uint64_t> logical_bytes_candidates =
+        extract_nonnegative_uint64(object.at("logical_bytes_candidates"));
+    const std::optional<std::uint64_t> logical_bytes_retired =
+        extract_nonnegative_uint64(object.at("logical_bytes_retired"));
+
+    if (!versions_scanned.has_value() || !versions_protected.has_value() || !versions_retained_by_policy.has_value() ||
+        !versions_candidates.has_value() || !versions_retired.has_value() || !logical_bytes_candidates.has_value() ||
+        !logical_bytes_retired.has_value()) {
+        throw RemoteProtocolError{"lifecycle run stats are invalid"};
+    }
+
+    try {
+        return aistore::metadata::LifecycleRun{
+            .run_id = aistore::metadata::UuidV7{std::string{object.at("run_id").as_string()}},
+            .policy_id = aistore::metadata::UuidV7{std::string{object.at("policy_id").as_string()}},
+            .mode = aistore::metadata::lifecycle_run_mode_from_string(std::string{object.at("mode").as_string()}),
+            .evaluated_at_unix_ms = *evaluated_at_unix_ms,
+            .stats =
+                aistore::metadata::LifecycleStats{
+                    .versions_scanned = *versions_scanned,
+                    .versions_protected = *versions_protected,
+                    .versions_retained_by_policy = *versions_retained_by_policy,
+                    .versions_candidates = *versions_candidates,
+                    .versions_retired = *versions_retired,
+                    .logical_bytes_candidates = *logical_bytes_candidates,
+                    .logical_bytes_retired = *logical_bytes_retired,
+                },
+        };
+    } catch (const std::invalid_argument&) {
+        throw RemoteProtocolError{"lifecycle run identifiers are invalid"};
+    } catch (const std::runtime_error&) {
+        throw RemoteProtocolError{"lifecycle run mode is invalid"};
+    }
+}
+
+[[nodiscard]] aistore::metadata::LifecycleRun parse_lifecycle_run_body(const std::string& body) {
+    boost::system::error_code parse_error;
+    const boost::json::value parsed = boost::json::parse(body, parse_error);
+
+    if (parse_error || !parsed.is_object()) {
+        throw RemoteProtocolError{"lifecycle run response is not a JSON object"};
+    }
+
+    return parse_lifecycle_run_json(parsed.as_object());
+}
+
+[[nodiscard]] aistore::metadata::LifecycleDecision parse_lifecycle_decision_json(const boost::json::object& object) {
+    if (!json_object_has_exact_keys(
+            object, {"version_id", "artifact_id", "artifact_kind", "decision", "reason", "logical_size_bytes"}) ||
+        !object.at("version_id").is_string() || !object.at("artifact_id").is_string() ||
+        !object.at("artifact_kind").is_string() || !object.at("decision").is_string() ||
+        !object.at("reason").is_string()) {
+        throw RemoteProtocolError{"lifecycle decision has unexpected fields"};
+    }
+
+    const std::string decision{object.at("decision").as_string()};
+
+    if (decision != "retain" && decision != "retire") {
+        throw RemoteProtocolError{"lifecycle decision value is invalid"};
+    }
+
+    const std::optional<std::uint64_t> logical_size_bytes = extract_nonnegative_uint64(object.at("logical_size_bytes"));
+
+    if (!logical_size_bytes.has_value()) {
+        throw RemoteProtocolError{"lifecycle decision logical_size_bytes is invalid"};
+    }
+
+    try {
+        return aistore::metadata::LifecycleDecision{
+            .version_id = std::string{object.at("version_id").as_string()},
+            .artifact_id = aistore::metadata::UuidV7{std::string{object.at("artifact_id").as_string()}},
+            .artifact_kind =
+                aistore::metadata::artifact_kind_from_string(std::string{object.at("artifact_kind").as_string()}),
+            .retire = decision == "retire",
+            .reason =
+                aistore::metadata::lifecycle_decision_reason_from_string(std::string{object.at("reason").as_string()}),
+            .logical_size_bytes = *logical_size_bytes,
+        };
+    } catch (const std::invalid_argument&) {
+        throw RemoteProtocolError{"lifecycle decision artifact_id is invalid"};
+    } catch (const std::runtime_error&) {
+        throw RemoteProtocolError{"lifecycle decision kind or reason is invalid"};
+    }
+}
+
+[[nodiscard]] boost::json::object lifecycle_rule_to_json(const aistore::metadata::LifecycleRule& rule) {
+    boost::json::object object{
+        {"artifact_kind", std::string{aistore::metadata::artifact_kind_to_string(rule.artifact_kind)}},
+        {"keep_last_n", rule.keep_last_n},
+    };
+
+    if (rule.max_age_seconds.has_value()) {
+        object["max_age_seconds"] = *rule.max_age_seconds;
+    } else {
+        object["max_age_seconds"] = nullptr;
+    }
+
+    return object;
+}
+
+aistore::metadata::LifecyclePolicy MetadataClient::register_lifecycle_policy(
+    const aistore::metadata::LifecyclePolicy& policy) const {
+    aistore::metadata::validate_lifecycle_policy(policy);
+
+    boost::json::array rules;
+    rules.reserve(kExpectedLifecycleRuleCount);
+
+    for (const aistore::metadata::ArtifactKind kind : kCanonicalArtifactKindOrder) {
+        const auto rule_it = policy.rules.find(kind);
+
+        if (rule_it == policy.rules.end()) {
+            throw std::invalid_argument("lifecycle policy is missing a canonical artifact kind rule");
+        }
+
+        rules.push_back(lifecycle_rule_to_json(rule_it->second));
+    }
+
+    const std::string body = boost::json::serialize(boost::json::object{
+        {"policy_id", policy.policy_id.str()},
+        {"name", policy.name},
+        {"rules", std::move(rules)},
+    });
+    const aistore::http::HttpClientResponse response =
+        http_client_.request(beast_http::verb::post, "/v1/lifecycle-policies", body, "application/json");
+
+    if (status_code_of(response) != 200U) {
+        throw_remote_api_error(response);
+    }
+
+    aistore::metadata::LifecyclePolicy loaded = parse_lifecycle_policy_body(response.body());
+
+    if (loaded.policy_id != policy.policy_id || loaded.name != policy.name || loaded.rules != policy.rules) {
+        throw RemoteProtocolError{"lifecycle policy response does not match request"};
+    }
+
+    return loaded;
+}
+
+std::optional<aistore::metadata::LifecyclePolicy> MetadataClient::get_lifecycle_policy(
+    const aistore::metadata::UuidV7& policy_id) const {
+    const std::string target = std::string{"/v1/lifecycle-policies/"} + policy_id.str();
+    const aistore::http::HttpClientResponse response = http_client_.request(beast_http::verb::get, target);
+
+    const unsigned int status = status_code_of(response);
+
+    if (status == 200U) {
+        aistore::metadata::LifecyclePolicy policy = parse_lifecycle_policy_body(response.body());
+
+        if (policy.policy_id != policy_id) {
+            throw RemoteProtocolError{"lifecycle policy response policy_id does not match request"};
+        }
+
+        return policy;
+    }
+
+    if (status == 404U && extract_error_code(response.body()) == "lifecycle_policy_not_found") {
+        return std::nullopt;
+    }
+
+    throw_remote_api_error(response);
+}
+
+void MetadataClient::pin_version(std::string_view version_id, std::string_view reason) const {
+    if (!is_valid_chunk_id(version_id)) {
+        throw std::invalid_argument("version_id must be 64 lowercase hex characters");
+    }
+
+    const std::string body = boost::json::serialize(boost::json::object{
+        {"reason", std::string{reason}},
+    });
+    const std::string target = std::string{"/v1/artifact-versions/"} + std::string{version_id} + "/pin";
+    const aistore::http::HttpClientResponse response =
+        http_client_.request(beast_http::verb::put, target, body, "application/json");
+
+    if (status_code_of(response) != 200U) {
+        throw_remote_api_error(response);
+    }
+
+    boost::system::error_code parse_error;
+    const boost::json::value parsed = boost::json::parse(response.body(), parse_error);
+
+    if (parse_error || !parsed.is_object()) {
+        throw RemoteProtocolError{"pin response is not a JSON object"};
+    }
+
+    const boost::json::object& object = parsed.as_object();
+
+    if (!json_object_has_exact_keys(object, {"version_id", "pinned", "reason"}) ||
+        !object.at("version_id").is_string() || !object.at("pinned").is_bool() || !object.at("reason").is_string() ||
+        !object.at("pinned").as_bool() || std::string{object.at("version_id").as_string()} != version_id ||
+        std::string{object.at("reason").as_string()} != reason) {
+        throw RemoteProtocolError{"pin response does not match request"};
+    }
+}
+
+void MetadataClient::unpin_version(std::string_view version_id) const {
+    if (!is_valid_chunk_id(version_id)) {
+        throw std::invalid_argument("version_id must be 64 lowercase hex characters");
+    }
+
+    const std::string target = std::string{"/v1/artifact-versions/"} + std::string{version_id} + "/pin";
+    const aistore::http::HttpClientResponse response = http_client_.request(beast_http::verb::delete_, target);
+
+    if (status_code_of(response) != 200U) {
+        throw_remote_api_error(response);
+    }
+
+    boost::system::error_code parse_error;
+    const boost::json::value parsed = boost::json::parse(response.body(), parse_error);
+
+    if (parse_error || !parsed.is_object()) {
+        throw RemoteProtocolError{"unpin response is not a JSON object"};
+    }
+
+    const boost::json::object& object = parsed.as_object();
+
+    if (!json_object_has_exact_keys(object, {"version_id", "pinned"}) || !object.at("version_id").is_string() ||
+        !object.at("pinned").is_bool() || object.at("pinned").as_bool() ||
+        std::string{object.at("version_id").as_string()} != version_id) {
+        throw RemoteProtocolError{"unpin response does not match request"};
+    }
+}
+
+VersionPinStatus MetadataClient::get_version_pin(std::string_view version_id) const {
+    if (!is_valid_chunk_id(version_id)) {
+        throw std::invalid_argument("version_id must be 64 lowercase hex characters");
+    }
+
+    const std::string target = std::string{"/v1/artifact-versions/"} + std::string{version_id} + "/pin";
+    const aistore::http::HttpClientResponse response = http_client_.request(beast_http::verb::get, target);
+
+    if (status_code_of(response) != 200U) {
+        throw_remote_api_error(response);
+    }
+
+    boost::system::error_code parse_error;
+    const boost::json::value parsed = boost::json::parse(response.body(), parse_error);
+
+    if (parse_error || !parsed.is_object()) {
+        throw RemoteProtocolError{"pin status response is not a JSON object"};
+    }
+
+    const boost::json::object& object = parsed.as_object();
+
+    if (!object.at("version_id").is_string() || !object.at("pinned").is_bool() ||
+        std::string{object.at("version_id").as_string()} != version_id) {
+        throw RemoteProtocolError{"pin status response version_id is invalid"};
+    }
+
+    if (!object.at("pinned").as_bool()) {
+        if (!json_object_has_exact_keys(object, {"version_id", "pinned"})) {
+            throw RemoteProtocolError{"unpinned pin status response has unexpected fields"};
+        }
+
+        return VersionPinStatus{.pinned = false};
+    }
+
+    if (!json_object_has_exact_keys(object, {"version_id", "pinned", "reason"}) || !object.at("reason").is_string()) {
+        throw RemoteProtocolError{"pinned pin status response has unexpected fields"};
+    }
+
+    return VersionPinStatus{
+        .pinned = true,
+        .reason = std::string{object.at("reason").as_string()},
+    };
+}
+
+aistore::metadata::LifecycleRun MetadataClient::run_lifecycle(const aistore::metadata::UuidV7& run_id,
+                                                              const aistore::metadata::UuidV7& policy_id,
+                                                              aistore::metadata::LifecycleRunMode mode) const {
+    const std::string body = boost::json::serialize(boost::json::object{
+        {"run_id", run_id.str()},
+        {"policy_id", policy_id.str()},
+        {"mode", std::string{aistore::metadata::lifecycle_run_mode_to_string(mode)}},
+    });
+    const aistore::http::HttpClientResponse response =
+        http_client_.request(beast_http::verb::post, "/v1/lifecycle-runs", body, "application/json");
+
+    if (status_code_of(response) != 200U) {
+        throw_remote_api_error(response);
+    }
+
+    aistore::metadata::LifecycleRun run = parse_lifecycle_run_body(response.body());
+
+    if (run.run_id != run_id || run.policy_id != policy_id || run.mode != mode) {
+        throw RemoteProtocolError{"lifecycle run response does not match request"};
+    }
+
+    return run;
+}
+
+std::optional<aistore::metadata::LifecycleRun> MetadataClient::get_lifecycle_run(
+    const aistore::metadata::UuidV7& run_id) const {
+    const std::string target = std::string{"/v1/lifecycle-runs/"} + run_id.str();
+    const aistore::http::HttpClientResponse response = http_client_.request(beast_http::verb::get, target);
+
+    const unsigned int status = status_code_of(response);
+
+    if (status == 200U) {
+        aistore::metadata::LifecycleRun run = parse_lifecycle_run_body(response.body());
+
+        if (run.run_id != run_id) {
+            throw RemoteProtocolError{"lifecycle run response run_id does not match request"};
+        }
+
+        return run;
+    }
+
+    if (status == 404U && extract_error_code(response.body()) == "lifecycle_run_not_found") {
+        return std::nullopt;
+    }
+
+    throw_remote_api_error(response);
+}
+
+LifecycleDecisionPage MetadataClient::list_lifecycle_decisions(const aistore::metadata::UuidV7& run_id,
+                                                               std::optional<std::string_view> after_version_id,
+                                                               std::size_t limit) const {
+    if (limit < 1U || limit > 256U) {
+        throw std::invalid_argument("lifecycle decision page limit must be between 1 and 256");
+    }
+
+    if (after_version_id.has_value() && !is_valid_chunk_id(*after_version_id)) {
+        throw std::invalid_argument("after_version_id must be 64 lowercase hex characters");
+    }
+
+    std::string target =
+        std::string{"/v1/lifecycle-runs/"} + run_id.str() + "/decisions?limit=" + std::to_string(limit);
+
+    if (after_version_id.has_value()) {
+        target += "&after=";
+        target += *after_version_id;
+    }
+
+    const aistore::http::HttpClientResponse response = http_client_.request(beast_http::verb::get, target);
+
+    if (status_code_of(response) != 200U) {
+        throw_remote_api_error(response);
+    }
+
+    boost::system::error_code parse_error;
+    const boost::json::value parsed = boost::json::parse(response.body(), parse_error);
+
+    if (parse_error || !parsed.is_object()) {
+        throw RemoteProtocolError{"lifecycle decisions response is not a JSON object"};
+    }
+
+    const boost::json::object& object = parsed.as_object();
+
+    if (!json_object_has_exact_keys(object, {"decisions", "next_after"}) || !object.at("decisions").is_array()) {
+        throw RemoteProtocolError{"lifecycle decisions response has unexpected fields"};
+    }
+
+    std::vector<aistore::metadata::LifecycleDecision> decisions;
+
+    for (const boost::json::value& entry : object.at("decisions").as_array()) {
+        if (!entry.is_object()) {
+            throw RemoteProtocolError{"lifecycle decision entry is not an object"};
+        }
+
+        decisions.push_back(parse_lifecycle_decision_json(entry.as_object()));
+    }
+
+    std::optional<std::string> next_after;
+
+    if (object.at("next_after").is_null()) {
+        next_after = std::nullopt;
+    } else if (object.at("next_after").is_string()) {
+        next_after = std::string{object.at("next_after").as_string()};
+    } else {
+        throw RemoteProtocolError{"lifecycle decisions next_after is invalid"};
+    }
+
+    return LifecycleDecisionPage{
+        .decisions = std::move(decisions),
+        .next_after = std::move(next_after),
+    };
 }
 
 }  // namespace aistore::client

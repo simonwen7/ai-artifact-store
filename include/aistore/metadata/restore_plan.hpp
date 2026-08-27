@@ -15,6 +15,7 @@ enum class RestorePlanErrorKind : std::uint8_t {
     VersionNotFound,
     VersionNotCommitted,
     SourceUnavailable,
+    VersionRetired,
 };
 
 class RestorePlanError : public std::runtime_error {

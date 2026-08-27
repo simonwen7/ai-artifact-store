@@ -142,6 +142,7 @@ add_library(
     src/metadata/finalize_upload.cpp
     src/metadata/restore_plan.cpp
     src/metadata/gc.cpp
+    src/metadata/lifecycle.cpp
     src/metadata/storage_node.cpp
     src/metadata/placement.cpp
     src/metadata/replication.cpp
@@ -230,6 +231,7 @@ add_library(
     src/service/storage_node_service.cpp
     src/service/metadata_service.cpp
     src/service/metadata_service_m8_routes.cpp
+    src/service/metadata_service_m9_routes.cpp
 )
 
 target_include_directories(
@@ -773,6 +775,17 @@ if(BUILD_TESTING)
     )
 
     aistore_add_test(
+        aistore_lifecycle_tests
+        tests/unit/metadata/lifecycle_test.cpp
+    )
+
+    target_link_libraries(
+        aistore_lifecycle_tests
+        PRIVATE
+        aistore_metadata
+    )
+
+    aistore_add_test(
         aistore_manifest_model_tests
         tests/unit/metadata/manifest_model_test.cpp
     )
@@ -965,6 +978,25 @@ if(BUILD_TESTING)
 
     target_link_libraries(
         aistore_metadata_service_m8_api_tests
+        PRIVATE
+        aistore_http
+        aistore_services
+        aistore_metadata
+        aistore_hashing
+        Boost::json
+        Boost::headers
+        Threads::Threads
+        libpqxx::pqxx
+    )
+
+    aistore_add_test(
+        aistore_metadata_service_m9_api_tests
+        tests/integration/metadata_service_m9_api_test.cpp
+        RESOURCE_LOCK aistore_process_ports
+    )
+
+    target_link_libraries(
+        aistore_metadata_service_m9_api_tests
         PRIVATE
         aistore_http
         aistore_services
@@ -1225,6 +1257,24 @@ if(BUILD_TESTING)
 
         set_tests_properties(
             aistore_cli_multinode_process_e2e
+            PROPERTIES
+            TIMEOUT 120
+            RUN_SERIAL TRUE
+            RESOURCE_LOCK aistore_process_ports
+        )
+
+        add_test(
+            NAME aistore_cli_lifecycle_process_e2e
+            COMMAND
+                bash
+                "${PROJECT_SOURCE_DIR}/tests/e2e/aistore_cli_lifecycle_e2e.sh"
+                $<TARGET_FILE:aistore>
+                $<TARGET_FILE:aistore_metadata_service>
+                $<TARGET_FILE:aistore_storage_node>
+        )
+
+        set_tests_properties(
+            aistore_cli_lifecycle_process_e2e
             PROPERTIES
             TIMEOUT 120
             RUN_SERIAL TRUE

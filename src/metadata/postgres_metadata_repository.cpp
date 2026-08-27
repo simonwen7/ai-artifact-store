@@ -1,5 +1,6 @@
 #include "aistore/metadata/postgres_metadata_repository.hpp"
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstddef>
@@ -8,6 +9,7 @@
 #include <map>
 #include <optional>
 #include <pqxx/pqxx>
+#include <ranges>
 #include <set>
 #include <span>
 #include <stdexcept>
@@ -19,6 +21,7 @@
 
 #include "aistore/metadata/chunking.hpp"
 #include "aistore/metadata/gc.hpp"
+#include "aistore/metadata/lifecycle.hpp"
 #include "aistore/metadata/placement.hpp"
 #include "aistore/metadata/replication.hpp"
 #include "aistore/metadata/restore_plan.hpp"
@@ -344,14 +347,41 @@ constexpr std::string_view kLiveLayoutPredicate = R"(
             SELECT 1
             FROM artifact_versions av
             WHERE av.root_object_id = ol.object_id
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM artifact_version_retirements avr
+                  WHERE avr.version_id = av.version_id
+              )
         )
         OR EXISTS (
             SELECT 1
             FROM upload_session_finalizations usf
+            INNER JOIN upload_sessions us ON us.session_id = usf.session_id
             WHERE usf.layout_id = ol.layout_id
+              AND us.finalized_version_id IS NOT NULL
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM artifact_version_retirements avr
+                  WHERE avr.version_id = us.finalized_version_id
+              )
         )
     )
 )";
+
+constexpr std::size_t kMaxLifecycleDecisionPageLimit = 256U;
+constexpr std::size_t kMaxPinReasonBytes = 256U;
+
+[[nodiscard]] bool is_version_retired(pqxx::work& transaction, std::string_view version_id) {
+    return transaction.query_value<bool>(
+        "SELECT EXISTS ("
+        "    SELECT 1 "
+        "    FROM artifact_version_retirements "
+        "    WHERE version_id = $1"
+        ")",
+        pqxx::params{
+            version_id,
+        });
+}
 
 constexpr std::string_view kMultiNodeRestorableChunkPredicate = R"(
     EXISTS (
@@ -766,6 +796,11 @@ class PostgresMetadataRepository::Impl {
                                    "artifact version is not committed: " + std::string{version_id}};
         }
 
+        if (is_version_retired(transaction, version_id)) {
+            throw RestorePlanError{RestorePlanErrorKind::VersionRetired,
+                                   "artifact version has been retired: " + std::string{version_id}};
+        }
+
         auto selected_layout = transaction.query01<std::string>(
             "SELECT "
             "    layout_id "
@@ -832,6 +867,11 @@ class PostgresMetadataRepository::Impl {
         if (version->state() != VersionState::Committed) {
             throw RestorePlanError{RestorePlanErrorKind::VersionNotCommitted,
                                    "artifact version is not committed: " + std::string{version_id}};
+        }
+
+        if (is_version_retired(transaction, version_id)) {
+            throw RestorePlanError{RestorePlanErrorKind::VersionRetired,
+                                   "artifact version has been retired: " + std::string{version_id}};
         }
 
         const std::string restorable_layout_sql =
@@ -1040,6 +1080,12 @@ class PostgresMetadataRepository::Impl {
 
         pqxx::work transaction{connection_};
 
+        acquire_gc_coordination_advisory_lock(transaction);
+
+        if (is_version_retired(transaction, version_id)) {
+            throw LifecycleError{LifecycleErrorKind::VersionRetired, "cannot set tag on a retired artifact version"};
+        }
+
         transaction
             .exec(
                 "INSERT INTO tags ("
@@ -1098,6 +1144,15 @@ class PostgresMetadataRepository::Impl {
 
     void register_manifest(const Manifest& manifest) {
         pqxx::work transaction{connection_};
+
+        acquire_gc_coordination_advisory_lock(transaction);
+
+        for (const auto& [role, version_id] : manifest.entries()) {
+            if (is_version_retired(transaction, version_id)) {
+                throw LifecycleError{LifecycleErrorKind::VersionRetired,
+                                     "cannot register manifest referencing a retired artifact version"};
+            }
+        }
 
         const long long entry_count = size_to_postgres_bigint(manifest.entries().size(), "manifest entry count");
 
@@ -2011,6 +2066,13 @@ class PostgresMetadataRepository::Impl {
             };
         }
 
+        if (is_version_retired(transaction, version.version_id())) {
+            throw FinalizeUploadError{
+                FinalizeUploadErrorKind::VersionRetired,
+                "artifact version has been retired",
+            };
+        }
+
         if (session.state() == UploadSessionState::Committed) {
             if (!session.finalized_version_id().has_value()) {
                 throw FinalizeUploadError{
@@ -2019,7 +2081,14 @@ class PostgresMetadataRepository::Impl {
                 };
             }
 
-            const auto finalized_layout = transaction.query01<std::string>(
+            if (is_version_retired(transaction, *session.finalized_version_id())) {
+                throw FinalizeUploadError{
+                    FinalizeUploadErrorKind::VersionRetired,
+                    "artifact version has been retired",
+                };
+            }
+
+            const auto finalized_layout = transaction.query01<std::optional<std::string>>(
                 "SELECT "
                 "    layout_id "
                 "FROM upload_session_finalizations "
@@ -2028,7 +2097,10 @@ class PostgresMetadataRepository::Impl {
                     session_id.str(),
                 });
 
-            if (!finalized_layout.has_value() || std::get<0>(*finalized_layout) != descriptor.layout_id() ||
+            const std::optional<std::string> stored_finalized_layout_id =
+                finalized_layout.has_value() ? std::get<0>(*finalized_layout) : std::nullopt;
+
+            if (!stored_finalized_layout_id.has_value() || *stored_finalized_layout_id != descriptor.layout_id() ||
                 *session.finalized_version_id() != version.version_id()) {
                 throw FinalizeUploadError{
                     FinalizeUploadErrorKind::Conflict,
@@ -2569,6 +2641,618 @@ class PostgresMetadataRepository::Impl {
         return *completed;
     }
 
+    void register_lifecycle_policy(const LifecyclePolicy& policy) {
+        validate_lifecycle_policy(policy);
+
+        pqxx::work transaction{connection_};
+
+        const auto existing = load_lifecycle_policy(transaction, policy.policy_id);
+
+        if (existing.has_value()) {
+            if (existing->name == policy.name && existing->rules == policy.rules) {
+                transaction.commit();
+                return;
+            }
+
+            throw LifecycleError{LifecycleErrorKind::PolicyConflict,
+                                 "lifecycle policy ID conflicts with a different configuration"};
+        }
+
+        transaction
+            .exec(
+                "INSERT INTO lifecycle_policies ("
+                "    policy_id, "
+                "    name"
+                ") "
+                "VALUES ("
+                "    $1::uuid, "
+                "    $2"
+                ")",
+                pqxx::params{
+                    policy.policy_id.str(),
+                    policy.name,
+                })
+            .no_rows();
+
+        for (const auto& [kind, rule] : policy.rules) {
+            transaction
+                .exec(
+                    "INSERT INTO lifecycle_policy_rules ("
+                    "    policy_id, "
+                    "    artifact_kind, "
+                    "    keep_last_n, "
+                    "    max_age_seconds"
+                    ") "
+                    "VALUES ("
+                    "    $1::uuid, "
+                    "    $2, "
+                    "    $3, "
+                    "    $4"
+                    ")",
+                    pqxx::params{
+                        policy.policy_id.str(),
+                        std::string{artifact_kind_to_string(kind)},
+                        static_cast<int>(rule.keep_last_n),
+                        rule.max_age_seconds.has_value()
+                            ? std::optional<long long>{to_postgres_bigint(*rule.max_age_seconds, "max_age_seconds")}
+                            : std::nullopt,
+                    })
+                .no_rows();
+        }
+
+        transaction.commit();
+    }
+
+    [[nodiscard]] std::optional<LifecyclePolicy> get_lifecycle_policy(const UuidV7& policy_id) {
+        pqxx::work transaction{connection_};
+
+        auto loaded = load_lifecycle_policy(transaction, policy_id);
+
+        transaction.commit();
+
+        return loaded;
+    }
+
+    void pin_version(std::string_view version_id, std::string_view reason) {
+        validate_version_id(version_id);
+
+        if (reason.empty() || reason.size() > kMaxPinReasonBytes) {
+            throw LifecycleError{LifecycleErrorKind::InvalidRequest, "pin reason is invalid"};
+        }
+
+        pqxx::work transaction{connection_};
+
+        acquire_gc_coordination_advisory_lock(transaction);
+
+        const auto version = load_version(transaction, version_id);
+
+        if (!version.has_value()) {
+            throw LifecycleError{LifecycleErrorKind::VersionNotFound,
+                                 "artifact version does not exist: " + std::string{version_id}};
+        }
+
+        if (version->state() != VersionState::Committed) {
+            throw LifecycleError{LifecycleErrorKind::InvalidRequest, "only committed artifact versions can be pinned"};
+        }
+
+        if (is_version_retired(transaction, version_id)) {
+            throw LifecycleError{LifecycleErrorKind::VersionRetired, "cannot pin a retired artifact version"};
+        }
+
+        transaction
+            .exec(
+                "INSERT INTO artifact_version_pins ("
+                "    version_id, "
+                "    reason"
+                ") "
+                "VALUES ("
+                "    $1, "
+                "    $2"
+                ") "
+                "ON CONFLICT (version_id) "
+                "DO UPDATE SET "
+                "    reason = EXCLUDED.reason, "
+                "    pinned_at = CURRENT_TIMESTAMP",
+                pqxx::params{
+                    version_id,
+                    reason,
+                })
+            .no_rows();
+
+        transaction.commit();
+    }
+
+    [[nodiscard]] bool unpin_version(std::string_view version_id) {
+        validate_version_id(version_id);
+
+        pqxx::work transaction{connection_};
+
+        acquire_gc_coordination_advisory_lock(transaction);
+
+        const pqxx::result deleted = transaction.exec(
+            "DELETE FROM artifact_version_pins "
+            "WHERE version_id = $1",
+            pqxx::params{
+                version_id,
+            });
+
+        transaction.commit();
+
+        return deleted.affected_rows() > 0;
+    }
+
+    [[nodiscard]] std::optional<std::string> get_version_pin(std::string_view version_id) {
+        validate_version_id(version_id);
+
+        pqxx::work transaction{connection_};
+
+        auto stored = transaction.query01<std::string>(
+            "SELECT "
+            "    reason "
+            "FROM artifact_version_pins "
+            "WHERE version_id = $1",
+            pqxx::params{
+                version_id,
+            });
+
+        if (!stored.has_value()) {
+            transaction.commit();
+            return std::nullopt;
+        }
+
+        auto [reason] = std::move(*stored);
+
+        transaction.commit();
+
+        return reason;
+    }
+
+    [[nodiscard]] LifecycleRun run_lifecycle(const UuidV7& run_id, const UuidV7& policy_id, LifecycleRunMode mode) {
+        pqxx::work transaction{connection_};
+
+        acquire_gc_coordination_advisory_lock(transaction);
+
+        const auto existing = load_lifecycle_run(transaction, run_id);
+
+        if (existing.has_value()) {
+            if (existing->policy_id == policy_id && existing->mode == mode) {
+                transaction.commit();
+                return *existing;
+            }
+
+            throw LifecycleError{LifecycleErrorKind::RunConflict, "lifecycle run ID conflicts with an existing run"};
+        }
+
+        if (transaction.query_value<bool>("SELECT EXISTS (SELECT 1 FROM upload_sessions WHERE state = 'open')")) {
+            throw LifecycleError{LifecycleErrorKind::BlockedByOpenUploadSessions, "open upload sessions are present"};
+        }
+
+        if (transaction.query_value<bool>("SELECT EXISTS (SELECT 1 FROM gc_runs WHERE state = 'open')")) {
+            throw LifecycleError{LifecycleErrorKind::BlockedByGc, "an open GC run is present"};
+        }
+
+        if (transaction.query_value<bool>("SELECT EXISTS (SELECT 1 FROM replication_runs WHERE state = 'open')")) {
+            throw LifecycleError{LifecycleErrorKind::BlockedByReplication, "an open replication run is present"};
+        }
+
+        const auto policy = load_lifecycle_policy(transaction, policy_id);
+
+        if (!policy.has_value()) {
+            throw LifecycleError{LifecycleErrorKind::PolicyNotFound, "lifecycle policy does not exist"};
+        }
+
+        const auto evaluated_at_ms =
+            transaction.query_value<long long>("SELECT (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::bigint");
+
+        struct Candidate {
+            std::string version_id;
+            UuidV7 artifact_id;
+            ArtifactKind artifact_kind = ArtifactKind::Generic;
+            double created_at_epoch = 0.0;
+            std::uint64_t logical_size_bytes = 0;
+            bool pinned = false;
+            bool tagged = false;
+            bool manifest_referenced = false;
+            std::uint32_t rank_in_kind = 0;
+        };
+
+        std::vector<Candidate> candidates;
+
+        for (auto row :
+             transaction
+                 .query<std::string, std::string, double, long long, std::optional<std::string>, bool, bool, bool>(
+                     "SELECT "
+                     "    av.version_id, "
+                     "    av.artifact_id::text, "
+                     "    EXTRACT(EPOCH FROM av.created_at), "
+                     "    o.total_size_bytes, "
+                     "    ("
+                     "        SELECT avm.metadata_value "
+                     "        FROM artifact_version_metadata avm "
+                     "        WHERE avm.version_id = av.version_id "
+                     "          AND avm.metadata_key = $1"
+                     "    ), "
+                     "    EXISTS ("
+                     "        SELECT 1 FROM artifact_version_pins avp WHERE avp.version_id = av.version_id"
+                     "    ), "
+                     "    EXISTS ("
+                     "        SELECT 1 FROM tags t WHERE t.version_id = av.version_id"
+                     "    ), "
+                     "    EXISTS ("
+                     "        SELECT 1 FROM manifest_entries me WHERE me.version_id = av.version_id"
+                     "    ) "
+                     "FROM artifact_versions av "
+                     "INNER JOIN objects o ON o.object_id = av.root_object_id "
+                     "WHERE av.state = 'committed' "
+                     "  AND NOT EXISTS ("
+                     "      SELECT 1 FROM artifact_version_retirements avr WHERE avr.version_id = av.version_id"
+                     "  )",
+                     pqxx::params{
+                         std::string{kArtifactKindMetadataKey},
+                     })) {
+            auto [version_id, artifact_id_text, created_at_epoch, total_size_bytes, kind_metadata, pinned, tagged,
+                  manifest_referenced] = std::move(row);
+
+            if (total_size_bytes < 0) {
+                throw std::runtime_error("object total_size_bytes is negative");
+            }
+
+            candidates.push_back(Candidate{
+                .version_id = std::move(version_id),
+                .artifact_id =
+                    UuidV7{
+                        std::move(artifact_id_text),
+                    },
+                .artifact_kind = resolve_artifact_kind(
+                    kind_metadata.has_value() ? std::optional<std::string_view>{*kind_metadata} : std::nullopt),
+                .created_at_epoch = created_at_epoch,
+                .logical_size_bytes = static_cast<std::uint64_t>(total_size_bytes),
+                .pinned = pinned,
+                .tagged = tagged,
+                .manifest_referenced = manifest_referenced,
+            });
+        }
+
+        std::ranges::sort(candidates, [](const Candidate& left, const Candidate& right) {
+            if (left.artifact_id.str() != right.artifact_id.str()) {
+                return left.artifact_id.str() < right.artifact_id.str();
+            }
+
+            const std::string_view left_kind = artifact_kind_to_string(left.artifact_kind);
+            const std::string_view right_kind = artifact_kind_to_string(right.artifact_kind);
+
+            if (left_kind != right_kind) {
+                return left_kind < right_kind;
+            }
+
+            if (left.created_at_epoch != right.created_at_epoch) {
+                return left.created_at_epoch > right.created_at_epoch;
+            }
+
+            return left.version_id < right.version_id;
+        });
+
+        {
+            std::string partition_artifact;
+            std::string partition_kind;
+            std::uint32_t rank = 0;
+
+            for (Candidate& candidate : candidates) {
+                const std::string artifact_key = candidate.artifact_id.str();
+                const std::string kind_key{artifact_kind_to_string(candidate.artifact_kind)};
+
+                if (artifact_key != partition_artifact || kind_key != partition_kind) {
+                    partition_artifact = artifact_key;
+                    partition_kind = kind_key;
+                    rank = 0;
+                }
+
+                ++rank;
+                candidate.rank_in_kind = rank;
+            }
+        }
+
+        std::vector<LifecycleDecision> decisions;
+        decisions.reserve(candidates.size());
+
+        LifecycleStats stats{};
+        stats.versions_scanned = candidates.size();
+
+        const double evaluated_at_seconds = static_cast<double>(evaluated_at_ms) / 1000.0;
+
+        for (const Candidate& candidate : candidates) {
+            const auto rule_it = policy->rules.find(candidate.artifact_kind);
+
+            if (rule_it == policy->rules.end()) {
+                throw std::runtime_error("lifecycle policy is missing a rule for an artifact kind");
+            }
+
+            const LifecycleRule& rule = rule_it->second;
+
+            LifecycleDecision decision{
+                .version_id = candidate.version_id,
+                .artifact_id = candidate.artifact_id,
+                .artifact_kind = candidate.artifact_kind,
+                .retire = false,
+                .reason = LifecycleDecisionReason::PolicyRetire,
+                .logical_size_bytes = candidate.logical_size_bytes,
+            };
+
+            if (candidate.pinned) {
+                decision.reason = LifecycleDecisionReason::Pinned;
+            } else if (candidate.tagged) {
+                decision.reason = LifecycleDecisionReason::Tagged;
+            } else if (candidate.manifest_referenced) {
+                decision.reason = LifecycleDecisionReason::ManifestReferenced;
+            } else if (candidate.rank_in_kind <= rule.keep_last_n) {
+                decision.reason = LifecycleDecisionReason::KeepLastN;
+            } else if (rule.max_age_seconds.has_value() && (evaluated_at_seconds - candidate.created_at_epoch) <
+                                                               static_cast<double>(*rule.max_age_seconds)) {
+                decision.reason = LifecycleDecisionReason::AgeNotReached;
+            } else {
+                decision.retire = true;
+                decision.reason = LifecycleDecisionReason::PolicyRetire;
+            }
+
+            switch (decision.reason) {
+                case LifecycleDecisionReason::Pinned:
+                case LifecycleDecisionReason::Tagged:
+                case LifecycleDecisionReason::ManifestReferenced:
+                    ++stats.versions_protected;
+                    break;
+
+                case LifecycleDecisionReason::KeepLastN:
+                case LifecycleDecisionReason::AgeNotReached:
+                    ++stats.versions_retained_by_policy;
+                    break;
+
+                case LifecycleDecisionReason::PolicyRetire:
+                    ++stats.versions_candidates;
+                    stats.logical_bytes_candidates += decision.logical_size_bytes;
+                    break;
+            }
+
+            decisions.push_back(std::move(decision));
+        }
+
+        std::vector<LifecycleDecision> retirements_to_persist;
+
+        if (mode == LifecycleRunMode::Apply) {
+            for (const LifecycleDecision& decision : decisions) {
+                if (!decision.retire || decision.reason != LifecycleDecisionReason::PolicyRetire) {
+                    continue;
+                }
+
+                retirements_to_persist.push_back(decision);
+                ++stats.versions_retired;
+                stats.logical_bytes_retired += decision.logical_size_bytes;
+            }
+        }
+
+        transaction
+            .exec(
+                "INSERT INTO lifecycle_runs ("
+                "    run_id, "
+                "    policy_id, "
+                "    mode, "
+                "    evaluated_at, "
+                "    versions_scanned, "
+                "    versions_protected, "
+                "    versions_retained_by_policy, "
+                "    versions_candidates, "
+                "    versions_retired, "
+                "    logical_bytes_candidates, "
+                "    logical_bytes_retired"
+                ") "
+                "VALUES ("
+                "    $1::uuid, "
+                "    $2::uuid, "
+                "    $3, "
+                "    to_timestamp($4::double precision / 1000.0), "
+                "    $5, "
+                "    $6, "
+                "    $7, "
+                "    $8, "
+                "    $9, "
+                "    $10, "
+                "    $11"
+                ")",
+                pqxx::params{
+                    run_id.str(),
+                    policy_id.str(),
+                    std::string{lifecycle_run_mode_to_string(mode)},
+                    evaluated_at_ms,
+                    to_postgres_bigint(stats.versions_scanned, "versions_scanned"),
+                    to_postgres_bigint(stats.versions_protected, "versions_protected"),
+                    to_postgres_bigint(stats.versions_retained_by_policy, "versions_retained_by_policy"),
+                    to_postgres_bigint(stats.versions_candidates, "versions_candidates"),
+                    to_postgres_bigint(stats.versions_retired, "versions_retired"),
+                    to_postgres_bigint(stats.logical_bytes_candidates, "logical_bytes_candidates"),
+                    to_postgres_bigint(stats.logical_bytes_retired, "logical_bytes_retired"),
+                })
+            .no_rows();
+
+        for (const LifecycleDecision& decision : retirements_to_persist) {
+            transaction
+                .exec(
+                    "INSERT INTO artifact_version_retirements ("
+                    "    version_id, "
+                    "    lifecycle_run_id, "
+                    "    artifact_kind, "
+                    "    reason"
+                    ") "
+                    "VALUES ("
+                    "    $1, "
+                    "    $2::uuid, "
+                    "    $3, "
+                    "    $4"
+                    ")",
+                    pqxx::params{
+                        decision.version_id,
+                        run_id.str(),
+                        std::string{artifact_kind_to_string(decision.artifact_kind)},
+                        std::string{lifecycle_decision_reason_to_string(decision.reason)},
+                    })
+                .no_rows();
+        }
+
+        for (const LifecycleDecision& decision : decisions) {
+            transaction
+                .exec(
+                    "INSERT INTO lifecycle_run_decisions ("
+                    "    run_id, "
+                    "    version_id, "
+                    "    artifact_id, "
+                    "    artifact_kind, "
+                    "    decision, "
+                    "    reason, "
+                    "    logical_size_bytes"
+                    ") "
+                    "VALUES ("
+                    "    $1::uuid, "
+                    "    $2, "
+                    "    $3::uuid, "
+                    "    $4, "
+                    "    $5, "
+                    "    $6, "
+                    "    $7"
+                    ")",
+                    pqxx::params{
+                        run_id.str(),
+                        decision.version_id,
+                        decision.artifact_id.str(),
+                        std::string{artifact_kind_to_string(decision.artifact_kind)},
+                        decision.retire ? "retire" : "retain",
+                        std::string{lifecycle_decision_reason_to_string(decision.reason)},
+                        to_postgres_bigint(decision.logical_size_bytes, "logical_size_bytes"),
+                    })
+                .no_rows();
+        }
+
+        const auto loaded = load_lifecycle_run(transaction, run_id);
+
+        if (!loaded.has_value()) {
+            throw std::runtime_error("lifecycle run disappeared immediately after persistence");
+        }
+
+        transaction.commit();
+
+        return *loaded;
+    }
+
+    [[nodiscard]] std::optional<LifecycleRun> get_lifecycle_run(const UuidV7& run_id) {
+        pqxx::work transaction{connection_};
+
+        auto loaded = load_lifecycle_run(transaction, run_id);
+
+        transaction.commit();
+
+        return loaded;
+    }
+
+    [[nodiscard]] std::vector<LifecycleDecision> list_lifecycle_decisions(
+        const UuidV7& run_id, std::optional<std::string_view> after_version_id, std::size_t limit) {
+        if (limit < 1U || limit > kMaxLifecycleDecisionPageLimit) {
+            throw LifecycleError{LifecycleErrorKind::InvalidRequest,
+                                 "lifecycle decision page limit must be between 1 and 256"};
+        }
+
+        if (after_version_id.has_value()) {
+            validate_version_id(*after_version_id);
+        }
+
+        pqxx::work transaction{connection_};
+
+        const bool run_exists = transaction.query_value<bool>(
+            "SELECT EXISTS ("
+            "    SELECT 1 "
+            "    FROM lifecycle_runs "
+            "    WHERE run_id = $1::uuid"
+            ")",
+            pqxx::params{
+                run_id.str(),
+            });
+
+        if (!run_exists) {
+            throw LifecycleError{LifecycleErrorKind::RunNotFound, "lifecycle run does not exist"};
+        }
+
+        std::vector<LifecycleDecision> decisions;
+
+        auto append_row = [&](std::string version_id, std::string artifact_id_text, const std::string& artifact_kind,
+                              const std::string& decision, const std::string& reason, long long logical_size_bytes) {
+            if (logical_size_bytes < 0) {
+                throw std::runtime_error("stored lifecycle decision has negative logical_size_bytes");
+            }
+
+            decisions.push_back(LifecycleDecision{
+                .version_id = std::move(version_id),
+                .artifact_id =
+                    UuidV7{
+                        std::move(artifact_id_text),
+                    },
+                .artifact_kind = artifact_kind_from_string(artifact_kind),
+                .retire = decision == "retire",
+                .reason = lifecycle_decision_reason_from_string(reason),
+                .logical_size_bytes = static_cast<std::uint64_t>(logical_size_bytes),
+            });
+        };
+
+        if (after_version_id.has_value()) {
+            for (auto row :
+                 transaction.query<std::string, std::string, std::string, std::string, std::string, long long>(
+                     "SELECT "
+                     "    version_id, "
+                     "    artifact_id::text, "
+                     "    artifact_kind, "
+                     "    decision, "
+                     "    reason, "
+                     "    logical_size_bytes "
+                     "FROM lifecycle_run_decisions "
+                     "WHERE run_id = $1::uuid "
+                     "  AND version_id > $2 "
+                     "ORDER BY version_id ASC "
+                     "LIMIT $3",
+                     pqxx::params{
+                         run_id.str(),
+                         *after_version_id,
+                         size_to_postgres_bigint(limit, "lifecycle decision limit"),
+                     })) {
+                auto [version_id, artifact_id_text, artifact_kind, decision, reason, logical_size_bytes] =
+                    std::move(row);
+                append_row(std::move(version_id), std::move(artifact_id_text), artifact_kind, decision, reason,
+                           logical_size_bytes);
+            }
+        } else {
+            for (auto row :
+                 transaction.query<std::string, std::string, std::string, std::string, std::string, long long>(
+                     "SELECT "
+                     "    version_id, "
+                     "    artifact_id::text, "
+                     "    artifact_kind, "
+                     "    decision, "
+                     "    reason, "
+                     "    logical_size_bytes "
+                     "FROM lifecycle_run_decisions "
+                     "WHERE run_id = $1::uuid "
+                     "ORDER BY version_id ASC "
+                     "LIMIT $2",
+                     pqxx::params{
+                         run_id.str(),
+                         size_to_postgres_bigint(limit, "lifecycle decision limit"),
+                     })) {
+                auto [version_id, artifact_id_text, artifact_kind, decision, reason, logical_size_bytes] =
+                    std::move(row);
+                append_row(std::move(version_id), std::move(artifact_id_text), artifact_kind, decision, reason,
+                           logical_size_bytes);
+            }
+        }
+
+        transaction.commit();
+
+        return decisions;
+    }
+
     [[nodiscard]] ReplicationRun start_replication_run(const UuidV7& run_id, std::string_view version_id,
                                                        std::uint8_t replication_factor) {
         validate_version_id(version_id);
@@ -2625,6 +3309,11 @@ class PostgresMetadataRepository::Impl {
         if (version->state() != VersionState::Committed) {
             throw ReplicationError{ReplicationErrorKind::VersionNotCommitted,
                                    "artifact version is not committed: " + std::string{version_id}};
+        }
+
+        if (is_version_retired(transaction, version_id)) {
+            throw ReplicationError{ReplicationErrorKind::VersionRetired,
+                                   "artifact version has been retired: " + std::string{version_id}};
         }
 
         const std::string restorable_layout_sql =
@@ -3857,6 +4546,131 @@ class PostgresMetadataRepository::Impl {
         }
     }
 
+    [[nodiscard]] std::optional<LifecyclePolicy> load_lifecycle_policy(pqxx::work& transaction,
+                                                                       const UuidV7& policy_id) {
+        auto stored = transaction.query01<std::string, std::string>(
+            "SELECT "
+            "    policy_id::text, "
+            "    name "
+            "FROM lifecycle_policies "
+            "WHERE policy_id = $1::uuid",
+            pqxx::params{
+                policy_id.str(),
+            });
+
+        if (!stored.has_value()) {
+            return std::nullopt;
+        }
+
+        auto [stored_policy_id, name] = std::move(*stored);
+
+        LifecyclePolicy policy{
+            .policy_id =
+                UuidV7{
+                    std::move(stored_policy_id),
+                },
+            .name = std::move(name),
+            .rules = {},
+        };
+
+        for (auto [artifact_kind, keep_last_n, max_age_seconds] :
+             transaction.query<std::string, int, std::optional<long long>>("SELECT "
+                                                                           "    artifact_kind, "
+                                                                           "    keep_last_n, "
+                                                                           "    max_age_seconds "
+                                                                           "FROM lifecycle_policy_rules "
+                                                                           "WHERE policy_id = $1::uuid "
+                                                                           "ORDER BY artifact_kind",
+                                                                           pqxx::params{
+                                                                               policy_id.str(),
+                                                                           })) {
+            if (keep_last_n < 0) {
+                throw std::runtime_error("stored lifecycle policy rule has negative keep_last_n");
+            }
+
+            if (max_age_seconds.has_value() && *max_age_seconds < 0) {
+                throw std::runtime_error("stored lifecycle policy rule has negative max_age_seconds");
+            }
+
+            const ArtifactKind kind = artifact_kind_from_string(artifact_kind);
+
+            policy.rules.emplace(
+                kind,
+                LifecycleRule{
+                    .artifact_kind = kind,
+                    .keep_last_n = static_cast<std::uint32_t>(keep_last_n),
+                    .max_age_seconds = max_age_seconds.has_value()
+                                           ? std::optional<std::uint64_t>{static_cast<std::uint64_t>(*max_age_seconds)}
+                                           : std::nullopt,
+                });
+        }
+
+        return policy;
+    }
+
+    [[nodiscard]] std::optional<LifecycleRun> load_lifecycle_run(pqxx::work& transaction, const UuidV7& run_id) {
+        auto stored = transaction.query01<std::string, std::string, std::string, long long, long long, long long,
+                                          long long, long long, long long, long long, long long>(
+            "SELECT "
+            "    run_id::text, "
+            "    policy_id::text, "
+            "    mode, "
+            "    (EXTRACT(EPOCH FROM evaluated_at) * 1000)::bigint, "
+            "    versions_scanned, "
+            "    versions_protected, "
+            "    versions_retained_by_policy, "
+            "    versions_candidates, "
+            "    versions_retired, "
+            "    logical_bytes_candidates, "
+            "    logical_bytes_retired "
+            "FROM lifecycle_runs "
+            "WHERE run_id = $1::uuid",
+            pqxx::params{
+                run_id.str(),
+            });
+
+        if (!stored.has_value()) {
+            return std::nullopt;
+        }
+
+        auto [stored_run_id, stored_policy_id, mode, evaluated_at_ms, versions_scanned, versions_protected,
+              versions_retained_by_policy, versions_candidates, versions_retired, logical_bytes_candidates,
+              logical_bytes_retired] = std::move(*stored);
+
+        auto require_non_negative = [](long long value, std::string_view field_name) -> std::uint64_t {
+            if (value < 0) {
+                throw std::runtime_error(std::string{field_name} + " is negative in stored lifecycle run");
+            }
+
+            return static_cast<std::uint64_t>(value);
+        };
+
+        return LifecycleRun{
+            .run_id =
+                UuidV7{
+                    std::move(stored_run_id),
+                },
+            .policy_id =
+                UuidV7{
+                    std::move(stored_policy_id),
+                },
+            .mode = lifecycle_run_mode_from_string(mode),
+            .evaluated_at_unix_ms = evaluated_at_ms,
+            .stats =
+                LifecycleStats{
+                    .versions_scanned = require_non_negative(versions_scanned, "versions_scanned"),
+                    .versions_protected = require_non_negative(versions_protected, "versions_protected"),
+                    .versions_retained_by_policy =
+                        require_non_negative(versions_retained_by_policy, "versions_retained_by_policy"),
+                    .versions_candidates = require_non_negative(versions_candidates, "versions_candidates"),
+                    .versions_retired = require_non_negative(versions_retired, "versions_retired"),
+                    .logical_bytes_candidates =
+                        require_non_negative(logical_bytes_candidates, "logical_bytes_candidates"),
+                    .logical_bytes_retired = require_non_negative(logical_bytes_retired, "logical_bytes_retired"),
+                },
+        };
+    }
+
     pqxx::connection connection_;
 };
 
@@ -4007,6 +4821,38 @@ std::vector<GcChunkDecision> PostgresMetadataRepository::classify_gc_chunks(cons
 
 GcRun PostgresMetadataRepository::complete_gc_run(const UuidV7& run_id, const GcPhysicalStats& physical_stats) {
     return impl_->complete_gc_run(run_id, physical_stats);
+}
+
+void PostgresMetadataRepository::register_lifecycle_policy(const LifecyclePolicy& policy) {
+    impl_->register_lifecycle_policy(policy);
+}
+
+std::optional<LifecyclePolicy> PostgresMetadataRepository::get_lifecycle_policy(const UuidV7& policy_id) {
+    return impl_->get_lifecycle_policy(policy_id);
+}
+
+void PostgresMetadataRepository::pin_version(std::string_view version_id, std::string_view reason) {
+    impl_->pin_version(version_id, reason);
+}
+
+bool PostgresMetadataRepository::unpin_version(std::string_view version_id) { return impl_->unpin_version(version_id); }
+
+std::optional<std::string> PostgresMetadataRepository::get_version_pin(std::string_view version_id) {
+    return impl_->get_version_pin(version_id);
+}
+
+LifecycleRun PostgresMetadataRepository::run_lifecycle(const UuidV7& run_id, const UuidV7& policy_id,
+                                                       LifecycleRunMode mode) {
+    return impl_->run_lifecycle(run_id, policy_id, mode);
+}
+
+std::optional<LifecycleRun> PostgresMetadataRepository::get_lifecycle_run(const UuidV7& run_id) {
+    return impl_->get_lifecycle_run(run_id);
+}
+
+std::vector<LifecycleDecision> PostgresMetadataRepository::list_lifecycle_decisions(
+    const UuidV7& run_id, std::optional<std::string_view> after_version_id, std::size_t limit) {
+    return impl_->list_lifecycle_decisions(run_id, after_version_id, limit);
 }
 
 }  // namespace aistore::metadata
