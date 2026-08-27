@@ -6,6 +6,16 @@ AI Artifact Store is a C++20 systems project for content-addressed storage of la
 
 Core system complete through **M10 portfolio/performance polish**. This is an engineering portfolio system, not a claim of production or enterprise readiness.
 
+## Interactive Demo
+
+Drive the **real** local Metadata Service, disposable PostgreSQL database, and three StorageNode processes through the production CLI — from a dark systems-demo UI.
+
+```bash
+./demo/start.sh
+```
+
+Then open [http://127.0.0.1:5173](http://127.0.0.1:5173). Details: [`demo/README.md`](demo/README.md).
+
 ## Engineering Highlights
 
 - Content-addressed CAS (chunk/object SHA-256 identity)

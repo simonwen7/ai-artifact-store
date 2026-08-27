@@ -25,5 +25,12 @@ benchmarks/scratch/
 benchmarks/results/*.tmp.json
 benchmarks/results/local_*.json
 
+# Interactive demo local artifacts
+build-demo-release/
+demo/frontend/node_modules/
+demo/frontend/dist/
+demo/controller/__pycache__/
+demo/**/__pycache__/
+
 # macOS
 .DS_Store
