@@ -1282,3 +1282,43 @@ if(BUILD_TESTING)
         )
     endif()
 endif()
+
+option(AISTORE_BUILD_BENCHMARKS "Build aistore-bench measurement tool" OFF)
+
+if(AISTORE_BUILD_BENCHMARKS)
+    add_executable(
+        aistore_bench
+        benchmarks/aistore_bench.cpp
+    )
+
+    target_compile_features(
+        aistore_bench
+        PRIVATE
+        cxx_std_20
+    )
+
+    set_target_properties(
+        aistore_bench
+        PROPERTIES
+        OUTPUT_NAME aistore-bench
+        CXX_EXTENSIONS OFF
+    )
+
+    target_link_libraries(
+        aistore_bench
+        PRIVATE
+        aistore_chunking
+        aistore_hashing
+        Boost::json
+    )
+
+    if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+        target_compile_options(
+            aistore_bench
+            PRIVATE
+            -Wall
+            -Wextra
+            -Wpedantic
+        )
+    endif()
+endif()

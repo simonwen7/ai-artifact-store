@@ -1,0 +1,30 @@
+{
+  "benchmark": "chunking",
+  "dataset_bytes": 134217728,
+  "fastcdc": {
+    "avg_chunk_size_bytes": 4194304,
+    "base_chunk_count": 29,
+    "max_chunk_size_bytes": 8388608,
+    "median_elapsed_ms": 336.540458,
+    "median_mib_per_second": 380.3406008320105,
+    "min_chunk_size_bytes": 2097152,
+    "reuse_ratio": 0.9578777069344993,
+    "reused_logical_bytes": 128626945,
+    "shared_chunk_count": 28,
+    "shifted_chunk_count": 29
+  },
+  "fixed_size": {
+    "base_chunk_count": 32,
+    "chunk_size_bytes": 4194304,
+    "median_elapsed_ms": 50.523375,
+    "median_mib_per_second": 2533.480789832429,
+    "reuse_ratio": 0.0,
+    "reused_logical_bytes": 0,
+    "shared_chunk_count": 0,
+    "shifted_chunk_count": 33
+  },
+  "iterations": 5,
+  "schema_version": 1,
+  "shift_bytes": 65536,
+  "shifted_dataset_bytes": 134283264
+}

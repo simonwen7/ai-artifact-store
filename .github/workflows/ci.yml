@@ -150,6 +150,8 @@ jobs:
             -S . \
             -B build-ci \
             -G Ninja \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DBUILD_TESTING=ON \
             -DCMAKE_TOOLCHAIN_FILE="$HOME/vcpkg/scripts/buildsystems/vcpkg.cmake" \
             -DCMAKE_CXX_COMPILER=clang++
 
@@ -452,3 +454,25 @@ jobs:
             "DELETE FROM storage_nodes WHERE node_id = 'ci-node';"
           psql "${AISTORE_TEST_DB_URL}" -v ON_ERROR_STOP=1 -c \
             "DELETE FROM chunks WHERE chunk_id = '${chunk_id}';"
+
+      - name: Configure Release verification
+        run: |
+          cmake \
+            -S . \
+            -B build-release-ci \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_TESTING=OFF \
+            -DAISTORE_BUILD_BENCHMARKS=ON \
+            -DCMAKE_TOOLCHAIN_FILE="$HOME/vcpkg/scripts/buildsystems/vcpkg.cmake" \
+            -DCMAKE_CXX_COMPILER=clang++
+
+      - name: Build Release verification
+        run: cmake --build build-release-ci
+
+      - name: Verify Release binaries
+        run: |
+          ./build-release-ci/aistore --help
+          test -x ./build-release-ci/storage-node
+          test -x ./build-release-ci/metadata-service
+          ./build-release-ci/aistore-bench --help

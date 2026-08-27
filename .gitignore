@@ -1,6 +1,9 @@
 # Build directories
 build/
 build-tidy/
+build-ci/
+build-m10-release/
+build-m10-debug/
 cmake-build-*/
 
 # CMake generated files
@@ -16,6 +19,11 @@ compile_commands.json
 *.a
 *.so
 *.dylib
+
+# Local benchmark scratch (committed reference JSON under benchmarks/results/ is kept)
+benchmarks/scratch/
+benchmarks/results/*.tmp.json
+benchmarks/results/local_*.json
 
 # macOS
 .DS_Store

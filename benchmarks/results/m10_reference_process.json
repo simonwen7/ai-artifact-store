@@ -1,0 +1,115 @@
+{
+  "benchmark": "process_localhost",
+  "configuration": {
+    "file_bytes": 67108864,
+    "fixed_chunk_size_bytes": 4194304,
+    "storage_node_count": 3
+  },
+  "environment": {
+    "architecture": "arm64",
+    "build_type": "Release",
+    "cmake_version": "cmake version 4.4.2",
+    "compiler_version": "Apple clang version 17.0.0 (clang-1700.0.13.5)",
+    "cpu_model": "Apple M4 Pro",
+    "logical_cpu_count": 12,
+    "os": "Darwin",
+    "os_version": "24.6.0"
+  },
+  "scenarios": {
+    "cold_push_rf1": {
+      "cli": {
+        "bytes_read": 67108864,
+        "bytes_sent_to_storage": 67108864,
+        "layout_id": "f73dac4ce3d1681af86a541c3209e38bb6185777fab877182eec2a0b2982c547",
+        "object_id": "90a5880e6413f29c0a5440dfec3fa5a7c1d05c168fbc66940b15469de71599af",
+        "put_requests": 16,
+        "repaired_target_chunks": 0,
+        "status": "committed",
+        "total_chunks": 16,
+        "unique_chunks": 16,
+        "verified_target_chunks": 0,
+        "version_id": "b2f1079e08704712285a2aa07d731aa0cae28733b4fec25b09bb1c48bb31fb67"
+      },
+      "elapsed_seconds": 0.14878908299999694,
+      "logical_bytes": 67108864,
+      "logical_mib_per_second": 430.1390848682179,
+      "name": "cold_push_rf1",
+      "storage_byte_amplification": 1.0
+    },
+    "cold_push_rf2": {
+      "cli": {
+        "bytes_read": 67108864,
+        "bytes_sent_to_storage": 134217728,
+        "layout_id": "c32e23481cc2f751ad36313d0b3353c71dcae9ea0b202e30806a21437dd39004",
+        "object_id": "ebfeb5fd16c4b63626bab6a6e53d9b8e0c9ecdbda4a5bf6931bad646b956947b",
+        "put_requests": 32,
+        "repaired_target_chunks": 0,
+        "status": "committed",
+        "total_chunks": 16,
+        "unique_chunks": 16,
+        "verified_target_chunks": 0,
+        "version_id": "00547405628e1981824bdf8ad1f5e30236642b67a70092a40915d4428bcf5547"
+      },
+      "elapsed_seconds": 0.22425579099999737,
+      "logical_bytes": 67108864,
+      "logical_mib_per_second": 285.3883938274787,
+      "name": "cold_push_rf2",
+      "storage_byte_amplification": 2.0
+    },
+    "pull_rf1": {
+      "cli": {
+        "bytes_received_from_storage": 67108864,
+        "bytes_restored": 67108864,
+        "chunks_downloaded": 16,
+        "chunks_reused_from_partial": 0,
+        "status": "restored",
+        "total_chunks": 16,
+        "version_id": "b2f1079e08704712285a2aa07d731aa0cae28733b4fec25b09bb1c48bb31fb67"
+      },
+      "elapsed_seconds": 0.30656358399999917,
+      "logical_bytes": 67108864,
+      "logical_mib_per_second": 208.76582653731037,
+      "name": "pull_rf1",
+      "sha256_verified": true
+    },
+    "pull_rf2": {
+      "cli": {
+        "bytes_received_from_storage": 67108864,
+        "bytes_restored": 67108864,
+        "chunks_downloaded": 16,
+        "chunks_reused_from_partial": 0,
+        "status": "restored",
+        "total_chunks": 16,
+        "version_id": "00547405628e1981824bdf8ad1f5e30236642b67a70092a40915d4428bcf5547"
+      },
+      "elapsed_seconds": 0.3003439159999992,
+      "logical_bytes": 67108864,
+      "logical_mib_per_second": 213.08905088658486,
+      "name": "pull_rf2",
+      "sha256_verified": true
+    },
+    "warm_dedup_push_rf1": {
+      "cli": {
+        "bytes_read": 67108864,
+        "bytes_sent_to_storage": 0,
+        "layout_id": "f73dac4ce3d1681af86a541c3209e38bb6185777fab877182eec2a0b2982c547",
+        "object_id": "90a5880e6413f29c0a5440dfec3fa5a7c1d05c168fbc66940b15469de71599af",
+        "put_requests": 0,
+        "repaired_target_chunks": 0,
+        "status": "committed",
+        "total_chunks": 16,
+        "unique_chunks": 16,
+        "verified_target_chunks": 16,
+        "version_id": "2786195ed874e60acab21be6cbaeb8262a4a86acdd632bd0b8029d22a9faa9d9"
+      },
+      "elapsed_seconds": 0.08415349999999933,
+      "logical_bytes": 67108864,
+      "logical_mib_per_second": 760.5150112591932,
+      "name": "warm_dedup_push_rf1",
+      "network_avoidance_ratio": 1.0,
+      "network_bytes_avoided": 67108864,
+      "storage_byte_amplification": 0.0
+    }
+  },
+  "schema_version": 1
+}
