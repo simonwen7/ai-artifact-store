@@ -1,0 +1,36 @@
+{
+  "benchmark_sources": [
+    "benchmarks/results/m10_reference_chunking.json",
+    "benchmarks/results/m10_reference_process.json"
+  ],
+  "description": "Recorded GET /api/state snapshots from a real local Guided Demo run against the production aistore CLI.",
+  "scenario_name": "guided-failure-recovery",
+  "schema_version": 1,
+  "source": "verified-local-demo",
+  "steps": [
+    {
+      "file": "guided/guided-ready.json",
+      "step": "READY"
+    },
+    {
+      "file": "guided/guided-pushed.json",
+      "step": "PUSHED"
+    },
+    {
+      "file": "guided/guided-node-failed.json",
+      "step": "NODE_FAILED"
+    },
+    {
+      "file": "guided/guided-pull-verified.json",
+      "step": "PULL_VERIFIED"
+    },
+    {
+      "file": "guided/guided-repaired.json",
+      "step": "REPAIRED"
+    },
+    {
+      "file": "guided/guided-complete.json",
+      "step": "COMPLETE"
+    }
+  ]
+}

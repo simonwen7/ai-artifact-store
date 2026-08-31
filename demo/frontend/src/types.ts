@@ -1,3 +1,5 @@
+export type AppTab = "cluster" | "chunking" | "lifecycle" | "performance";
+
 export type ProcessStatus = "online" | "offline";
 export type RegistryState = "active" | "draining" | "disabled";
 export type MetadataServiceStatus = "online" | "offline";

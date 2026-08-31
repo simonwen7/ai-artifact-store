@@ -3,23 +3,16 @@ import type {
   ArtifactKind,
   ArtifactState,
   ChunkingStrategy,
-  DemoState,
 } from "../types";
-import { getRestoredUrl, pushArtifact } from "../lib/api";
+import { useDemoRuntime } from "../lib/demoRuntime";
 
 interface ArtifactPanelProps {
-  state: DemoState | null;
   busy: boolean;
   explorer: boolean;
-  runMutation: (fn: () => Promise<DemoState>, note?: string) => Promise<void>;
 }
 
-export default function ArtifactPanel({
-  state,
-  busy,
-  explorer,
-  runMutation,
-}: ArtifactPanelProps) {
+export default function ArtifactPanel({ busy, explorer }: ArtifactPanelProps) {
+  const { state, runMutation, actions, capabilities } = useDemoRuntime();
   const artifact = state?.artifact ?? null;
   const inputRef = useRef<HTMLInputElement>(null);
   const [file, setFile] = useState<File | null>(null);
@@ -39,7 +32,7 @@ export default function ArtifactPanel({
     if (!file) return;
     void runMutation(async () => {
       const buffer = await file.arrayBuffer();
-      return pushArtifact(buffer, {
+      return actions.pushArtifact(buffer, {
         filename: file.name,
         chunking_strategy: chunking,
         replication_factor: rf,
@@ -57,9 +50,7 @@ export default function ArtifactPanel({
             {artifact ? artifact.filename : "No artifact yet"}
           </h3>
         </div>
-        {artifact && (
-          <HealthBadge health={artifact.health} />
-        )}
+        {artifact && <HealthBadge health={artifact.health} />}
       </div>
 
       {artifact ? (
@@ -78,14 +69,16 @@ export default function ArtifactPanel({
             <IdRow label="Version ID" value={artifact.version_id} />
             <IdRow label="Artifact ID" value={artifact.artifact_id} />
           </div>
-          <a
-            className="btn-secondary inline-flex text-sm"
-            href={getRestoredUrl()}
-            target="_blank"
-            rel="noreferrer"
-          >
-            Download last restore
-          </a>
+          {capabilities.downloadRestore && (
+            <a
+              className="btn-secondary inline-flex text-sm"
+              href={actions.getRestoredUrl()}
+              target="_blank"
+              rel="noreferrer"
+            >
+              Download last restore
+            </a>
+          )}
           <p className="text-[11px] text-mist-500">
             Demo health view — derived from placement + process reachability; not a
             persisted production health status.
@@ -93,11 +86,13 @@ export default function ArtifactPanel({
         </div>
       ) : (
         <p className="mt-3 text-sm text-mist-500">
-          Push a guided artifact or upload in Explorer to populate identity and placement.
+          {explorer
+            ? "Push a guided artifact or upload in Explorer to populate identity and placement."
+            : "Push a guided artifact to populate identity and placement."}
         </p>
       )}
 
-      {explorer && (
+      {explorer && capabilities.uploadArtifact && (
         <div className="mt-6 space-y-4 border-t border-white/[0.06] pt-5">
           <div
             onDragOver={(e) => {

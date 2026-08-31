@@ -3,3 +3,5 @@ dist
 .DS_Store
 *.local
 .vite
+# Generated from benchmarks/results/ during prepare:showcase / build:showcase
+public/showcase/reference/

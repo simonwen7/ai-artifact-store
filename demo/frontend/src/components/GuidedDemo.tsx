@@ -1,12 +1,5 @@
 import type { DemoState, GuidedStepName } from "../types";
-import {
-  guidedComplete,
-  guidedKill,
-  guidedPull,
-  guidedPush,
-  guidedRepair,
-  resetDemo,
-} from "../lib/api";
+import { useDemoRuntime } from "../lib/demoRuntime";
 
 const STEP_ORDER: GuidedStepName[] = [
   "READY",
@@ -18,23 +11,18 @@ const STEP_ORDER: GuidedStepName[] = [
 ];
 
 interface GuidedDemoProps {
-  state: DemoState | null;
   busy: boolean;
-  runMutation: (fn: () => Promise<DemoState>, note?: string) => Promise<void>;
   onExplore: () => void;
 }
 
-export default function GuidedDemo({
-  state,
-  busy,
-  runMutation,
-  onExplore,
-}: GuidedDemoProps) {
+export default function GuidedDemo({ busy, onExplore }: GuidedDemoProps) {
+  const { state, runMutation, actions, labels, capabilities } = useDemoRuntime();
   const step = normalizeStep(state?.guided?.step);
   const index = Math.max(0, STEP_ORDER.indexOf(step));
   const displayStep = Math.min(index + 1, 5);
   const killed = state?.guided?.killed_node_id;
   const showSummary = step === "REPAIRED" || step === "COMPLETE";
+  const readyEnabled = capabilities.scenarioExplorer || Boolean(state?.ready);
 
   return (
     <section className="panel overflow-hidden">
@@ -54,7 +42,9 @@ export default function GuidedDemo({
       </div>
 
       <div className="space-y-4 px-5 py-5">
-        <p className="text-sm leading-relaxed text-mist-300">{copyFor(step, killed)}</p>
+        <p className="text-sm leading-relaxed text-mist-300">
+          {copyFor(step, killed, labels.guidedCompleteBody, capabilities.scenarioExplorer)}
+        </p>
 
         {step === "PULL_VERIFIED" && (
           <ul className="space-y-1 text-sm text-mist-300">
@@ -81,9 +71,12 @@ export default function GuidedDemo({
             <button
               type="button"
               className="btn-primary"
-              disabled={busy || !state?.ready}
+              disabled={busy || !readyEnabled}
               onClick={() =>
-                void runMutation(guidedPush, "Pushing demo artifact (FastCDC, RF=2)…")
+                void runMutation(
+                  actions.guidedPush,
+                  "Pushing demo artifact (FastCDC, RF=2)…",
+                )
               }
             >
               Push Demo Artifact
@@ -95,7 +88,10 @@ export default function GuidedDemo({
               className="btn-danger"
               disabled={busy}
               onClick={() =>
-                void runMutation(guidedKill, "Simulating storage-node failure…")
+                void runMutation(
+                  actions.guidedKill,
+                  "Simulating storage-node failure…",
+                )
               }
             >
               Simulate failure
@@ -107,7 +103,10 @@ export default function GuidedDemo({
               className="btn-primary"
               disabled={busy}
               onClick={() =>
-                void runMutation(guidedPull, "Pulling while a replica is offline…")
+                void runMutation(
+                  actions.guidedPull,
+                  "Pulling while a replica is offline…",
+                )
               }
             >
               Pull while offline
@@ -119,7 +118,7 @@ export default function GuidedDemo({
               className="btn-primary"
               disabled={busy}
               onClick={() =>
-                void runMutation(guidedRepair, "Repairing replicas…")
+                void runMutation(actions.guidedRepair, "Repairing replicas…")
               }
             >
               Repair
@@ -131,7 +130,10 @@ export default function GuidedDemo({
               className="btn-primary"
               disabled={busy}
               onClick={() =>
-                void runMutation(guidedComplete, "Finishing guided demo…")
+                void runMutation(
+                  actions.guidedComplete,
+                  "Finishing guided demo…",
+                )
               }
             >
               Finish Guided Demo
@@ -143,7 +145,9 @@ export default function GuidedDemo({
                 type="button"
                 className="btn-primary"
                 disabled={busy}
-                onClick={() => void runMutation(resetDemo, "Restarting demo…")}
+                onClick={() =>
+                  void runMutation(actions.resetDemo, "Restarting demo…")
+                }
               >
                 Restart Demo
               </button>
@@ -186,10 +190,17 @@ function titleFor(step: GuidedStepName): string {
   }
 }
 
-function copyFor(step: GuidedStepName, killed: string | null | undefined): string {
+function copyFor(
+  step: GuidedStepName,
+  killed: string | null | undefined,
+  completeBody: string,
+  recorded: boolean,
+): string {
   switch (step) {
     case "READY":
-      return "Start with a healthy three-node cluster. All three nodes should already be online and Active.";
+      return recorded
+        ? "Start from a recorded healthy three-node cluster. Advance through the verified recovery sequence."
+        : "Start with a healthy three-node cluster. All three nodes should already be online and Active.";
     case "PUSHED":
       return "The demo artifact is content-addressed and replicated. Next, simulate a storage-node failure without changing registry state — metadata belief and physical availability diverge.";
     case "NODE_FAILED":
@@ -197,9 +208,11 @@ function copyFor(step: GuidedStepName, killed: string | null | undefined): strin
     case "PULL_VERIFIED":
       return "Pull succeeded against a degraded cluster. Repair will disable the failed node for placement eligibility, then restore replication factor.";
     case "REPAIRED":
-      return "Real Push, Pull, and Repair finished. Review the stats below, then finish the guided presentation.";
+      return recorded
+        ? "Recorded Push, Pull, and Repair finished. Review the stats below, then finish the guided presentation."
+        : "Real Push, Pull, and Repair finished. Review the stats below, then finish the guided presentation.";
     case "COMPLETE":
-      return "You exercised push, failure, verified pull, and repair against the real local system.";
+      return completeBody;
   }
 }
 

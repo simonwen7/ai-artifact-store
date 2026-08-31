@@ -7,7 +7,9 @@
     "dev": "vite",
     "build": "tsc -b && vite build",
     "preview": "vite preview",
-    "lint": "tsc -b --pretty false"
+    "lint": "tsc -b --pretty false",
+    "prepare:showcase": "node scripts/prepare-showcase.mjs",
+    "build:showcase": "node scripts/build-showcase.mjs"
   },
   "dependencies": {
     "react": "^18.3.1",

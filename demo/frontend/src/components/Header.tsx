@@ -1,15 +1,33 @@
 import type { DemoState, NodeState } from "../types";
+import { useDemoRuntime } from "../lib/demoRuntime";
 
-function clusterHealth(state: DemoState | null, pollError: string | null): {
+function clusterHealth(
+  state: DemoState | null,
+  pollError: string | null,
+  recorded: boolean,
+): {
   label: string;
   tone: "ok" | "warn" | "bad" | "idle";
 } {
   if (!state) {
     return {
-      label: pollError ? "Controller unreachable" : "Initializing",
+      label: pollError
+        ? recorded
+          ? "Showcase data unavailable"
+          : "Controller unreachable"
+        : "Initializing",
       tone: pollError ? "bad" : "idle",
     };
   }
+
+  if (recorded) {
+    const step = String(state.guided?.step ?? "READY");
+    return {
+      label: `Verified replay · ${step}`,
+      tone: "ok",
+    };
+  }
+
   if (!state.ready) {
     return { label: "Initializing", tone: "idle" };
   }
@@ -57,13 +75,10 @@ function pulseClass(tone: "ok" | "warn" | "bad" | "idle"): string {
   }
 }
 
-interface HeaderProps {
-  state: DemoState | null;
-  pollError: string | null;
-}
-
-export default function Header({ state, pollError }: HeaderProps) {
-  const health = clusterHealth(state, pollError);
+export default function Header() {
+  const { state, pollError, labels, mode } = useDemoRuntime();
+  const recorded = mode === "showcase";
+  const health = clusterHealth(state, pollError, recorded);
   const nodeSummary = summarizeNodes(state?.cluster.nodes ?? []);
 
   return (
@@ -73,25 +88,27 @@ export default function Header({ state, pollError }: HeaderProps) {
           <h1 className="text-2xl font-semibold tracking-tight text-mist-50 sm:text-3xl">
             AI Artifact Store
           </h1>
-          <p className="mt-1 text-sm text-mist-400">
-            Interactive Distributed Systems Demo
-          </p>
+          <p className="mt-1 text-sm text-mist-400">{labels.productSubtitle}</p>
         </div>
 
         <div className="flex flex-col items-start gap-1 sm:items-end">
           <div className={`flex items-center gap-2 text-sm font-medium ${toneClass(health.tone)}`}>
             <span
               className={`inline-block h-2 w-2 rounded-full ${pulseClass(health.tone)} ${
-                health.tone === "idle" ? "animate-pulse" : ""
+                !recorded && health.tone === "idle" ? "animate-pulse" : ""
               }`}
               aria-hidden
             />
             {health.label}
           </div>
           <p className="text-xs text-mist-500">
-            {state?.ready
-              ? `Metadata ${state.cluster.metadata_service.status} · ${nodeSummary}`
-              : "Waiting for local demo controller"}
+            {recorded
+              ? state
+                ? `Recorded scenario · Metadata ${state.cluster.metadata_service.status} · ${nodeSummary}`
+                : "Loading recorded scenario…"
+              : state?.ready
+                ? `Metadata ${state.cluster.metadata_service.status} · ${nodeSummary}`
+                : "Waiting for local demo controller"}
           </p>
         </div>
       </div>

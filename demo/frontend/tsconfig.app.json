@@ -16,7 +16,10 @@
     "noUnusedLocals": true,
     "noUnusedParameters": true,
     "noFallthroughCasesInSwitch": true,
-    "noUncheckedSideEffectImports": true
+    "noUncheckedSideEffectImports": true,
+    "paths": {
+      "@aistore/demo-runtime-impl": ["./src/lib/localRuntime.tsx"]
+    }
   },
   "include": ["src"]
 }

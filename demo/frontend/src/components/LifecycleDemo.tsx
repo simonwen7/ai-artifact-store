@@ -1,22 +1,12 @@
-import type { DemoState, LifecycleVersionState } from "../types";
-import {
-  lifecycleApply,
-  lifecycleDryRun,
-  lifecycleGc,
-  lifecycleSetup,
-} from "../lib/api";
+import { useDemoRuntime } from "../lib/demoRuntime";
+import type { LifecycleVersionState } from "../types";
 
 interface LifecycleDemoProps {
-  state: DemoState | null;
   busy: boolean;
-  runMutation: (fn: () => Promise<DemoState>, note?: string) => Promise<void>;
 }
 
-export default function LifecycleDemo({
-  state,
-  busy,
-  runMutation,
-}: LifecycleDemoProps) {
+export default function LifecycleDemo({ busy }: LifecycleDemoProps) {
+  const { state, runMutation, actions, labels } = useDemoRuntime();
   const lifecycle = state?.lifecycle;
   const initialized = Boolean(lifecycle?.initialized);
   const versions = lifecycle?.versions ?? [];
@@ -27,10 +17,7 @@ export default function LifecycleDemo({
         <h2 className="text-2xl font-semibold tracking-tight text-mist-50">
           Lifecycle
         </h2>
-        <p className="mt-2 max-w-2xl text-sm text-mist-400">
-          Semantic retirement is separate from physical reclamation. Pin, dry-run,
-          apply, then GC — against the real local system.
-        </p>
+        <p className="mt-2 max-w-2xl text-sm text-mist-400">{labels.lifecycleIntro}</p>
       </section>
 
       <section className="panel p-5">
@@ -43,7 +30,7 @@ export default function LifecycleDemo({
               disabled={busy || !state?.ready}
               onClick={() =>
                 void runMutation(
-                  lifecycleSetup,
+                  actions.lifecycleSetup,
                   "Initializing lifecycle scenario…",
                 )
               }
@@ -68,7 +55,10 @@ export default function LifecycleDemo({
                   className="btn-secondary"
                   disabled={busy}
                   onClick={() =>
-                    void runMutation(lifecycleDryRun, "Running lifecycle dry-run…")
+                    void runMutation(
+                      actions.lifecycleDryRun,
+                      "Running lifecycle dry-run…",
+                    )
                   }
                 >
                   Dry run
@@ -78,7 +68,7 @@ export default function LifecycleDemo({
                   className="btn-secondary"
                   disabled={busy}
                   onClick={() =>
-                    void runMutation(lifecycleApply, "Applying lifecycle…")
+                    void runMutation(actions.lifecycleApply, "Applying lifecycle…")
                   }
                 >
                   Apply
@@ -88,7 +78,7 @@ export default function LifecycleDemo({
                   className="btn-primary"
                   disabled={busy}
                   onClick={() =>
-                    void runMutation(lifecycleGc, "Running GC…")
+                    void runMutation(actions.lifecycleGc, "Running GC…")
                   }
                 >
                   GC
@@ -155,7 +145,10 @@ function Timeline({ versions }: { versions: LifecycleVersionState[] }) {
                       : "muted"
                   }
                 />
-                <p className="mono truncate pt-1 text-[11px] text-mist-500" title={version.version_id}>
+                <p
+                  className="mono truncate pt-1 text-[11px] text-mist-500"
+                  title={version.version_id}
+                >
                   {truncate(version.version_id)}
                 </p>
               </div>

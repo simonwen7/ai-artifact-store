@@ -1,12 +1,11 @@
-import { useEffect, useMemo, useState, type ReactNode } from "react";
-import type { DemoState } from "../types";
+import { useMemo, useState, type ReactNode } from "react";
+import type { GuidedStepName } from "../types";
+import { useDemoRuntime } from "../lib/demoRuntime";
 import {
-  getReferencePerformance,
-  guidedPush,
-  pullArtifact,
-  repairArtifact,
-  resetDemo,
-} from "../lib/api";
+  GUIDED_STEPS,
+  SCENARIO_LABELS,
+  stepFromState,
+} from "../lib/showcaseFixtures";
 import GuidedDemo from "./GuidedDemo";
 import NodeCard from "./NodeCard";
 import ArtifactPanel from "./ArtifactPanel";
@@ -16,41 +15,35 @@ import OperationLog from "./OperationLog";
 type Mode = "guided" | "explorer";
 
 interface ClusterDemoProps {
-  state: DemoState | null;
   busy: boolean;
-  runMutation: (fn: () => Promise<DemoState>, note?: string) => Promise<void>;
 }
 
-export default function ClusterDemo({
-  state,
-  busy,
-  runMutation,
-}: ClusterDemoProps) {
+export default function ClusterDemo({ busy }: ClusterDemoProps) {
+  const {
+    state,
+    runMutation,
+    actions,
+    capabilities,
+    labels,
+    referencePerformance,
+  } = useDemoRuntime();
   const [mode, setMode] = useState<Mode>("guided");
-  const [fastcdcReuse, setFastcdcReuse] = useState<string>("—");
 
-  useEffect(() => {
-    let cancelled = false;
-    void getReferencePerformance()
-      .then((ref) => {
-        if (cancelled) return;
-        const ratio = ref.chunking?.fastcdc?.reuse_ratio;
-        if (typeof ratio === "number") {
-          setFastcdcReuse(`${(ratio * 100).toFixed(1)}%`);
-        }
-      })
-      .catch(() => {
-        /* keep placeholder */
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, []);
+  const fastcdcReuse = useMemo(() => {
+    const ratio = referencePerformance?.chunking?.fastcdc?.reuse_ratio;
+    if (typeof ratio === "number") {
+      return `${(ratio * 100).toFixed(1)}%`;
+    }
+    return "—";
+  }, [referencePerformance]);
 
   const nodes = useMemo(() => {
     const list = state?.cluster.nodes ?? [];
     return [...list].sort((a, b) => a.node_id.localeCompare(b.node_id));
   }, [state]);
+
+  const currentStep = stepFromState(state);
+  const explorerLabel = capabilities.scenarioExplorer ? "Scenario Explorer" : "Explorer";
 
   return (
     <div className="space-y-8">
@@ -66,13 +59,13 @@ export default function ClusterDemo({
           </p>
         </div>
 
-        {mode === "guided" && guidedStep(state) === "READY" && (
+        {mode === "guided" && currentStep === "READY" && (
           <button
             type="button"
             className="btn-primary"
-            disabled={busy || !state?.ready}
+            disabled={busy || (!capabilities.scenarioExplorer && !state?.ready)}
             onClick={() =>
-              void runMutation(guidedPush, "Pushing guided demo artifact…")
+              void runMutation(actions.guidedPush, "Pushing guided demo artifact…")
             }
           >
             Start Guided Demo
@@ -83,7 +76,7 @@ export default function ClusterDemo({
       <section className="panel overflow-hidden">
         <div className="grid grid-cols-2 divide-x divide-white/[0.06] sm:grid-cols-4">
           <Metric value="415" label="Correctness tests" />
-          <Metric value="3" label="Storage nodes" />
+          <Metric value="3" label={labels.metricNodesLabel} />
           <Metric value={fastcdcReuse} label="FastCDC reuse*" />
           <Metric value="6" label="Process-level E2Es" />
         </div>
@@ -97,18 +90,21 @@ export default function ClusterDemo({
           <ModeButton active={mode === "guided"} onClick={() => setMode("guided")}>
             Guided
           </ModeButton>
-          <ModeButton active={mode === "explorer"} onClick={() => setMode("explorer")}>
-            Explorer
+          <ModeButton
+            active={mode === "explorer"}
+            onClick={() => setMode("explorer")}
+          >
+            {explorerLabel}
           </ModeButton>
         </div>
-        {mode === "explorer" && (
+        {mode === "explorer" && capabilities.mutateCluster && (
           <div className="flex flex-wrap gap-2">
             <button
               type="button"
               className="btn-secondary"
               disabled={busy || !state?.artifact}
               onClick={() =>
-                void runMutation(pullArtifact, "Pulling artifact…")
+                void runMutation(actions.pullArtifact, "Pulling artifact…")
               }
             >
               Pull Artifact
@@ -118,7 +114,7 @@ export default function ClusterDemo({
               className="btn-secondary"
               disabled={busy || !state?.artifact}
               onClick={() =>
-                void runMutation(repairArtifact, "Repairing replicas…")
+                void runMutation(actions.repairArtifact, "Repairing replicas…")
               }
             >
               Repair Replicas
@@ -127,7 +123,7 @@ export default function ClusterDemo({
               type="button"
               className="btn-danger"
               disabled={busy}
-              onClick={() => void runMutation(resetDemo, "Resetting demo…")}
+              onClick={() => void runMutation(actions.resetDemo, "Resetting demo…")}
             >
               Reset Demo
             </button>
@@ -136,7 +132,18 @@ export default function ClusterDemo({
       </div>
 
       {mode === "guided" && (
-        <GuidedDemo state={state} busy={busy} runMutation={runMutation} onExplore={() => setMode("explorer")} />
+        <GuidedDemo
+          busy={busy}
+          onExplore={() => setMode("explorer")}
+        />
+      )}
+
+      {mode === "explorer" && capabilities.scenarioExplorer && (
+        <ScenarioPicker
+          current={currentStep}
+          busy={busy}
+          onSelect={(step) => void actions.selectScenario(step)}
+        />
       )}
 
       <section className="grid gap-4 md:grid-cols-3">
@@ -148,29 +155,67 @@ export default function ClusterDemo({
               key={node.node_id}
               node={node}
               busy={busy}
-              explorer={mode === "explorer"}
-              runMutation={runMutation}
+              explorer={mode === "explorer" && capabilities.mutateCluster}
             />
           ))
         )}
       </section>
 
       <ArtifactPanel
-        state={state}
         busy={busy}
-        explorer={mode === "explorer"}
-        runMutation={runMutation}
+        explorer={mode === "explorer" && capabilities.mutateCluster}
       />
 
       <ChunkPlacementTable artifact={state?.artifact ?? null} />
 
-      <OperationLog events={state?.events ?? []} />
+      <OperationLog
+        events={state?.events ?? []}
+        recordedSession={capabilities.scenarioExplorer}
+      />
     </div>
   );
 }
 
-function guidedStep(state: DemoState | null): string {
-  return state?.guided?.step ?? "READY";
+function ScenarioPicker({
+  current,
+  busy,
+  onSelect,
+}: {
+  current: GuidedStepName;
+  busy: boolean;
+  onSelect: (step: GuidedStepName) => void;
+}) {
+  return (
+    <section className="panel p-5">
+      <p className="label">Recorded scenarios</p>
+      <h3 className="mt-1 text-lg font-medium text-mist-50">Scenario Explorer</h3>
+      <p className="mt-2 text-sm text-mist-400">
+        Jump between verified snapshots from the same local Guided run. Display only —
+        no live cluster mutations.
+      </p>
+      <div className="mt-4 flex flex-wrap gap-2">
+        {GUIDED_STEPS.map((step) => {
+          const active = step === current;
+          return (
+            <button
+              key={step}
+              type="button"
+              disabled={busy}
+              onClick={() => onSelect(step)}
+              className={[
+                "rounded-md px-3 py-1.5 text-sm transition",
+                active
+                  ? "bg-accent-muted text-accent"
+                  : "bg-ink-800 text-mist-300 hover:text-mist-50",
+              ].join(" ")}
+            >
+              {SCENARIO_LABELS[step]}
+            </button>
+          );
+        })}
+      </div>
+    </section>
+  );
 }
 
 function Metric({ value, label }: { value: string; label: string }) {

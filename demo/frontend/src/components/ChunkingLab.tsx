@@ -1,34 +1,10 @@
-import { useEffect, useState } from "react";
-import { formatSafeError, getReferencePerformance } from "../lib/api";
-import type { ChunkingReference, ReferencePerformance } from "../types";
+import { useDemoRuntime } from "../lib/demoRuntime";
+import type { ChunkingReference } from "../types";
 
 export default function ChunkingLab() {
-  const [data, setData] = useState<ReferencePerformance | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [loading, setLoading] = useState(true);
-
-  useEffect(() => {
-    let cancelled = false;
-    setLoading(true);
-    void getReferencePerformance()
-      .then((ref) => {
-        if (!cancelled) {
-          setData(ref);
-          setError(null);
-        }
-      })
-      .catch((err) => {
-        if (!cancelled) setError(formatSafeError(err));
-      })
-      .finally(() => {
-        if (!cancelled) setLoading(false);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, []);
-
-  const chunking = data?.chunking;
+  const { referencePerformance, referenceError, referenceLoading } =
+    useDemoRuntime();
+  const chunking = referencePerformance?.chunking ?? null;
 
   return (
     <div className="space-y-8">
@@ -65,12 +41,14 @@ export default function ChunkingLab() {
         </p>
       </section>
 
-      {loading && (
-        <div className="panel px-5 py-8 text-sm text-mist-400">Loading reference measurements…</div>
+      {referenceLoading && (
+        <div className="panel px-5 py-8 text-sm text-mist-400">
+          Loading reference measurements…
+        </div>
       )}
-      {error && (
+      {referenceError && (
         <div className="rounded-lg border border-failure/35 bg-failure/10 px-4 py-3 text-sm text-[#f0c0c0]">
-          {error}
+          {referenceError}
         </div>
       )}
       {chunking && <ReferenceCards chunking={chunking} />}
@@ -102,12 +80,11 @@ function BoundaryRow({
         <span className="text-xs text-mist-500">{note}</span>
       </div>
       <div className="space-y-2">
-        <FileStrip label="Original File" widths={original} accent={accent} align="start" />
+        <FileStrip label="Original File" widths={original} accent={accent} />
         <FileStrip
           label="Shifted File (+64 KiB prefix)"
           widths={shifted}
           accent={accent}
-          align="start"
           shift
         />
       </div>
@@ -124,7 +101,6 @@ function FileStrip({
   label: string;
   widths: number[];
   accent: "healthy" | "warning";
-  align?: string;
   shift?: boolean;
 }) {
   const total = widths.reduce((a, b) => a + b, 0);

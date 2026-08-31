@@ -1,4 +1,5 @@
 import type { ArtifactState, ChunkLocation, ChunkPlacement } from "../types";
+import { useDemoRuntime } from "../lib/demoRuntime";
 
 const NODE_COLS = ["node-a", "node-b", "node-c"] as const;
 
@@ -7,6 +8,7 @@ interface ChunkPlacementTableProps {
 }
 
 export default function ChunkPlacementTable({ artifact }: ChunkPlacementTableProps) {
+  const { labels } = useDemoRuntime();
   const chunks = artifact?.chunks ?? [];
 
   return (
@@ -14,9 +16,7 @@ export default function ChunkPlacementTable({ artifact }: ChunkPlacementTablePro
       <div className="border-b border-white/[0.06] px-5 py-4">
         <p className="label">Placement</p>
         <h3 className="mt-1 text-lg font-medium text-mist-50">Chunk placement</h3>
-        <p className="mt-1 text-xs text-mist-500">
-          From controller state — not recomputed in the browser.
-        </p>
+        <p className="mt-1 text-xs text-mist-500">{labels.chunkPlacementNote}</p>
       </div>
 
       {chunks.length === 0 ? (

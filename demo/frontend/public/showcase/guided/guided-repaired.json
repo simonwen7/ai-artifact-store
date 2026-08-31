@@ -1,0 +1,286 @@
+{
+  "artifact": {
+    "artifact_id": "01a05873-3acc-7ec4-8d9b-9c48a54543c4",
+    "artifact_kind": "model-checkpoint",
+    "chunking_strategy": "fastcdc",
+    "chunks": [
+      {
+        "chunk_id": "04f9a7efe119689a0c357d8076882e9c80da65ebdc673b688cea09ec87657cf4",
+        "desired_nodes": [
+          "node-a",
+          "node-b",
+          "node-c"
+        ],
+        "locations": [
+          {
+            "metadata_state": "available",
+            "node_id": "node-a",
+            "process_status": "online"
+          },
+          {
+            "metadata_state": "available",
+            "node_id": "node-b",
+            "process_status": "offline"
+          },
+          {
+            "metadata_state": "available",
+            "node_id": "node-c",
+            "process_status": "online"
+          }
+        ],
+        "size_bytes": 4393542
+      },
+      {
+        "chunk_id": "7037449f5eea92e155173683c9d7137f46bb92af2f21b51c30ad4eff0a9ed46e",
+        "desired_nodes": [
+          "node-a",
+          "node-b",
+          "node-c"
+        ],
+        "locations": [
+          {
+            "metadata_state": "available",
+            "node_id": "node-a",
+            "process_status": "online"
+          },
+          {
+            "metadata_state": "available",
+            "node_id": "node-b",
+            "process_status": "offline"
+          },
+          {
+            "metadata_state": "available",
+            "node_id": "node-c",
+            "process_status": "online"
+          }
+        ],
+        "size_bytes": 8388608
+      },
+      {
+        "chunk_id": "a3abbca4e19b2f94672bbbb41b19e3d04dd7ba2759a8a522260fcc03eb2d17ba",
+        "desired_nodes": [
+          "node-a",
+          "node-b",
+          "node-c"
+        ],
+        "locations": [
+          {
+            "metadata_state": "available",
+            "node_id": "node-a",
+            "process_status": "online"
+          },
+          {
+            "metadata_state": "available",
+            "node_id": "node-b",
+            "process_status": "offline"
+          },
+          {
+            "metadata_state": "available",
+            "node_id": "node-c",
+            "process_status": "online"
+          }
+        ],
+        "size_bytes": 8388608
+      },
+      {
+        "chunk_id": "4b01e40cc094e5503a713522ab50c4124fcede479e4ab6838c3f63863e235c9c",
+        "desired_nodes": [
+          "node-a",
+          "node-b",
+          "node-c"
+        ],
+        "locations": [
+          {
+            "metadata_state": "available",
+            "node_id": "node-a",
+            "process_status": "online"
+          },
+          {
+            "metadata_state": "available",
+            "node_id": "node-b",
+            "process_status": "offline"
+          },
+          {
+            "metadata_state": "available",
+            "node_id": "node-c",
+            "process_status": "online"
+          }
+        ],
+        "size_bytes": 4420149
+      },
+      {
+        "chunk_id": "4fc7acb328bed3e2e728e077e97e29dde4d030d65da3cf36a008ac3d916344ad",
+        "desired_nodes": [
+          "node-a",
+          "node-b",
+          "node-c"
+        ],
+        "locations": [
+          {
+            "metadata_state": "available",
+            "node_id": "node-a",
+            "process_status": "online"
+          },
+          {
+            "metadata_state": "available",
+            "node_id": "node-b",
+            "process_status": "offline"
+          },
+          {
+            "metadata_state": "available",
+            "node_id": "node-c",
+            "process_status": "online"
+          }
+        ],
+        "size_bytes": 5204882
+      },
+      {
+        "chunk_id": "e86dbf3fed5ef04950d5a90d356682a1f77b69d53816a08caf4f8cbab236bc90",
+        "desired_nodes": [
+          "node-a",
+          "node-b",
+          "node-c"
+        ],
+        "locations": [
+          {
+            "metadata_state": "available",
+            "node_id": "node-a",
+            "process_status": "online"
+          },
+          {
+            "metadata_state": "available",
+            "node_id": "node-b",
+            "process_status": "offline"
+          },
+          {
+            "metadata_state": "available",
+            "node_id": "node-c",
+            "process_status": "online"
+          }
+        ],
+        "size_bytes": 2758643
+      }
+    ],
+    "filename": "guided-artifact.bin",
+    "health": "healthy",
+    "layout_id": "7fc63717ae3ec93c5401d2bedd0566a91adb40edb3418b4b6172cc3b5c82c049",
+    "object_id": "1fc8f541cd808443467a3bd8f8d41d9fef570e3b4d27bcae3f6befad113479bb",
+    "replication_factor": 2,
+    "size_bytes": 33554432,
+    "version_id": "2ffc97854241979bafcf02904ed3405472967541852e61b4acb46d3c0f93d614"
+  },
+  "busy": false,
+  "cluster": {
+    "metadata_service": {
+      "port": 8080,
+      "status": "online"
+    },
+    "nodes": [
+      {
+        "chunk_count": 6,
+        "node_id": "node-a",
+        "port": 8081,
+        "process_status": "online",
+        "registry_state": "active"
+      },
+      {
+        "chunk_count": 6,
+        "node_id": "node-b",
+        "port": 8082,
+        "process_status": "offline",
+        "registry_state": "disabled"
+      },
+      {
+        "chunk_count": 6,
+        "node_id": "node-c",
+        "port": 8083,
+        "process_status": "online",
+        "registry_state": "active"
+      }
+    ]
+  },
+  "events": [
+    {
+      "kind": "system",
+      "message": "Demo cluster ready: metadata-service + node-a/b/c Active.",
+      "timestamp": "11:32:16"
+    },
+    {
+      "kind": "system",
+      "message": "Demo reset complete.",
+      "timestamp": "11:32:16"
+    },
+    {
+      "kind": "push",
+      "message": "Pushed guided-artifact.bin (33554432 bytes) with fastcdc RF=2; 6 chunks.",
+      "timestamp": "11:32:22"
+    },
+    {
+      "kind": "system",
+      "message": "Guided step complete: artifact pushed with FastCDC RF=2.",
+      "timestamp": "11:32:22"
+    },
+    {
+      "kind": "node",
+      "message": "Storage node node-b went offline (process stopped; registry unchanged).",
+      "timestamp": "11:32:22"
+    },
+    {
+      "kind": "pull",
+      "message": "Pull succeeded while node-b was offline; another available replica served the artifact. SHA-256 verified.",
+      "timestamp": "11:32:23"
+    },
+    {
+      "kind": "node",
+      "message": "Marked node-b Disabled via production CLI so offline nodes are excluded from automatic placement/repair.",
+      "timestamp": "11:32:23"
+    },
+    {
+      "kind": "repair",
+      "message": "Repair completed after disabling node-b.",
+      "timestamp": "11:32:23"
+    },
+    {
+      "kind": "system",
+      "message": "Replicas repaired. Finish Guided Demo to mark presentation complete.",
+      "timestamp": "11:32:23"
+    }
+  ],
+  "guided": {
+    "killed_node_id": "node-b",
+    "step": "REPAIRED",
+    "step_index": 4,
+    "summary": {
+      "pull": {
+        "bytes": 33554432,
+        "chunks_downloaded": 6,
+        "elapsed_seconds": 0.1341308749979362,
+        "label": "Pull"
+      },
+      "push": {
+        "bytes": 33554432,
+        "bytes_sent_to_storage": 67108864,
+        "chunk_count": 6,
+        "elapsed_seconds": 0.3010847920013475,
+        "label": "Push",
+        "put_requests": 12
+      },
+      "repair": {
+        "disabled_nodes": [
+          "node-b"
+        ],
+        "elapsed_seconds": 0.2583479169989005,
+        "label": "Repair",
+        "message": "Repair completed via production CLI.",
+        "replicas_verified": 6,
+        "replicas_written": 6
+      }
+    }
+  },
+  "lifecycle": {
+    "initialized": false,
+    "policy_id": null,
+    "versions": []
+  },
+  "ready": true
+}

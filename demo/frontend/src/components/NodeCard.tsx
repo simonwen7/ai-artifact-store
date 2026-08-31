@@ -1,19 +1,14 @@
-import type { DemoState, NodeState, RegistryState } from "../types";
-import { killNode, restartNode, setNodeState } from "../lib/api";
+import type { NodeState, RegistryState } from "../types";
+import { useDemoRuntime } from "../lib/demoRuntime";
 
 interface NodeCardProps {
   node: NodeState;
   busy: boolean;
   explorer: boolean;
-  runMutation: (fn: () => Promise<DemoState>, note?: string) => Promise<void>;
 }
 
-export default function NodeCard({
-  node,
-  busy,
-  explorer,
-  runMutation,
-}: NodeCardProps) {
+export default function NodeCard({ node, busy, explorer }: NodeCardProps) {
+  const { runMutation, actions } = useDemoRuntime();
   const title = displayName(node.node_id);
   const processTone =
     node.process_status === "online" ? "healthy" : "failure";
@@ -61,7 +56,7 @@ export default function NodeCard({
               disabled={busy || node.process_status === "offline"}
               onClick={() =>
                 void runMutation(
-                  () => killNode(node.node_id),
+                  () => actions.killNode(node.node_id),
                   `Killing ${node.node_id}…`,
                 )
               }
@@ -74,7 +69,7 @@ export default function NodeCard({
               disabled={busy || node.process_status === "online"}
               onClick={() =>
                 void runMutation(
-                  () => restartNode(node.node_id),
+                  () => actions.restartNode(node.node_id),
                   `Restarting ${node.node_id}…`,
                 )
               }
@@ -96,7 +91,7 @@ export default function NodeCard({
                 disabled={busy || node.registry_state === s}
                 onClick={() =>
                   void runMutation(
-                    () => setNodeState(node.node_id, s),
+                    () => actions.setNodeState(node.node_id, s),
                     `Setting ${node.node_id} → ${s}…`,
                   )
                 }

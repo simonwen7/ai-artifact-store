@@ -3,9 +3,13 @@ import type { DemoEvent } from "../types";
 
 interface OperationLogProps {
   events: DemoEvent[];
+  recordedSession?: boolean;
 }
 
-export default function OperationLog({ events }: OperationLogProps) {
+export default function OperationLog({
+  events,
+  recordedSession = false,
+}: OperationLogProps) {
   const [clearedAt, setClearedAt] = useState(0);
   const visible = useMemo(() => {
     if (clearedAt <= 0) return events;
@@ -18,6 +22,11 @@ export default function OperationLog({ events }: OperationLogProps) {
         <div>
           <p className="label">Operations</p>
           <h3 className="mt-1 text-lg font-medium text-mist-50">Operation log</h3>
+          {recordedSession && (
+            <p className="mt-1 text-xs text-mist-500">
+              Recorded session timestamps — not live wall-clock activity.
+            </p>
+          )}
         </div>
         <button
           type="button"
@@ -38,7 +47,9 @@ export default function OperationLog({ events }: OperationLogProps) {
                 key={`${event.timestamp}-${index}-${event.message}`}
                 className="mono flex gap-3 text-[12px] leading-relaxed"
               >
-                <span className="shrink-0 text-mist-500">{event.timestamp}</span>
+                <span className="shrink-0 text-mist-500">
+                  {formatTimestamp(event.timestamp, recordedSession)}
+                </span>
                 <span className={`shrink-0 uppercase ${kindColor(event.kind)}`}>
                   {event.kind}
                 </span>
@@ -50,6 +61,14 @@ export default function OperationLog({ events }: OperationLogProps) {
       </div>
     </section>
   );
+}
+
+function formatTimestamp(raw: string, recordedSession: boolean): string {
+  if (!recordedSession) return raw;
+  const match = raw.match(/T(\d{2}:\d{2}:\d{2})/);
+  if (match) return match[1];
+  if (/^\d{2}:\d{2}:\d{2}/.test(raw)) return raw.slice(0, 8);
+  return raw;
 }
 
 function kindColor(kind: string): string {

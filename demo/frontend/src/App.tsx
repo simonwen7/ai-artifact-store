@@ -1,91 +1,64 @@
-import { useCallback, useEffect, useState } from "react";
+import { useState } from "react";
 import Header from "./components/Header";
 import ClusterDemo from "./components/ClusterDemo";
 import ChunkingLab from "./components/ChunkingLab";
 import LifecycleDemo from "./components/LifecycleDemo";
 import PerformanceView from "./components/PerformanceView";
-import { formatSafeError, getState } from "./lib/api";
-import type { DemoState } from "./types";
+import { DemoRuntimeProvider, useDemoRuntime } from "./lib/demoRuntime";
+import type { AppTab } from "./types";
 
-export type AppTab = "cluster" | "chunking" | "lifecycle" | "performance";
+export type { AppTab };
 
-const TABS: { id: AppTab; label: string }[] = [
-  { id: "cluster", label: "Cluster Demo" },
-  { id: "chunking", label: "Chunking Lab" },
-  { id: "lifecycle", label: "Lifecycle" },
-  { id: "performance", label: "Performance" },
-];
+function AppShell() {
+  const {
+    tabs,
+    capabilities,
+    labels,
+    state,
+    locked,
+    pollError,
+    actionError,
+    actionNote,
+    dismissActionError,
+  } = useDemoRuntime();
 
-export default function App() {
-  const [tab, setTab] = useState<AppTab>("cluster");
-  const [state, setState] = useState<DemoState | null>(null);
-  const [pollError, setPollError] = useState<string | null>(null);
-  const [busy, setBusy] = useState(false);
-  const [actionError, setActionError] = useState<string | null>(null);
-  const [actionNote, setActionNote] = useState<string | null>(null);
-
-  useEffect(() => {
-    let cancelled = false;
-    let timer: number | undefined;
-
-    const tick = async () => {
-      try {
-        const next = await getState();
-        if (!cancelled) {
-          setState(next);
-          setPollError(null);
-        }
-      } catch (err) {
-        if (!cancelled) {
-          setPollError(formatSafeError(err));
-        }
-      } finally {
-        if (!cancelled) {
-          timer = window.setTimeout(tick, 1000);
-        }
-      }
-    };
-
-    void tick();
-    return () => {
-      cancelled = true;
-      if (timer !== undefined) window.clearTimeout(timer);
-    };
-  }, []);
-
-  const runMutation = useCallback(
-    async (fn: () => Promise<DemoState>, note?: string) => {
-      if (busy) return;
-      setBusy(true);
-      setActionError(null);
-      setActionNote(note ?? null);
-      try {
-        const next = await fn();
-        setState(next);
-        setActionNote(null);
-      } catch (err) {
-        setActionError(formatSafeError(err));
-        setActionNote(null);
-      } finally {
-        setBusy(false);
-      }
-    },
-    [busy],
-  );
-
-  const locked = busy || Boolean(state?.busy);
+  const defaultTab = tabs[0]?.id ?? "cluster";
+  const [tab, setTab] = useState<AppTab>(defaultTab);
+  const activeTab = tabs.some((t) => t.id === tab) ? tab : defaultTab;
 
   return (
     <div className="min-h-screen">
-      <Header state={state} pollError={pollError} />
+      <Header />
 
       <main className="mx-auto max-w-6xl px-4 pb-16 pt-6 sm:px-6">
+        {labels.disclosure && (
+          <div className="mb-6 rounded-xl border border-accent/20 bg-accent-muted/60 px-4 py-3">
+            <p className="text-sm font-medium text-mist-100">
+              Public Interactive Showcase
+            </p>
+            <p className="mt-1 text-sm text-mist-300">{labels.disclosure}</p>
+            {labels.localDemoHint && (
+              <p className="mt-2 text-xs text-mist-500">
+                {labels.localDemoHint}{" "}
+                <a
+                  href={labels.localDemoUrl}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="text-accent underline-offset-2 hover:underline"
+                >
+                  Local demo instructions
+                </a>
+              </p>
+            )}
+          </div>
+        )}
+
         <nav
           className="mb-8 flex flex-wrap gap-1 rounded-xl border border-white/[0.06] bg-ink-900/80 p-1"
           aria-label="Demo sections"
         >
-          {TABS.map((item) => {
-            const active = tab === item.id;
+          {tabs.map((item) => {
+            const active = activeTab === item.id;
             return (
               <button
                 key={item.id}
@@ -104,7 +77,7 @@ export default function App() {
           })}
         </nav>
 
-        {(actionError || actionNote || pollError) && (
+        {(actionError || actionNote || (pollError && !state)) && (
           <div className="mb-6 space-y-2">
             {actionNote && (
               <div className="rounded-lg border border-accent/30 bg-accent-muted px-4 py-3 text-sm text-mist-100">
@@ -117,7 +90,7 @@ export default function App() {
                 <button
                   type="button"
                   className="btn-ghost shrink-0 px-2 py-1 text-xs"
-                  onClick={() => setActionError(null)}
+                  onClick={dismissActionError}
                 >
                   Dismiss
                 </button>
@@ -125,29 +98,27 @@ export default function App() {
             )}
             {pollError && !state && (
               <div className="rounded-lg border border-warning/35 bg-warning/10 px-4 py-3 text-sm text-[#f0d9a8]">
-                Waiting for demo controller at 127.0.0.1:8787 — {pollError}
+                {labels.waitingForController} — {pollError}
               </div>
             )}
           </div>
         )}
 
-        {tab === "cluster" && (
-          <ClusterDemo
-            state={state}
-            busy={locked}
-            runMutation={runMutation}
-          />
+        {activeTab === "cluster" && <ClusterDemo busy={locked} />}
+        {activeTab === "chunking" && <ChunkingLab />}
+        {activeTab === "lifecycle" && capabilities.showLifecycleTab && (
+          <LifecycleDemo busy={locked} />
         )}
-        {tab === "chunking" && <ChunkingLab />}
-        {tab === "lifecycle" && (
-          <LifecycleDemo
-            state={state}
-            busy={locked}
-            runMutation={runMutation}
-          />
-        )}
-        {tab === "performance" && <PerformanceView />}
+        {activeTab === "performance" && <PerformanceView />}
       </main>
     </div>
+  );
+}
+
+export default function App() {
+  return (
+    <DemoRuntimeProvider>
+      <AppShell />
+    </DemoRuntimeProvider>
   );
 }

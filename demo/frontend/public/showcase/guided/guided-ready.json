@@ -1,0 +1,61 @@
+{
+  "artifact": null,
+  "busy": false,
+  "cluster": {
+    "metadata_service": {
+      "port": 8080,
+      "status": "online"
+    },
+    "nodes": [
+      {
+        "chunk_count": 0,
+        "node_id": "node-a",
+        "port": 8081,
+        "process_status": "online",
+        "registry_state": "active"
+      },
+      {
+        "chunk_count": 0,
+        "node_id": "node-b",
+        "port": 8082,
+        "process_status": "online",
+        "registry_state": "active"
+      },
+      {
+        "chunk_count": 0,
+        "node_id": "node-c",
+        "port": 8083,
+        "process_status": "online",
+        "registry_state": "active"
+      }
+    ]
+  },
+  "events": [
+    {
+      "kind": "system",
+      "message": "Demo cluster ready: metadata-service + node-a/b/c Active.",
+      "timestamp": "11:32:16"
+    },
+    {
+      "kind": "system",
+      "message": "Demo reset complete.",
+      "timestamp": "11:32:16"
+    }
+  ],
+  "guided": {
+    "killed_node_id": null,
+    "step": "READY",
+    "step_index": 0,
+    "summary": {
+      "pull": null,
+      "push": null,
+      "repair": null
+    }
+  },
+  "lifecycle": {
+    "initialized": false,
+    "policy_id": null,
+    "versions": []
+  },
+  "ready": true
+}
